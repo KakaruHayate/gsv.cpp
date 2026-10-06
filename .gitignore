@@ -1,0 +1,9 @@
+llama.cpp/
+build-*/
+*.dll
+*.exe
+*.obj
+models/
+*.gguf
+__pycache__/
+*.pyc
