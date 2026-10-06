@@ -5,5 +5,8 @@ build-*/
 *.obj
 models/
 *.gguf
+tests/golden/
+*.bin
+*.npy
 __pycache__/
 *.pyc

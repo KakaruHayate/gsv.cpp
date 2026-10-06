@@ -87,4 +87,21 @@ if __name__ == "__main__":
         logits = dec.ar_predict_layer(xy_dec[:, -1])
         dump("ar.step0.logits", logits)
 
+        # --- decode 步: 用固定 token 序列推进 3 步, 对拍单步 decode (KV cache 增量) ---
+        # 首 token 由 step0 采样得到(任意), 这里用固定 token 保证可复现
+        step_tokens = torch.tensor([[100, 200, 300]])
+        all_y = torch.concat([prompt, step_tokens], dim=1)  # [1, 24+3]
+        # 逐 token: t=24..26 (第 25,26,27 个 token), 输入是上一个 token 的 embedding+PE
+        for di in range(3):
+            tok = all_y[:, y_len + di]           # 该步输入 token (位置 y_len+di)
+            y_emb1 = dec.ar_audio_embedding(tok.unsqueeze(0))  # [1,1,512]
+            pe_row = dec.ar_audio_position.pe[:, y_len + di]   # [1,512]
+            x_in = y_emb1 * dec.ar_audio_position.x_scale + dec.ar_audio_position.alpha * pe_row
+            dump(f"ar.dec{di+1}.x_in", x_in)
+            xy_dec1, k_cache, v_cache = dec.t2s_transformer.decode_next_token(x_in, k_cache, v_cache)
+            logits1 = dec.ar_predict_layer(xy_dec1[:, -1])
+            dump(f"ar.dec{di+1}.logits", logits1)
+        # 存 step_tokens 与 prompt 供 C++ 复现 KV cache
+        dump("ar.dec_tokens", step_tokens)
+
     print("AR golden done ->", outdir)

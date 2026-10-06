@@ -8,6 +8,7 @@
 #include "ggml-cpu.h"
 
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -113,13 +114,87 @@ int main(int argc, char ** argv) {
 
     const int x_len = 32;      // phones
     const int y_len = 24;      // prompt
-    const int S = x_len + y_len;
     const int D = hp.D;
+    int recalc_n = 0;
+    if (const char * rc = getenv("GSV_AR_RECALC")) recalc_n = atoi(rc);
+    const int S = x_len + y_len + (recalc_n > 0 ? recalc_n : 0);
 
     auto xy_pos_g = read_bin("ar.xy_pos");     // [1, S, D]
     auto attn_g   = read_bin("ar.xy_attn_mask");
     auto dec_g    = read_bin("ar.step0.dec");
     auto logits_g = read_bin("ar.step0.logits");
+
+    // 整段重算模式: GSV_AR_RECALC=<n_new> (1..3) — 新 token embedding+PE 在 C++ 侧生成,
+    // 拼接到 xy_pos, mask 扩展, 对拍 ar.recalc{n}.logits
+    std::vector<float> xy_ext;
+    std::vector<float> mask_ext;
+    std::vector<float> logits_ext;
+    if (recalc_n > 0) {
+        char pb[128];
+        // 1) audio embedding 查表 + PE 行 (alpha 缩放), 拼 n_new 个 token
+        ggml_tensor * pe_aud = nullptr; // 由 build_pe 生成, 这里直接生成 host 表
+        static std::vector<float> pe_tab;    // [T_max, D] 行主序 (ne0=D)
+        const int T_max = 4096;
+        pe_tab.resize((size_t)T_max * D);
+        {
+            for (int pos = 0; pos < T_max; pos++)
+                for (int i = 0; i < D; i += 2) {
+                    float div = std::exp(i * -(std::log(10000.0f) / (float)D));
+                    pe_tab[(size_t)pos*D + i]     = std::sin(pos * div);
+                    pe_tab[(size_t)pos*D + i + 1] = std::cos(pos * div);
+                }
+        }
+        float alpha = 0;
+        { // 读 alpha (F32 标量)
+            ggml_tensor * al = t("ar.audio_pe_alpha");
+            alpha = *(const float *)al->data;
+        }
+        auto audio_emb = t("ar.audio_emb"); // [1025, 512] ne0=D? gguf shape [1025 512] → ne0=1025?
+        // audio_emb: torch weight [1025,512] row-major; ggml ne0=1025 (行=vocab), ne1=512
+        // 查表: token idx → 行 idx, 长度 512, 步长 nb0=4? ne0=1025 是 vocab → 查表按 ne[0]?
+        // 我们写 GGUF 时直接写 [1025,512] → ne0=1025(vocab), ne1=512(dim); get_rows 需要 ne0=行内长度。
+        // 查表期望 emb[i] = W[tok, i] → W 行主序 [1025,512], ggml 视图 (512, 1025): ne0=512。
+        // 简单起见: host 手工查表。
+        auto new_tokens = read_bin("ar.dec_tokens");
+        xy_ext = xy_pos_g;
+        xy_ext.resize((size_t)(56 + recalc_n) * D);
+        for (int n = 0; n < recalc_n; n++) {
+            int tok = (int) new_tokens[n];
+            const float * row = audio_emb->data ? nullptr : nullptr; // no_alloc=false → data 有效
+            const float * wmem = (const float *) audio_emb->data;
+            // ggml ne=(1025, 512): 元素 (v, d) at mem[v + d*1025]?? ne0=1025 fastest → mem[v*512? no!
+            // ggml ne0 fastest: mem[(size_t)v * nb0 + d * nb1] 其中 nb0=4, nb1=1025*4
+            // → 行主 [1025,512] 的 mem[v*1025 + d]?? 需确认: numpy [1025,512] row-major
+            //   mem = v*512 + d (v 行, d 列)。ggml ne=(1025,512): ne0=1025 (v) fastest → mem[v + d*1025]。
+            //   两者不同! numpy [1025,512]: 行 v 连续 512 → mem[v*512+d]。
+            //   ggml (ne0=1025, ne1=512) 读 mem[v + d*1025] → 是 numpy 的转置读取!
+            // 所以 GGUF 记录 shape [1025 512] 时, C++ 读到的是"转置表"。查表正确方式:
+            //   emb[d] = mem[d*1025 + tok] (nb1=1025*4)
+            const float * base = (const float *)audio_emb->data;
+            // GGUF numpy [1025,512] row-major: emb[d] = base[tok*512 + d]
+            for (int d = 0; d < D; d++) {
+                float e = base[(size_t)tok * D + d];
+                float pe = pe_tab[(size_t)(24 + n)*D + d];
+                xy_ext[(size_t)(56 + n)*D + d] = e + alpha * pe;
+            }
+        }
+        // 2) mask 扩展: 拷贝原始 56x56; 新 token 行 causal; 旧 query 对新 token 全可见
+        mask_ext.assign((size_t)(56 + recalc_n) * (56 + recalc_n), 0.0f);
+        for (int a = 0; a < 56; a++)
+            for (int b = 0; b < 56; b++)
+                mask_ext[(size_t)a * (56 + recalc_n) + b] = attn_g[(size_t)a * 56 + b];
+        for (int n = 0; n < recalc_n; n++) {
+            int a = 56 + n;  // 新 token 的 query 行 (绝对位置)
+            for (int b = 0; b < 56 + recalc_n; b++)
+                mask_ext[(size_t)a * (56 + recalc_n) + b] = (b <= a) ? 0.0f : -std::numeric_limits<float>::infinity();
+        }
+        // 注意: y 段(含新 token)行对 x 列也可见 — 与官方 decode 一致 (decode 无 mask)。
+        // 但上面拷贝的 56x56 原始 mask 中 y 行对 x 列已经是 0(可见) ✓
+        for (int a = 0; a < 56; a++)
+            for (int n = 0; n < recalc_n; n++)
+                // x 段 query 屏蔽 y 列 (torch: x_attn pad True); y 段 query causal 可见
+                mask_ext[(size_t)a * (56 + recalc_n) + 56 + n] = (a < 32) ? -std::numeric_limits<float>::infinity() : 0.0f;
+    }
 
     // ---- build graph ----
     const bool no_attn_mode = getenv("GSV_AR_NO_ATTN") != nullptr;
@@ -202,9 +277,11 @@ int main(int argc, char ** argv) {
     ggml_gallocr_alloc_graph(galloc, graph);
 
     // 写输入
-    ggml_backend_tensor_set(xy_pos, xy_pos_g.data(), 0, xy_pos_g.size() * 4);
+    const float * xy_in = recalc_n > 0 ? xy_ext.data() : xy_pos_g.data();
+    ggml_backend_tensor_set(xy_pos, xy_in, 0, (size_t)S * D * 4);
     if (!no_attn_mode) {
-        ggml_backend_tensor_set(attn, attn_g.data(), 0, attn_g.size() * 4);
+        const float * mask_in = recalc_n > 0 ? mask_ext.data() : attn_g.data();
+        ggml_backend_tensor_set(attn, mask_in, 0, (size_t)S * S * 4);
     }
 
     // bypass 模式: 清零所有额外的 F32 input (GSV_AR_NO_ATTN 的 attn_out)
@@ -222,6 +299,12 @@ int main(int argc, char ** argv) {
     ggml_backend_graph_compute(backend, graph);
 
     std::vector<float> got(hp.vocab);
+    if (recalc_n > 0) {
+        char pb2[160];
+        snprintf(pb2, sizeof(pb2), "ar.recalc%d.logits", recalc_n);
+        logits_ext = read_bin(pb2);
+    }
+    std::vector<float> & got_ref = (recalc_n > 0 ? logits_ext : logits_g);
     ggml_backend_tensor_get(last_logits, got.data(), 0, got.size() * 4);
 
     if (getenv("GSV_AR_DEBUG_DUMP")) {
@@ -232,7 +315,7 @@ int main(int argc, char ** argv) {
     // 对比
     double max_diff = 0;
     for (int i = 0; i < hp.vocab; i++) {
-        double d = std::fabs(got[i] - logits_g[i]);
+        double d = std::fabs(got[i] - got_ref[i]);
         if (d > max_diff) max_diff = d;
     }
     printf("[ar step0] last-token logits max|diff| = %.6g\n", max_diff);
