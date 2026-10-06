@@ -16,8 +16,11 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
 
 ## 目录
 
-- `llama.cpp/` — ggml 基线（内嵌，含 ggml-audio-patch 全部算子移植；见其 git log）
+- `patches/0001-ggml-audio-patch-port-on-llamacpp.patch` — **ggml 基线补丁**（116 个算子 + Vulkan shader + pipeline cache），
+  对 `llama.cpp@f0c41e0` 应用；`llama.cpp/` 目录本身不入库（见下方"获取 ggml 基线"）
+- `docs/V5-ggml-port-research.md` — 选型与移植调研报告（链路清单、参考仓库映射、已确认决策）
 - `models/` — 权重（不入库）：s1v3.ckpt(AR) / s2Gv5turbo.pth / vocoder.pth / chinese-hubert-base / chinese-roberta-wwm-ext-large
+- `scripts/build-tests.bat` — 一键构建 ggml + 全部对拍可执行文件（VS2019 BuildTools）
 - `tools/` — 权重转换与 golden 导出（Python，diffsinger env）
   - `convert_ar.py`：s1v3.ckpt → `models/gsv-ar-f32.gguf`
   - `dump_golden_ar.py`：torch 侧 golden（step0 各段 + K/V cache + decode 步）
@@ -26,6 +29,17 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
   - `test_ar_decode.cpp`：增量 decode 对拍（KV cache）
   - `test_min_ffn.cpp`：最小 LN+FFN 对拍（排查用）
   - `golden/`（不入库）由 `dump_golden_ar.py` 生成
+
+## 获取 ggml 基线
+
+```bash
+git clone --depth 1 https://github.com/ggml-org/llama.cpp.git llama.cpp
+cd llama.cpp && git fetch --depth 2 origin f0c41e0 && git checkout f0c41e0
+git apply ../patches/0001-ggml-audio-patch-port-on-llamacpp.patch
+```
+
+> 注：llama.cpp 的 `ggml/` 目录是从 `ggml-org/ggml` 同步而来（`scripts/sync-ggml.last`），
+> 后续若改为直接依赖独立 ggml 仓库，本补丁需按 `ggml/src` 布局重放一遍（补丁本身已按此布局书写）。
 
 ## 复现
 
@@ -37,12 +51,12 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
 python tools/convert_ar.py
 python tools/dump_golden_ar.py
 
-# 3) 构建 ggml（CPU）
-cd llama.cpp && cmake -B build-cpu -DGGML_NATIVE=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF && cmake --build build-cpu --target ggml -j
+# 3) 构建 ggml（CPU）+ 对拍程序
+scripts\build-tests.bat
 
 # 4) 对拍
-./tests/test_ar_step0.exe  models/gsv-ar-f32.gguf tests/golden
-./tests/test_ar_decode.exe models/gsv-ar-f32.gguf tests/golden
+tests\test_ar_step0.exe  models\gsv-ar-f32.gguf tests\golden
+tests\test_ar_decode.exe models\gsv-ar-f32.gguf tests\golden
 ```
 
 ## 关键移植结论（踩坑记录）

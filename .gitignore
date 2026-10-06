@@ -10,3 +10,4 @@ tests/golden/
 *.npy
 __pycache__/
 *.pyc
+scripts/*.log
