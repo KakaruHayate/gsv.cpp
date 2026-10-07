@@ -234,38 +234,32 @@ struct gsv_ar::impl {
         const double t_a = now_ms();
         const int B = cache.B;
         const int L = cache.len + 1;
-        std::vector<float> mask_host((size_t)L * B, 0.0f);
+        std::vector<ggml_fp16_t> mask_host((size_t)L * B);
         for (int b = 0; b < B; b++)
             for (int k = 0; k < L; k++)
-                mask_host[(size_t)k + (size_t)b * L] = (k < pad_len[b]) ? -INFINITY : 0.0f;
+                mask_host[(size_t)k + (size_t)b * L] = ggml_fp32_to_fp16((k < pad_len[b]) ? -INFINITY : 0.0f);
 
-        ggml_init_params ip = { ggml_tensor_overhead() * 16384, NULL, true };
+        ggml_init_params ip = { ggml_tensor_overhead() * 2048, NULL, true };
         ggml_context * ctx = ggml_init(ip);
         ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, 1, B);
         ggml_set_input(x);
-        ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, L, 1, 1, B);
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, L, 1, 1, B);
         ggml_set_input(mask);
-        ggml_tensor * mask16 = ggml_cast(ctx, mask, GGML_TYPE_F16);
         ggml_tensor * cur = x;
-        std::vector<ggml_tensor *> kcol_wt(NL), vcol_wt(NL);
         for (int li = 0; li < NL; li++) {
             ggml_tensor * qkv = ggml_add(ctx, ggml_mul_mat(ctx, ws[li].qkv_w, cur), ws[li].qkv_b);
             ggml_tensor * qkv4 = ggml_reshape_4d(ctx, qkv, D, 3, 1, B);
-            ggml_tensor * q = ggml_view_3d(ctx, qkv4, D, 1, B, qkv4->nb[2], qkv4->nb[3], 0);
-            ggml_tensor * k = ggml_view_3d(ctx, qkv4, D, 1, B, qkv4->nb[2], qkv4->nb[3], qkv4->nb[1]);
-            ggml_tensor * v = ggml_view_3d(ctx, qkv4, D, 1, B, qkv4->nb[2], qkv4->nb[3], 2 * qkv4->nb[1]);
-            q = ggml_cont(ctx, q); k = ggml_cont(ctx, k); v = ggml_cont(ctx, v);
-            ggml_tensor * qh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, q, HD, NH, 1, B), 0, 2, 1, 3));
-            ggml_tensor * kh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, k, HD, NH, 1, B), 0, 2, 1, 3));
-            ggml_tensor * vh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, v, HD, NH, 1, B), 0, 2, 1, 3));
-            // 新列写入常驻 cache (cpy 副作用), 并且 cpy 的输出作为 concat 的输入
-            // 以保证 "写 -> 读" 的执行顺序 (直接读 cache 视图与 cpy 之间无依赖边, 会竞争)
-            ggml_tensor * kcol_w = ggml_cpy(ctx, kh, k_col_view(ctx, li, cache.len));
-            ggml_tensor * vcol_w = ggml_cpy(ctx, vh, v_col_view(ctx, li, cache.len));
-            kcol_wt[li] = kcol_w; vcol_wt[li] = vcol_w;
+            // S=1: q/k/v 在 qkv 里的内存序已是 (hd, nh)，可直接用 (HD,1,NH,B) 视图送 flash / 送 KV cpy
+            // —— 省掉每层 6 次 ggml_cont (3 次切 q/k/v + 3 次 permute)，数值完全相同
+            ggml_tensor * qh      = ggml_view_4d(ctx, qkv4, HD, 1, NH, B, 4 * HD, 4 * HD, qkv4->nb[3], 0);
+            ggml_tensor * ksrc    = ggml_view_4d(ctx, qkv4, HD, 1, NH, B, 4 * HD, 4 * HD, qkv4->nb[3], qkv4->nb[1]);
+            ggml_tensor * vsrc    = ggml_view_4d(ctx, qkv4, HD, 1, NH, B, 4 * HD, 4 * HD, qkv4->nb[3], 2 * qkv4->nb[1]);
+            // 新列写入常驻 cache (cpy 副作用); flash 读 concat(旧列视图, cpy输出) 以显式化 "写 -> 读" 依赖
+            ggml_tensor * kcol_w = ggml_cpy(ctx, ksrc, k_col_view(ctx, li, cache.len));
+            ggml_tensor * vcol_w = ggml_cpy(ctx, vsrc, v_col_view(ctx, li, cache.len));
             ggml_tensor * kfull = ggml_concat(ctx, k_view(ctx, li, cache.len), kcol_w, 1);
             ggml_tensor * vfull = ggml_concat(ctx, v_view(ctx, li, cache.len), vcol_w, 1);
-            ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, qh, kfull, vfull, mask16, 1.0f / std::sqrt((float)HD), 0.0f, 0.0f);
+            ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, qh, kfull, vfull, mask, 1.0f / std::sqrt((float)HD), 0.0f, 0.0f);
             attn_out = ggml_reshape_3d(ctx, attn_out, D, 1, B);
             ggml_tensor * o = ggml_add(ctx, ggml_mul_mat(ctx, ws[li].out_w, attn_out), ws[li].out_b);
             ggml_tensor * c2 = ggml_add(ctx, cur, o);
@@ -277,13 +271,12 @@ struct gsv_ar::impl {
         }
         ggml_tensor * logits = ggml_mul_mat(ctx, predict, cur);
         ggml_set_output(logits);
-        ggml_cgraph * graph = ggml_new_graph_custom(ctx, 16384, false);
-        ggml_build_forward_expand(graph, logits);
-        for (int li = 0; li < NL; li++) { ggml_build_forward_expand(graph, kcol_wt[li]); ggml_build_forward_expand(graph, vcol_wt[li]); }
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx, 4096, false);
+        ggml_build_forward_expand(graph, logits);   // KV cpy 经 concat 连到 flash, 已是 logits 的祖先
         ggml_gallocr_alloc_graph(galloc, graph);
         const double t_b = now_ms();
         ggml_backend_tensor_set(x, x_host.data(), 0, x_host.size() * 4);
-        ggml_backend_tensor_set(mask, mask_host.data(), 0, mask_host.size() * 4);
+        ggml_backend_tensor_set(mask, mask_host.data(), 0, mask_host.size() * 2);
         const double t_c = now_ms();
         ggml_backend_graph_compute(backend, graph);
         const double t_d = now_ms();
@@ -326,7 +319,8 @@ gsv_ar * gsv_ar::load(const std::string & gguf_path, const gsv_ar_cfg & cfg) {
     // 设备选择 (cfg.device: "" = CPU, "vulkan"/"gpu" = 第一个 GPU 设备)
     ggml_backend_dev_t dev = nullptr;
     {
-        const bool want_gpu = cfg.device == "gpu" || cfg.device == "vulkan" || cfg.device == "GPU" || cfg.device == "Vulkan";
+        const bool want_gpu = cfg.device == "gpu" || cfg.device == "vulkan" || cfg.device == "cuda" ||
+                               cfg.device == "GPU"  || cfg.device == "Vulkan" || cfg.device == "CUDA";
         const int n_dev = (int) ggml_backend_dev_count();
         for (int i = 0; i < n_dev && !dev; i++) {
             ggml_backend_dev_t d = ggml_backend_dev_get(i);

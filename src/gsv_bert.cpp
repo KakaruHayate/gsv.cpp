@@ -18,7 +18,7 @@ static double now_ms() {
 }
 
 struct bert_layer_w {
-    ggml_tensor * q_w, * q_b, * k_w, * k_b, * v_w, * v_b, * attn_out_w, * attn_out_b, * attn_ln_w, * attn_ln_b;
+    ggml_tensor * qkv_w, * qkv_b, * attn_out_w, * attn_out_b, * attn_ln_w, * attn_ln_b;
     ggml_tensor * ff1_w, * ff1_b, * ff2_w, * ff2_b, * out_ln_w, * out_ln_b;
 };
 
@@ -74,12 +74,14 @@ void gsv_bert::impl::run(const int32_t * ids, int T, std::vector<float> & out, i
 
     for (int li = 0; li < n_layers; li++) {
         const bert_layer_w & w = ws[li];
-        ggml_tensor * q = ggml_add(ctx, ggml_mul_mat(ctx, w.q_w, cur), w.q_b);
-        ggml_tensor * k = ggml_add(ctx, ggml_mul_mat(ctx, w.k_w, cur), w.k_b);
-        ggml_tensor * v = ggml_add(ctx, ggml_mul_mat(ctx, w.v_w, cur), w.v_b);
-        ggml_tensor * qh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, q, HD, NH, T, 1), 0, 2, 1, 3));
-        ggml_tensor * kh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, k, HD, NH, T, 1), 0, 2, 1, 3));
-        ggml_tensor * vh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, v, HD, NH, T, 1), 0, 2, 1, 3));
+        // QKV 一次 matmul + 三个 (HD,T,NH,1) 视图直送 flash:
+        // qkv 的行序是 (hd, nh) 且 S 维步长 = 3D*4, head 维步长 = HD*4 -> 无需 permute/cont
+        ggml_tensor * qkv = ggml_add(ctx, ggml_mul_mat(ctx, w.qkv_w, cur), w.qkv_b);   // [3D, T]
+        ggml_tensor * q3 = ggml_reshape_3d(ctx, qkv, D, 3, T);                          // nb=(4, 4D, 12D)
+        const size_t nb_s = q3->nb[2], nb_h = 4 * HD;
+        ggml_tensor * qh = ggml_view_4d(ctx, q3, HD, T, NH, 1, nb_s, nb_h, nb_h * T, 0);
+        ggml_tensor * kh = ggml_view_4d(ctx, q3, HD, T, NH, 1, nb_s, nb_h, nb_h * T, q3->nb[1]);
+        ggml_tensor * vh = ggml_view_4d(ctx, q3, HD, T, NH, 1, nb_s, nb_h, nb_h * T, 2 * q3->nb[1]);
         ggml_tensor * attn = ggml_flash_attn_ext(ctx, qh, kh, vh, t_msk, 1.0f / std::sqrt((float) HD), 0.0f, 0.0f);
         attn = ggml_reshape_2d(ctx, ggml_reshape_4d(ctx, attn, D, T, 1, 1), D, T);
         ggml_tensor * ao = ggml_add(ctx, ggml_mul_mat(ctx, w.attn_out_w, attn), w.attn_out_b);
@@ -169,7 +171,8 @@ gsv_bert * gsv_bert::load(const std::string & gguf_path, const gsv_bert_cfg & cf
 
     ggml_backend_dev_t dev = nullptr;
     {
-        const bool want_gpu = cfg.device == "gpu" || cfg.device == "vulkan" || cfg.device == "GPU" || cfg.device == "Vulkan";
+        const bool want_gpu = cfg.device == "gpu" || cfg.device == "vulkan" || cfg.device == "cuda" ||
+                               cfg.device == "GPU"  || cfg.device == "Vulkan" || cfg.device == "CUDA";
         const int n_dev = (int) ggml_backend_dev_count();
         for (int i = 0; i < n_dev && !dev; i++) {
             ggml_backend_dev_t d = ggml_backend_dev_get(i);
@@ -250,7 +253,7 @@ gsv_bert * gsv_bert::load(const std::string & gguf_path, const gsv_bert_cfg & cf
     char buf[128];
     for (int li = 0; li < s.NL; li++) {
         #define GW_L(f, nm) snprintf(buf, sizeof(buf), "bert.l%d." nm, li); if (!(s.ws[li].f = t(buf))) { delete m; return nullptr; }
-        GW_L(q_w, "q_w"); GW_L(q_b, "q_b"); GW_L(k_w, "k_w"); GW_L(k_b, "k_b"); GW_L(v_w, "v_w"); GW_L(v_b, "v_b");
+        GW_L(qkv_w, "qkv_w"); GW_L(qkv_b, "qkv_b");
         GW_L(attn_out_w, "attn_out_w"); GW_L(attn_out_b, "attn_out_b");
         GW_L(attn_ln_w, "attn_ln_w"); GW_L(attn_ln_b, "attn_ln_b");
         GW_L(ff1_w, "ff1_w"); GW_L(ff1_b, "ff1_b"); GW_L(ff2_w, "ff2_w"); GW_L(ff2_b, "ff2_b");

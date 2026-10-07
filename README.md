@@ -12,8 +12,9 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
 | AR 采样链（rep-penalty/top-p/temperature/top-k/softmax + exp-trick 采样） | ✅ probs 对拍 7e-9；注入 q 的采样索引与 torch 一致 |
 | AR batch 能力（多序列 KV cache + padding/causal mask） | ✅ batched 首步 6.2e-6；解码步 4~5e-6；greedy 生成逐 token 一致（含 early-stop 路径） |
 | AR 引擎（`src/gsv_ar`：GGUF 加载 + 前端 + 生成循环 + 常驻 KV cache） | ✅ 引擎端到端对拍 5.7e-6 / token 一致；**性能 2.1×（bs=1）/ 1.7×（bs=3）于 torch eager**，见 [docs/benchmark_ar.md](docs/benchmark_ar.md) |
+| AR 单流延迟优化（bs=1） | ✅ Vulkan 5.08 → **3.89 ms/step（257 tok/s，-23%）**；CPU 换 q8_attn_ffn 近无损档 19.6 → **9.1 ms（-54%）**；见 [docs/ar_latency.md](docs/ar_latency.md) |
 | AR 量化（最小近无损档） | ✅ **F16 158MB（TV 0.0002）/ attn+ffn Q8_0 89MB（TV 0.0035）**；低于此档 TV 翻倍，见 [docs/quant_ar.md](docs/quant_ar.md) |
-| BERT 前端（chinese-roberta-wwm-ext-large，22 层 encoder） | ✅ CPU 对拍 max\|Δ\| = 1.0e-5（逐层 23 个隐藏状态全部 cos=1.0）；Vulkan 13.1ms（f32）/10.1ms（f16）≈ torch 最快路径 3.8×；**量化下限 F16 662MB**（Q8 及以下越 token 稳定阈值）；见 [docs/bert_ggml.md](docs/bert_ggml.md) |
+| BERT 前端（chinese-roberta-wwm-ext-large，22 层 encoder） | ✅ CPU 对拍 max\|Δ\| = 1.0e-5（逐层 23 个隐藏状态全部 cos=1.0）；Vulkan f16 **8.5 ms** / f32 10.6 ms（≈ torch 最快路径 5.9×），CPU f32 149 ms（16 线程 f16 110 ms）；**量化下限 F16 662MB**（Q8 及以下越 token 稳定阈值）；见 [docs/bert_ggml.md](docs/bert_ggml.md) |
 | 条件编码段（HuBERT/RVQ/enc_p/MRTE/ref_enc/bridge/wns1） | ⬜ |
 | DiT（CFM + static cache，v5turbo 4 步） | ⬜ |
 | vocoder（ONNX，fp32 严格不量化） | ✅ 导出 57.8MB / sha256 `13f95a88…`；对拍 max\|Δ\| ≤1.1e-4、corr 1.0；ORT-DML ≈ torch CUDA，ORT-CPU 快 torch 1.85×，见 [docs/vocoder_onnx.md](docs/vocoder_onnx.md) |
@@ -24,6 +25,7 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
   对 `llama.cpp@f0c41e0` 应用；`llama.cpp/` 目录本身不入库（见下方"获取 ggml 基线"）
 - `docs/V5-ggml-port-research.md` — 选型与移植调研报告（链路清单、参考仓库映射、已确认决策）
 - `docs/benchmark_ar.md` — AR 段基准（vs torch，含精度-速度权衡与剖析）
+- `docs/ar_latency.md` — AR 单流（bs=1）延迟优化专项（剖析、已做项、精度档对延迟、剩余空间）
 - `docs/quant_ar.md` — AR 量化（验收协议：logits/greedy/TF 分布 TV；最小近无损档）
 - `docs/vocoder_onnx.md` — vocoder ONNX 导出（fp32 严格不量化、DML 动态形状陷阱）
 - `docs/bert_ggml.md` — BERT 前端（切层依据、逐层对拍、Vulkan 精度容限探针、量化扫描）
@@ -34,6 +36,7 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
   - `gsv_bert.{h,cpp}`：BERT 前端（22 层 post-LN encoder + flash attention；`encode()`/`encode_feat()`/`encode_layers()`）
 - `scripts/build-tests.bat` — 一键构建 ggml + 全部对拍可执行文件（VS2019 BuildTools，含 `/utf-8`；脚本须保持纯 ASCII）
 - `scripts/build-bert-vk.bat` — BERT Release+Vulkan 构建（用 `llama.cpp/build-vk-rel`，产物 `tests/rel/`）
+- `scripts/build-ar-vk.bat` — AR 基准/对拍 Release+Vulkan 构建（`tests/rel/bench_ar_rel.exe`、`test_ar_engine_rel.exe`）
 - `tools/` — 权重转换与 golden 导出（Python，diffsinger env）
   - `convert_ar.py`：s1v3.ckpt → `models/gsv-ar-f32.gguf`
   - `dump_golden_ar.py`：torch 侧 golden（step0 各段 + K/V cache + decode 步）
@@ -103,6 +106,9 @@ tests\test_bert_ggml.exe  --bench                          # GSV_BERT_DEVICE=vul
 - **采样链顺序不可调换**：rep-penalty → top-p → temperature → top-k（`<` 比较，等值保留）→ softmax；`idx<11` 时排除 EOS 等价于 `logits[:, :-1]`。
 - **图中间张量读不回来**：`ggml_set_output` 只影响 gallocr 的原地复用/回收判定，图根以外的中间张量在 `backend_graph_compute` 之后读到的可能是被复用/覆盖的数据（实测只有最后一个节点正确、其余全是垃圾）。要逐层导出就**按层数重建图**（`encode_layers()`），不要靠 OUTPUT 标记。
 - **Vulkan flash attention 只有 F16 K/V**（`pipeline_flash_attn_f32_f16`）：F32 K/V 会被降精度 → BERT 隐藏状态 1e-2 级偏差、AR logits Δ 0.0035。关 `GGML_VK_DISABLE_COOPMAT2` 不够，关 `GGML_VK_DISABLE_COOPMAT` 也几乎不改善（实测误差不变）。是否可接受用**前端噪声容限探针**判定（`GSV_AR_BERT_NOISE`：σ≤1e-2 时 100-token 逐 token 仍一致，σ=5e-2 开始分歧）。
+- **decode 步（S=1）的 permute 是恒等变换**：qkv 的内存序本来就是 (hd, nh)，直接 `view_4d(HD,1,NH,B, nb1=任意, nb2=4*HD, nb3=共轭)` 就是 flash 需要的布局 —— 省掉每层 6 次 `ggml_cont`（144 dispatch/步，Vulkan bs=1 -23%）。CPU 只要求内维连续（`nb0 == type_size`），Vulkan 的 FA 通过 push constant 接收三个步长，两边都按视图步长寻址（实测逐位一致）。同理 BERT 的 `(HD,T,NH,1)` 视图。
+- **图根不要重复 expand**：KV 写入的 `cpy` 已通过 `concat` 连到 flash（是 logits 的祖先），再对每个 cpy 单独 `ggml_build_forward_expand` 会让它重新遍历整条链 48 次（建图 1.42 → 0.99 ms/步）。
+- **mask 直接上传 F16**：flash 要求 mask 为 F16，图内 `ggml_cast` 是白扔一次 dispatch。
 - **Windows 上 `INTER` 是宏**（`windef.h`），不能当成员名。
 - **`.bat` 必须纯 ASCII + 无括号歧义**：UTF-8 中文注释的批处理（LF 行尾、936 代码页）会被 cmd 解析错位；`echo (...)` 里的括号会截断 `if (...)` 块。
 - audio-patch 补丁路径需从独立 ggml 布局 `src/`→`ggml/src/`、`include/`→`ggml/include/`；vulkan 的 `vk_device_struct` 已拆到 `ggml-vulkan-types.h`；pipeline cache 的静态成员需 `vk_device_struct::` 限定调用。

@@ -69,12 +69,13 @@ def main():
     for li in range(cfg.num_hidden_layers):
         s = f"bert.encoder.layer.{li}."
         d = f"{P}l{li}."
-        add(d + "q_w", sd[s + "attention.self.query.weight"], "attn")
-        add(d + "q_b", sd[s + "attention.self.query.bias"], "norm")
-        add(d + "k_w", sd[s + "attention.self.key.weight"], "attn")
-        add(d + "k_b", sd[s + "attention.self.key.bias"], "norm")
-        add(d + "v_w", sd[s + "attention.self.value.weight"], "attn")
-        add(d + "v_b", sd[s + "attention.self.value.bias"], "norm")
+        # QKV 融合成一次 matmul (q,k,v 行拼接), 行序与 torch (q|k|v) 切片一致
+        qkv_w = torch.cat([sd[s + "attention.self.query.weight"], sd[s + "attention.self.key.weight"],
+                        sd[s + "attention.self.value.weight"]], dim=0)
+        qkv_b = torch.cat([sd[s + "attention.self.query.bias"], sd[s + "attention.self.key.bias"],
+                        sd[s + "attention.self.value.bias"]], dim=0)
+        add(d + "qkv_w", qkv_w, "attn")
+        add(d + "qkv_b", qkv_b, "norm")
         add(d + "attn_out_w", sd[s + "attention.output.dense.weight"], "attn")
         add(d + "attn_out_b", sd[s + "attention.output.dense.bias"], "norm")
         add(d + "attn_ln_w", sd[s + "attention.output.LayerNorm.weight"], "norm")

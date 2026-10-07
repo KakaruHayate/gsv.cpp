@@ -37,8 +37,9 @@ static std::string group_of(const std::string & name) {
     if (is_bert) {
         if (name.find("_emb") != std::string::npos) return "emb";                    // word/pos/type_emb
         if (name.find("ff1_w") != std::string::npos || name.find("ff2_w") != std::string::npos) return "ffn";
-        if (name.find("q_w") != std::string::npos || name.find("k_w") != std::string::npos ||
-            name.find("v_w") != std::string::npos || name.find("attn_out_w") != std::string::npos) return "attn";
+        if (name.find("qkv_w") != std::string::npos || name.find("q_w") != std::string::npos ||
+            name.find("k_w") != std::string::npos || name.find("v_w") != std::string::npos ||
+            name.find("attn_out_w") != std::string::npos) return "attn";
         return "other";
     }
     if (name.find("ffn") != std::string::npos) return "ffn";

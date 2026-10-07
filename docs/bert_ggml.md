@@ -9,7 +9,7 @@
 | 模块 | `src/gsv_bert.{h,cpp}`：22 层 post-LN encoder（**只跑 0..21 层**，等价 `hidden_states[-3]`），F32 计算 + `flash_attn_ext` |
 | 精度（CPU，vs HF fp32） | 4 文本最终特征 max\|Δ\| = **1.0e-5**，cos = 1.00000000；逐层 23 个隐藏状态全部对齐（max 9.5e-6） |
 | 精度（Vulkan，vs HF fp32） | max\|Δ\| = 1.2e-2 / 均值 4.0e-4（cos 0.9999999）——见 §4 的容限论证，**在产品指标上安全** |
-| 速度（T=25） | ggml CPU-f32 **167 ms** / ggml Vulkan-f32 **13.1 ms** / ggml Vulkan-f16 **10.1 ms**；torch CPU-fp32 169 ms / torch GPU-fp32 49 ms / torch GPU-fp16 50 ms |
+| 速度（T=25） | ggml CPU-f32 **149 ms**（16 线程 f16 **110 ms**）/ ggml Vulkan-f32 **10.6 ms** / ggml Vulkan-f16 **8.5 ms**；torch CPU-fp32 169 ms / torch GPU-fp32 49 ms / torch GPU-fp16 50 ms（**比 torch 最快路径快 ~5.9×**） |
 | 最小近无损精度 | **F16：662 MB**（1.9×↓）——CPU 均值 2.7e-4 / Vulkan 2.0e-3 |
 | ✗ 拒绝 | **Q8_0 及以下**（均值 ≥1.2e-2，max 达 0.17~1.0）：BERT 对隐藏状态级误差远比 AR 敏感（§5） |
 | Vocoder 无关 | BERT 只影响 semantic token，与声码器无耦合；不影响"声码器严格不量化"的决策 |
@@ -39,8 +39,8 @@
 x = word_emb(ids) + pos_emb(pos 0..T-1) + type_emb(0)
 x = LN(x, emb_ln)                                   # eps=1e-12
 for li in 0..21:
-    q,k,v = W_q x + b_q, ...                        # [D,T]，torch [out,in] 直写 = ggml [ne0=in,ne1=out]
-    qh,kh,vh = permute(reshape(q, HD,NH,T,1), 0,2,1,3) + cont   # (HD,T,NH,1) = flash 布局
+    qkv = W_qkv x + b_qkv                           # 一次 matmul: [3D,T]，q/k/v 行拼接（转换时融合）
+    qh,kh,vh = view(qkv, HD,T,NH,1, nb1=12D, nb2=4*HD)   # 直接构造 flash 布局视图, 不 permute/不 cont
     o = flash_attn_ext(qh, kh, vh, mask, 1/sqrt(HD), 0, 0)      # mask = 全 0 F16 [T,T,1,1]
     o = reshape_2d(reshape_4d(o, D,T,1,1), D, T)                # (HD,NH) 折叠 = torch 的 head 拼接顺序
     x = LN(x + (W_o o + b_o), attn_ln)              # post-LN ①
@@ -92,21 +92,48 @@ CPU 结果（复现见上）：4 文本 `max|Δ| = 3.8e-6 ~ 1.05e-5`，cos = 1.0
 
 ## 5. 基准（T=25，单次前向，含输入上传/输出回读）
 
-| 实现 | T=4 | T=25 | T=64 | T=128 | T=256 | T=512 |
-|---|---|---|---|---|---|---|
-| torch CPU fp32（24 层） | 107 | 169 | 303 | 513 | 953 | 1244 |
-| torch GPU fp32（24 层） | 52 | 49 | 48 | 56 | 54 | 61 |
-| torch GPU fp16（24 层） | 49 | 50 | 53 | 48 | 53 | 47 |
-| ggml CPU f32（22 层） | — | 167 | 368 | 725 | 1458 | 2957 |
-| **ggml Vulkan f32** | — | **13.1** | 11.1 | 20.1 | 29.5 | 53.0 |
-| **ggml Vulkan f16** | — | **10.1** | 9.8 | 16.9 | 25.2 | 47.1 |
+| 实现 | T=25 | T=64 | T=128 | T=256 | T=512 |
+|---|---|---|---|---|---|
+| torch CPU fp32（24 层） | 169 | 303 | 513 | 953 | 1244 |
+| torch GPU fp32（24 层） | 49 | 48 | 56 | 54 | 61 |
+| torch GPU fp16（24 层） | 50 | 53 | 48 | 53 | 47 |
+| ggml CPU f32（22 层, 8 线程） | 149 | 357 | 671 | 1350 | 2899 |
+| ggml CPU f16（22 层, 16 线程） | 110 | 237 | 455 | 881 | 1788 |
+| **ggml Vulkan f32** | **10.6** | 7.9 | 14.2 | 23.1 | 50.7 |
+| **ggml Vulkan f16** | **8.5** | 7.5 | 11.9 | 21.3 | 43.4 |
 
 要点：
 
-- **torch GPU 的 BERT 是 launch-bound**：T 从 4 到 512 恒定 ~50 ms（HF eager 前向 ~600 个小 kernel）；ggml Vulkan 13 ms → **约 3.8× 于 torch 最快路径（fp16 50 ms）**。
+- **torch GPU 的 BERT 是 launch-bound**：T 从 4 到 512 恒定 ~50 ms（HF eager 前向 ~600 个小 kernel）；ggml Vulkan f16 8.5 ms → **约 5.9× 于 torch 最快路径**。
+- **本次提速（QKV 融合 + q/k/v 视图直送 flash）**：每层 25 → 18 dispatch。Vulkan f16 10.1 → 8.5 ms（-16%）、
+  Vulkan f32 13.1 → 10.6 ms（-19%）、CPU f32 167 → 149 ms（-11%）；CPU 侧主要瓶颈是算力（82 GFLOPS @8 线程），
+  故算子数减少的收益小，换 16 线程 + f16 权重才有 1.5×（149 → 110 ms）。
 - CPU 上 ggml-f32 与 torch-fp32 持平（167 vs 169 ms）→ ggml 的 CPU 路径没有额外开销，但也说明 BERT 短序列在 CPU 上就是 ~0.17 s 量级（一次性成本，占整句 TTS 比重很小：AR 一字约 20~30 token × ~5 ms/step ≫ BERT）。
 - **F16 权重在 CPU 上不提速**（166 ms，F16→F32 转换等价开销），只省内存；在 Vulkan 上提速 ~25%（10.1 vs 13.1 ms）。量化权重（q6_k）反而**更慢**（15.0 ms，去量化开销）→ 小 batch 场景下"量化换速度"不成立，量化只为省内存。
 - torch 侧数据由 `tools/bench_bert.py` 生成（含 `output_hidden_states=True` 的全部 25 层，与官方 `get_bert_feature` 用法一致）。
+
+## 5.1 BERT 还有多少提速空间
+
+**能做的（工程层，预计再 -15~20%）**：每层仍有 18 dispatch，其中 4 个是纯 elementwise
+（`norm + mul + add` 两处 = 6 个、`add bias` 两处、`add` 残差两处、`gelu`）。把
+`norm(x)·w + b` 合成一个 `layernorm_affine` 算子即可省 4/层（22 层 = 88 dispatch），
+`add + relu` 类融合再省一点。收益与 AR 那侧同一套改造（需要 Vulkan shader + 重放 audio-patch），
+做完预计 Vulkan f16 8.5 → ~7 ms。**注意 BERT 的 LN 仿射不能"折叠进下游 matmul"**：
+post-LN 结构的 LN 输出同时喂给残差流和下一个 matmul，折叠会改变残差（AR 同理，已实测推导）。
+
+**不建议做的（模型层）**：
+
+1. **剪层/换更小的预训练模型**：本实现已经只用 22/24 层（`hidden_states[-3]` 之后的两层本来就白跑）。
+   再往下剪会改变特征分布，而 BERT 特征直接进 AR 的 `bert_proj`——§4 的噪声探针表明
+   σ≈1e-2 就开始影响 token，因此"换模型/蒸馏"都必须重训并重新标定验收，不是工程优化。
+2. **再量化**：实测 Q8_0 及以下越界（§0 表），F16 已是下限。
+3. **蒸馏/替换为小模型**：需要训练数据与 GPU 时间，收益上限只有 ~10 ms/句
+   （BERT 在整句 TTS 中占比 <5%，AR 是 0.5~1 s、DiT 是 100~200 ms 量级），
+   风险（特征分布漂移 → 音质/韵律变化）远大于收益。
+
+**结论**：BERT 段在 GPU 上（8.5 ms）已比 torch 最快路径快 5.9×，剩余工程空间约 -15~20%（需要
+Vulkan 融合算子，可与 AR 的同类改造一起做）；模型层面不做改动。CPU 侧若必须用 CPU，
+用 16 线程 + f16 权重（110 ms/句）即可，它同样是整句里的小头。
 
 ## 6. 量化：为什么 BERT 比 AR 敏感（与 `docs/quant_ar.md` 的对照）
 

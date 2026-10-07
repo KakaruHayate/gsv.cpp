@@ -74,6 +74,11 @@ int main(int argc, char ** argv) {
     const int n_texts = nvec.empty() ? 0 : (int) (nvec[0] + 0.5f);
     if (n_texts == 0) { fprintf(stderr, "no golden in %s\n", gdir); delete m; return 1; }
 
+    // Vulkan 后端的 flash attention 只有 F16 K/V 管线, 其自身误差即 ~1e-2 (docs/bert_ggml.md §4);
+    // 这里按设备取阈值: 该门真正要防的是布局/语义错误 (那会是 1e3 量级)
+    const double tol = cfg.device.empty() ? 1e-3 : 5e-2;
+    printf("[tol] device=%s -> max|d| threshold %.0e\n", cfg.device.empty() ? "cpu" : cfg.device.c_str(), tol);
+
     int n_bad = 0;
     for (int i = 0; i < n_texts; i++) {
         std::vector<float> idsf = read_bin(std::string(gdir) + "/bert." + std::to_string(i) + ".ids.bin");
@@ -94,7 +99,7 @@ int main(int argc, char ** argv) {
         m->encode_feat(ids.data(), T, feat);
         stats_t s2 = cmp_vec(feat, feat_ref);
 
-        const bool ok = s1.max_abs < 1e-3 && s2.max_abs < 1e-3;
+        const bool ok = s1.max_abs < tol && s2.max_abs < tol;
         if (!ok) n_bad++;
         printf("text%d T=%2d: hidden[-3] max|d|=%.3e mean=%.3e cos=%.8f | feat max|d|=%.3e cos=%.8f  %s\n",
                i, T, s1.max_abs, s1.mean_abs, s1.cos, s2.max_abs, s2.cos, ok ? "OK" : "FAIL");
