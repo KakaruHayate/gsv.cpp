@@ -21,25 +21,46 @@
 
 ## 1. 主结果：解码每 token 耗时 / 吞吐
 
-| 实现 | bs=1 | bs=3 | bs=8 | bs=20 |
+> **2026-10-07 更新（AR 优化三轮之后，同场配对测量）**：下表是**当前** ggml 实现与 torch 最快路径
+> 在**同一时段**重测的结果（旧的优化前数字与优化过程见 [docs/ar_latency.md](ar_latency.md)）。
+> 工作负载不变：3 条序列（32/26/20 音素 + 24 prompt token）greedy 生成 100 token。
+
+| | bs=1 | bs=3 | bs=8 | bs=20 |
 |---|---|---|---|---|
-| **gsv.cpp + Vulkan（RTX 2070, f32）** | **5.00 ms / 200 tok·s⁻¹** | **6.46 ms / 465** | **8.83 ms / 906** | **15.27 ms / 1310** |
-| gsv.cpp CPU（16 线程, f32） | 19.64 ms / 51 | 23.43 ms / 128 | 34.40 ms / 233 | 71.31 ms / 281 |
-| torch CUDA Graph fp16（Accel，最快 Python） | 14.47 ms / 66 | 16.32 ms / 165 | 23.24 ms / 285 | 37.50 ms / 405 |
-| torch CUDA eager fp16 | 40.7 ms / 25 | 44.8 ms / 67 | — | — |
-| torch CPU eager f32（16 线程） | 37.8 ms / 26 | 41.9 ms / 72 | 56.1 ms / 143 | — |
+| **ggml + Vulkan f32**（当前）每 token | **2.61 ms** | 3.94 | 7.39 | 14.80 |
+| ggml + Vulkan f16（158MB） | 2.38 | — | — | — |
+| ggml + Vulkan q8_attn_ffn（85MB，近无损） | **2.27 ms** | — | — | — |
+| torch CUDA Graph fp16（最快 Python 路径） | 14.82 ms | 17.70 | 25.02 | 40.89 |
+| **倍率（每 token）** | **5.7× / 6.2× / 6.5×**（f32/f16/q8） | 4.5× | 3.4× | 2.8× |
 
-（"每 token 耗时"= (总时长 − 首步)/99；吞吐按每条序列计再乘 bs）
-
-**关键数字：ggml + Vulkan 比最快 Python 路径（CUDA Graph）快 2.5\~3.2×**（bs=1 2.9×，bs=20 吞吐 1310 vs 405 tok/s = 3.2×）。
-
-首步（prefill，56 token 前缀）：
-
-| 实现 | bs=1 | bs=3 | bs=8 | bs=20 |
+| | bs=1 | bs=3 | bs=8 | bs=20 |
 |---|---|---|---|---|
-| gsv.cpp Vulkan | 43.7 ms | 73.6 ms | 180.7 ms | 439.6 ms |
-| gsv.cpp CPU | 90.1 ms | 191.0 ms | 485.3 ms | 1136.0 ms |
-| torch CUDA Graph | 77.0 ms | 206.5 ms | 503.8 ms | 1221.8 ms |
+| ggml Vulkan f32 总吞吐 | **383 tok/s** | 761 | 1082 | **1351 tok/s** |
+| torch CUDA Graph fp16 总吞吐 | 64.5 tok/s | 154 | 268 | 376 |
+| **倍率（吞吐）** | **5.9×** | 4.9× | 4.0× | **3.6×** |
+
+首步（prefill，56 token 前缀；torch 侧含 CUDA Graph 捕获）：
+
+| | bs=1 | bs=3 | bs=8 | bs=20 |
+|---|---|---|---|---|
+| ggml Vulkan f32 | **16.8 ms** | 12.5 | 18.4 | 36.5 |
+| torch CUDA Graph fp16 | 83.4 ms | 198.4 | 510.2 | 1277.9 |
+| **倍率** | **5.0×** | 15.9× | 27.7× | 35× |
+
+端到端整句（TTFT + 100 token）：
+
+| | ggml Vulkan | torch CUDA Graph | 倍率 |
+|---|---|---|---|
+| bs=1（f32） | 16.8 + 261 = **278 ms** | 83.4 + 1482 = 1565 ms | **5.6×** |
+| bs=1（q8_attn_ffn 近无损档） | 16.3 + 227 = **243 ms** | 1565 ms | **6.4×** |
+| bs=20 | 36.5 + 1480 = 1517 ms | 1277.9 + 4089 = 5367 ms | 3.5× |
+
+**精度对照（同一 workload）**：ggml f32 与 golden 逐 token 完全一致；torch CUDA Graph 走 fp16，
+与 golden 对比 bs=1 差 1/1、bs=3/8/20 差 3/3 条序列（`--accel` 输出自带该检查）→ 我们是
+"更快 + 精确 f32"，torch 最快路径是"更慢 + fp16 漂移"。
+
+（旧的优化前数字供参考：ggml Vulkan 5.00/6.46/8.83/15.27 ms·token⁻¹，torch 14.47/16.32/23.24/37.50，
+首步 43.7/73.6/180.7/439.6 vs 77.0/206.5/503.8/1221.8 —— 当时倍率 2.5~3.2×。）
 
 ## 2. 数值正确性
 

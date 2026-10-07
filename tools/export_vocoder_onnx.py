@@ -13,7 +13,7 @@ import time
 import numpy as np
 import torch
 
-REPO = os.environ.get("GSV_REPO", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "repo"))
+REPO = os.environ.get("GSV_REPO", os.path.normpath(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), os.pardir, "repo")))
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "GPT_SoVITS"))
 os.chdir(os.path.join(REPO, "GPT_SoVITS"))
