@@ -15,7 +15,7 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
 | AR 量化（最小近无损档） | ✅ **F16 158MB（TV 0.0002）/ attn+ffn Q8_0 89MB（TV 0.0035）**；低于此档 TV 翻倍，见 [docs/quant_ar.md](docs/quant_ar.md) |
 | 条件编码段（HuBERT/RVQ/enc_p/MRTE/ref_enc/bridge/wns1） | ⬜ |
 | DiT（CFM + static cache，v5turbo 4 步） | ⬜ |
-| vocoder（ONNX，DiffSinger 式导出） | ⬜ |
+| vocoder（ONNX，fp32 严格不量化） | ✅ 导出 57.8MB / sha256 `13f95a88…`；对拍 max\|Δ\| ≤1.1e-4、corr 1.0；ORT-DML ≈ torch CUDA，ORT-CPU 快 torch 1.85×，见 [docs/vocoder_onnx.md](docs/vocoder_onnx.md) |
 
 ## 目录
 
