@@ -61,6 +61,7 @@ struct gsv_ar::impl {
     ggml_tensor * audio_emb = nullptr;
     ggml_tensor * bert_proj = nullptr;
     ggml_tensor * bert_proj_b = nullptr;
+    ggml_tensor * bert_aug = nullptr;   // [BERT_DIM+1, D] = [W | b] 增广 (prefill 图内投影)
     float text_pe_alpha = 1.0f, audio_pe_alpha = 1.0f;
     ggml_context * wctx = nullptr;
     gguf_context * gf = nullptr;
@@ -154,17 +155,18 @@ struct gsv_ar::impl {
     }
 
     // 构造 batched 输入: xy_pos [B,S,D] 与 mask [B,S,S] (-inf/0); S = max_len + prompt_len
-    void build_inputs(const std::vector<gsv_ar_request> & reqs, std::vector<float> & xy,
+    // feat [BERT_DIM+1, S, B]: 文本位置 = bert 特征 + 末行 1 (给增广权重 [W|b] 的 bias 用);
+    //                         prompt / padding 位置 = 全 0 (不加 bert 也不加 bias)
+    void build_inputs(const std::vector<gsv_ar_request> & reqs, std::vector<float> & xy, std::vector<float> & feat,
                       std::vector<float> & mask, int & S, int & max_len) const {
         const int B = (int) reqs.size();
         max_len = 0;
         for (const auto & r : reqs) max_len = std::max(max_len, (int) r.phones.size());
         S = max_len + prompt_len;
         xy.assign((size_t)B * S * D, 0.0f);
+        feat.assign((size_t)B * S * (BERT_DIM + 1), 0.0f);
         mask.assign((size_t)B * S * S, 0.0f);
         const float * te  = h_text_emb.data();
-        const float * bp  = h_bert_proj.data();      // ne=(BERT_DIM, D)
-        const float * bpb = h_bert_proj_b.data();
         const float * ae  = h_audio_emb.data();
         for (int b = 0; b < B; b++) {
             const gsv_ar_request & r = reqs[b];
@@ -173,13 +175,10 @@ struct gsv_ar::impl {
             for (int t = 0; t < T; t++) {
                 float * dst = xy.data() + ((size_t)b * S + pad + t) * D;
                 const float * tok = te + (size_t) r.phones[t] * D;
-                // bert_proj: y[d] = sum_k W[d*BERT_DIM + k] * bert[k*T + t] + bias[d]
-                for (int d = 0; d < D; d++) {
-                    float acc = bpb[d];
-                    const float * wr = bp + (size_t)d * BERT_DIM;
-                    for (int k = 0; k < BERT_DIM; k++) acc += wr[k] * r.bert[(size_t)k * T + t];
-                    dst[d] = tok[d] + acc + h_text_alpha * pe_tab[(size_t)t * D + d];
-                }
+                float * fdst = feat.data() + ((size_t)b * S + pad + t) * (BERT_DIM + 1);
+                for (int d = 0; d < D; d++) dst[d] = tok[d] + h_text_alpha * pe_tab[(size_t)t * D + d];
+                for (int k = 0; k < BERT_DIM; k++) fdst[k] = r.bert[(size_t)k * T + t];
+                fdst[BERT_DIM] = 1.0f;                            // 增广位: 触发 bias
             }
             for (int t = 0; t < prompt_len; t++) {
                 float * dst = xy.data() + ((size_t)b * S + max_len + t) * D;
@@ -200,17 +199,20 @@ struct gsv_ar::impl {
     }
 
     // 首步: 全前向, 输出 logits [B,V] 与各层 K/V cache
-    void run_first(const std::vector<float> & xy_host, const std::vector<float> & mask_host, int S,
+    void run_first(const std::vector<float> & xy_host, const std::vector<float> & feat_host,
+                   const std::vector<float> & mask_host, int S,
                    std::vector<float> & logits_out) {
         const int B = cache.B;
         const double t_a = now_ms();
         ggml_init_params ip = { ggml_tensor_overhead() * 16384, NULL, true };
         ggml_context * ctx = ggml_init(ip);
         ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, S, B);
+        ggml_tensor * feat = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, BERT_DIM + 1, S, B);
         ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, S, 1, B);
-        ggml_set_input(x); ggml_set_input(mask);
+        ggml_set_input(x); ggml_set_input(feat); ggml_set_input(mask);
         ggml_tensor * mask16 = ggml_cast(ctx, mask, GGML_TYPE_F16);
-        ggml_tensor * cur = x;
+        // bert 投影在图内 (增广权重 [W|b] × [feat; 1]): host 侧不再做 30M MAC 循环
+        ggml_tensor * cur = ggml_add(ctx, x, ggml_mul_mat(ctx, bert_aug, feat));
         std::vector<ggml_tensor *> kout(NL), vout(NL);
         for (int li = 0; li < NL; li++) {
             ggml_tensor * qkv = ggml_add(ctx, ggml_mul_mat(ctx, ws[li].qkv_w, cur), ws[li].qkv_b);
@@ -251,6 +253,7 @@ struct gsv_ar::impl {
         ggml_gallocr_alloc_graph(galloc, graph);
         const double t_b = now_ms();
         ggml_backend_tensor_set(x, xy_host.data(), 0, xy_host.size() * 4);
+        ggml_backend_tensor_set(feat, feat_host.data(), 0, feat_host.size() * 4);
         ggml_backend_tensor_set(mask, mask_host.data(), 0, mask_host.size() * 4);
         const double t_c = now_ms();
         ggml_backend_graph_compute(backend, graph);
@@ -540,9 +543,10 @@ gsv_ar * gsv_ar::load(const std::string & gguf_path, const gsv_ar_cfg & cfg) {
     }
     // [w;b] 打包 (供 4-src 融合 LN): 专用 ctx + buffer, 只占 ~200KB
     {
-        ggml_init_params pp = { ggml_tensor_overhead() * (2 * s.NL + 16), NULL, true };
+        ggml_init_params pp = { ggml_tensor_overhead() * (2 * s.NL + 32), NULL, true };
         s.pctx = ggml_init(pp);
         std::vector<ggml_tensor *> tmp(2 * s.NL, nullptr);
+        ggml_tensor * aug = ggml_new_tensor_2d(s.pctx, GGML_TYPE_F32, s.BERT_DIM + 1, s.D);
         for (int li = 0; li < s.NL; li++) {
             tmp[2*li+0] = ggml_new_tensor_1d(s.pctx, GGML_TYPE_F32, 2 * s.D);
             tmp[2*li+1] = ggml_new_tensor_1d(s.pctx, GGML_TYPE_F32, 2 * s.D);
@@ -564,6 +568,7 @@ gsv_ar * gsv_ar::load(const std::string & gguf_path, const gsv_ar_cfg & cfg) {
             s.ln_pack[2*li+0] = { tmp[2*li+0], n1 };
             s.ln_pack[2*li+1] = { tmp[2*li+1], n2 };
         }
+        s.bert_aug = aug;   // 数据在 host 副本生成后填 (见下)
     }
     if (!(s.predict      = t("ar.predict")))      { delete m; return nullptr; }
     if (!(s.text_emb     = t("ar.text_emb")))     { delete m; return nullptr; }
@@ -585,6 +590,16 @@ gsv_ar * gsv_ar::load(const std::string & gguf_path, const gsv_ar_cfg & cfg) {
     to_host(s.audio_emb, s.h_audio_emb);
     to_host(s.bert_proj, s.h_bert_proj);
     to_host(s.bert_proj_b, s.h_bert_proj_b);
+    // [W | b] 增广 (元素 (k,d): k<BERT_DIM 为 W, k==BERT_DIM 为 bias[d]) —— prefill 图内投影用
+    {
+        std::vector<float> abuf((size_t) s.D * (s.BERT_DIM + 1));
+        for (int d = 0; d < s.D; d++) {
+            memcpy(abuf.data() + (size_t) d * (s.BERT_DIM + 1), s.h_bert_proj.data() + (size_t) d * s.BERT_DIM,
+                   sizeof(float) * s.BERT_DIM);
+            abuf[(size_t) d * (s.BERT_DIM + 1) + s.BERT_DIM] = s.h_bert_proj_b[d];
+        }
+        ggml_backend_tensor_set(s.bert_aug, abuf.data(), 0, abuf.size() * 4);
+    }
     {
         float a1 = 0, a2 = 0;
         ggml_backend_tensor_get(t("ar.text_pe_alpha"), &a1, 0, 4);
@@ -639,12 +654,12 @@ void gsv_ar::first_logits(const std::vector<gsv_ar_request> & reqs, std::vector<
     impl & s = *p;
     if (reqs.empty()) return;
     if (s.prompt_len == 0) s.prompt_len = (int) reqs[0].prompt.size();
-    std::vector<float> xy, mask;
+    std::vector<float> xy, feat, mask;
     int S = 0, max_len = 0;
-    s.build_inputs(reqs, xy, mask, S, max_len);
+    s.build_inputs(reqs, xy, feat, mask, S, max_len);
     s.alloc_cache(S + 8, (int) reqs.size());
     s.cache.len = 0;
-    s.run_first(xy, mask, S, logits_out);
+    s.run_first(xy, feat, mask, S, logits_out);
 }
 
 gsv_ar_result gsv_ar::generate(const std::vector<gsv_ar_request> & reqs,
@@ -662,15 +677,15 @@ gsv_ar_result gsv_ar::generate(const std::vector<gsv_ar_request> & reqs,
             fprintf(stderr, "[gsv_ar] warning: 批内 prompt 长度不一致\n");
     s.prompt_len = (int) reqs[0].prompt.size();
 
-    std::vector<float> xy, mask, lg;
+    std::vector<float> xy, feat, mask, lg;
     int S = 0, max_len = 0;
-    s.build_inputs(reqs, xy, mask, S, max_len);
+    s.build_inputs(reqs, xy, feat, mask, S, max_len);
     std::vector<int> pad_len(B, 0);
     for (int b = 0; b < B; b++) pad_len[b] = max_len - (int) reqs[b].phones.size();
 
     s.alloc_cache(S + max_steps + 8, B);
     s.cache.len = 0;
-    s.run_first(xy, mask, S, lg);
+    s.run_first(xy, feat, mask, S, lg);
     prof_reset();
 
     std::vector<std::vector<int32_t>> y(B);
