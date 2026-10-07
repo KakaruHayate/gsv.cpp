@@ -11,6 +11,7 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
 | AR 增量 decode（KV cache） | ✅ 3 步对拍 3~6e-6 |
 | AR 采样链（rep-penalty/top-p/temperature/top-k/softmax + exp-trick 采样） | ✅ probs 对拍 7e-9；注入 q 的采样索引与 torch 一致 |
 | AR batch 能力（多序列 KV cache + padding/causal mask） | ✅ batched 首步 6.2e-6；解码步 4~5e-6；greedy 生成逐 token 一致（含 early-stop 路径） |
+| AR 引擎（`src/gsv_ar`：GGUF 加载 + 前端 + 生成循环 + 常驻 KV cache） | ✅ 引擎端到端对拍 5.7e-6 / token 一致；**性能 2.1×（bs=1）/ 1.7×（bs=3）于 torch eager**，见 [docs/benchmark_ar.md](docs/benchmark_ar.md) |
 | 条件编码段（HuBERT/RVQ/enc_p/MRTE/ref_enc/bridge/wns1） | ⬜ |
 | DiT（CFM + static cache，v5turbo 4 步） | ⬜ |
 | vocoder（ONNX，DiffSinger 式导出） | ⬜ |
@@ -20,19 +21,24 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
 - `patches/0001-ggml-audio-patch-port-on-llamacpp.patch` — **ggml 基线补丁**（116 个算子 + Vulkan shader + pipeline cache），
   对 `llama.cpp@f0c41e0` 应用；`llama.cpp/` 目录本身不入库（见下方"获取 ggml 基线"）
 - `docs/V5-ggml-port-research.md` — 选型与移植调研报告（链路清单、参考仓库映射、已确认决策）
+- `docs/benchmark_ar.md` — AR 段基准（vs torch，含精度-速度权衡与剖析）
 - `models/` — 权重（不入库）：s1v3.ckpt(AR) / s2Gv5turbo.pth / vocoder.pth / chinese-hubert-base / chinese-roberta-wwm-ext-large
 - `src/` — 引擎代码
   - `gsv_sampler.{h,cpp}`：AR 采样链（严格复刻 `AR/models/utils.py::logits_to_probs` 的顺序与语义）+ exp-trick 采样
+  - `gsv_ar.{h,cpp}`：AR 引擎（GGUF 加载、phones/bert/prompt 前端、batched 首步/增量解码、常驻 KV cache、生成循环）。`GSV_AR_PROFILE=1` 输出分阶段耗时
 - `scripts/build-tests.bat` — 一键构建 ggml + 全部对拍可执行文件（VS2019 BuildTools，含 `/utf-8`）
 - `tools/` — 权重转换与 golden 导出（Python，diffsinger env）
   - `convert_ar.py`：s1v3.ckpt → `models/gsv-ar-f32.gguf`
   - `dump_golden_ar.py`：torch 侧 golden（step0 各段 + K/V cache + decode 步）
-  - `dump_golden_ar_sampling.py`：采样链 golden（probs/q/idx）+ batch golden（batched 首步/解码步 + greedy 参考）
+  - `dump_golden_ar_sampling.py`：采样链 golden（probs/q/idx）+ batch golden（batched 首步/解码步 + greedy 参考 + phones/bert 输入）
+  - `bench_ar.py`：torch 侧 AR 基准（与 bench_ar.cpp 同 workload）
 - `tests/` — C++ 对拍（MSVC 链接 `llama.cpp/build-cpu` 的 ggml）
   - `test_ar_step0.cpp`：全前向对拍（支持 GSV_AR_DEBUG_LAYERS / TOKEN / RECALC）
   - `test_ar_decode.cpp`：增量 decode 对拍（KV cache，单序列）
   - `test_ar_batch.cpp`：batch 图 + greedy 生成循环 + 采样链接入（含 mask 解析构造校验）
   - `test_ar_sampler.cpp`：采样链 probs 对拍 + 注入 q 的 argmax 规则
+  - `test_ar_engine.cpp`：引擎端到端（前端 + 首步 logits + greedy/early-stop 生成）
+  - `bench_ar.cpp`：AR 基准（bs=1/3/8，见 docs/benchmark_ar.md）
   - `test_min_ffn.cpp`：最小 LN+FFN 对拍（排查用）
   - `golden/`（不入库）由上述 dump 脚本生成
 

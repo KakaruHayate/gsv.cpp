@@ -111,6 +111,10 @@ def main():
     attn_h = attn.unsqueeze(1).expand(-1, dec.num_head, -1, -1).contiguous()  # [B, nh, S, S] (torch 路径用)
 
     dump(outdir, "batch.x_len", torch.tensor(x_lens, dtype=torch.float32))
+    # 引擎测试需要原始输入 (phones / bert)
+    for i in range(B):
+        dump(outdir, f"batch.phones{i}", phones_list[i].float())
+        dump(outdir, f"batch.bert{i}", bert_list[i])
     dump(outdir, "batch.xy_pos", xy_pos)
     dump(outdir, "batch.attn_mask", attn_f)             # [B, sq, sk] -> ggml [sk, sq, 1, B]
 
