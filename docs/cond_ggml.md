@@ -79,3 +79,43 @@ m->rvq_decode(codes, T, /*upsample_x2=*/true, out);   // out: [768, 2T], idx = d
 `x [T, C]`（时间在最内层）设计，而我们 AR/BERT/RVQ 一路用的是 `[C, T]`（通道在最内层，适配 `mul_mat`）。
 两条路可选：(a) 在模块边界做一次 transpose（每模块 1~2 次，代价小、语义清楚），
 (b) 权重转置存储 + 全程 `[T,C]`（省 transpose 但所有张量语义反转）。建议 (a)，在写 `ref_enc` 时定稿并记录。
+
+## 5. HuBERT（音频特征前端，gsv.cpp 路线）✅
+
+> 背景另一条线（host C++ 版 test_hubert.cpp，ORCATERM）已 parity PASS 但 401ms；本节记录 ggml 图实现。
+
+结构（chinese-hubert-base, wav2vec2 风格）：
+- 7 层 conv 前端 k=[10,3,3,3,3,2,2] s=[5,2,2,2,2,2,2]，conv0 后 GroupNorm(**512**) + gelu，其余层 gelu
+  - **注意**：transformers 的 `HubertGroupNormConvLayer` 用的是 `GroupNorm(num_groups=512, num_channels=512)`
+    —— 即**逐通道**（over T）归一，不是 GN(32)！GGUF 里名字叫 `feat_conv.0.norm_w/b`。
+- `feature_projection`：LN(512) + Linear(512→768)
+- `pos_conv`：grouped k=128 g=16 weight-norm（导出时已折叠）；**groups=16 的 conv 不适配 ggml_conv_1d，
+  保留 host 实现**（49 帧 ~230M MAC，OpenMP ~15ms，未来可用 batched mul_mat 重写）
+- 12 层 post-LN transformer：d=768, heads=12, FFN 3072, gelu_erf —— 与 BERT 同款（fused QKV 可后做）
+
+### 实现要点（踩坑记录）
+
+1. **conv 权重布局**：ggml im2col 要求 a 按 `ne=[K, IC, OC]` 列主 = **k 最内**。
+   而 host conv 语义（ORCATERM converter 的 `permute(2,1,0)` + gguf-py 反转）字节是 k 最外。
+   两者相反！→ load() 时对 7 个 conv 权重做一次 host 转置回写（k↔oc 互换），图内 reshape 为 [K,IC,OC]。
+2. **字节序恒等**：`[T,D] 行主`（torch/torch golden）与 `[D,T] 列主`（ggml）**字节序相同**，
+   图输入输出直接整块 memcpy，不要写转置循环（写了必错）。
+3. **FA mask 是 input 张量**：galloc 不清零 → 必须显式写 0，否则 softmax 读到垃圾出 NaN。
+4. **每图独立 gallocr**：共用 gallocr 时第二个图 alloc 触发扩容会 free 旧 buffer，
+   第一个图所有节点指针悬空（新缓冲复用同一段虚拟内存），计算互相涂写。
+5. **host 不得直接解引用 GPU 权重**（`t->data`）：Vulkan 下会段错误；一律 `ggml_backend_tensor_get`。
+   pos_conv/enc_norm 的 4 个权重每次 encode 拷回 host（~3.4MB，可忽略）。
+6. **C++ 实参求值顺序**：`f(need(nm), need((snprintf(nm,...), nm)))` —— MSVC 从右往左求值，
+   右半先覆盖共享的 `nm`，左半拿到错权重。名字格式化+查表必须封装成单次调用（见 `W()` lambda）。
+
+### 对拍与性能
+
+| 后端 | max\|d\| vs torch golden | 耗时 |
+|------|---------------------------|------|
+| host C++（ORCATERM 基线） | 8.2e-6 | 401 ms |
+| ggml CPU (16T) | 1.77e-3 | 155 ms |
+| **ggml Vulkan** | **1.43e-2** | **38.9 ms** |
+
+CPU 精度好（全 F32）；Vulkan 的 1.4e-2 来自 FA 的 F16 K/V（与 BERT 一致，实测不影响下游）。
+测试：`tests/test_hubert_ggml.cpp`（`GSV_HUBERT_DEVICE=vulkan` 切后端，`GSV_HUBERT_BENCH=N` 基准，
+`GSV_HUBERT_ENCIN=<file>` 可用 golden enc_in 单测 g2）。
