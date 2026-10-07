@@ -105,6 +105,7 @@ tests\test_bert_ggml.exe  --bench                          # GSV_BERT_DEVICE=vul
 - **torch 对拍脚本**：`torch.manual_seed` 必须在 `Text2SemanticLightningModule` 构造**之后**（构造消耗 RNG 流）。
 - **采样链顺序不可调换**：rep-penalty → top-p → temperature → top-k（`<` 比较，等值保留）→ softmax；`idx<11` 时排除 EOS 等价于 `logits[:, :-1]`。
 - **图中间张量读不回来**：`ggml_set_output` 只影响 gallocr 的原地复用/回收判定，图根以外的中间张量在 `backend_graph_compute` 之后读到的可能是被复用/覆盖的数据（实测只有最后一个节点正确、其余全是垃圾）。要逐层导出就**按层数重建图**（`encode_layers()`），不要靠 OUTPUT 标记。
+- **CUDA 线未做**：llama.cpp 的 CUDA FA 要求 `head_dim >= 40`，AR 的 head_dim = 32 → `ggml_cuda_flash_attn_ext` 直接 abort；引擎直连 `graph_compute`（无 scheduler 回退），故 CUDA 后端不可用（等价的 mul_mat+soft_max 方案实测收益不成立，见 docs/ar_latency.md §5）。
 - **Vulkan flash attention 只有 F16 K/V**（`pipeline_flash_attn_f32_f16`）：F32 K/V 会被降精度 → BERT 隐藏状态 1e-2 级偏差、AR logits Δ 0.0035。关 `GGML_VK_DISABLE_COOPMAT2` 不够，关 `GGML_VK_DISABLE_COOPMAT` 也几乎不改善（实测误差不变）。是否可接受用**前端噪声容限探针**判定（`GSV_AR_BERT_NOISE`：σ≤1e-2 时 100-token 逐 token 仍一致，σ=5e-2 开始分歧）。
 - **decode 步（S=1）的 permute 是恒等变换**：qkv 的内存序本来就是 (hd, nh)，直接 `view_4d(HD,1,NH,B, nb1=任意, nb2=4*HD, nb3=共轭)` 就是 flash 需要的布局 —— 省掉每层 6 次 `ggml_cont`（144 dispatch/步，Vulkan bs=1 -23%）。CPU 只要求内维连续（`nb0 == type_size`），Vulkan 的 FA 通过 push constant 接收三个步长，两边都按视图步长寻址（实测逐位一致）。同理 BERT 的 `(HD,T,NH,1)` 视图。
 - **图根不要重复 expand**：KV 写入的 `cpy` 已通过 `concat` 连到 flash（是 logits 的祖先），再对每个 cpy 单独 `ggml_build_forward_expand` 会让它重新遍历整条链 48 次（建图 1.42 → 0.99 ms/步）。

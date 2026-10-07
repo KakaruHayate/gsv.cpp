@@ -13,7 +13,6 @@
 | CPU f32（bs=1，8 线程） | 19.64 → 17.6 ms | 57 tok/s | 建图/算子优化对 CPU 影响很小（CPU 受权重带宽限制） |
 | **CPU + q8_attn_ffn 权重**（bs=1） | **9.1 ms** | **110 tok/s** | **-54%**（近无损档，见 §3） |
 | CPU f16（bs=1） | 13.4 ms | 75 tok/s | -32% |
-| CUDA（bs=1） | 见 §5 | | |
 
 一句话：**GPU 单流延迟的瓶颈是"每步固定开销"（dispatch + 建图），不是一个 token 的算力**；
 本次砍掉 144 次拷贝 dispatch、48 次冗余图遍历、去掉每步一次 cast，Vulkan 单流 -23%；
@@ -49,7 +48,7 @@ residual 1 + norm 1 + mul 1 + add 1 = **28 dispatch/层 → 674/步**（+ ~170 �
    `concat(旧列视图, cpy输出)` 连到 flash，是 logits 的祖先；再单独建根会让
    `ggml_build_forward_expand` 重新遍历整条链 48 次（建图 1.42 → 0.99 ms）。
 4. 建图上下文 16384 → 2048 张量（无性能差，减小内存抖动）。
-5. 引擎 `device` 选择支持 `"cuda"`（原来只认 `"vulkan"/"gpu"`）。
+5. 引擎 `device` 选择支持 `"cuda"` 别名（原来只认 `"vulkan"/"gpu"`；CUDA 后端本次未验证，原因见 §5）。
 
 > 关键坑（已写在 README):`cpy` 写 cache 与 flash 读 cache 视图之间**必须有数据依赖边**，
 > 否则 Vulkan 不插 barrier、顺序不定（表现为随机早停）。本次没有动这个结构，只是把
@@ -78,20 +77,19 @@ residual 1 + norm 1 + mul 1 + add 1 = **28 dispatch/层 → 674/步**（+ ~170 �
 | prefill（TTFT）：56 token 前缀 45.5 ms | 与 decode 同源（674 dispatch + chunk 化 attention） | 分块 prefill / 更大 tile；当前已领先 torch CUDA Graph 1.7× |
 | FA 的 K/V 常驻 F16（Vulkan 的 FA 内核本来就只吃 F16 K/V） | 省一半 KV 流量，Vulkan 上数值等价 | 会改变 CPU 端数值（f16 化 K/V），需重跑验收 |
 
-## 5. CUDA 后端（产品优先级 CUDA > Vulkan）
+## 5. CUDA 后端（本次未做，原因记录）
 
-引擎无需改代码即可选 CUDA 设备（`GSV_AR_DEVICE=cuda`，本次新增别名）；构建脚本
-`scripts/build-cuda.bat`（CUDA 12.6 + sm75）。
+**不做**：llama.cpp 的 CUDA flash attention 内核要求 `head_dim ∈ {40,64,72,80,96,112,128,256,...}`，
+而 AR 的 head_dim = 32（D=512, NH=16）→ `ggml_cuda_flash_attn_ext_supported()` 返回 false，
+引擎直接调 `ggml_backend_graph_compute`（无 scheduler 回退）时会在 `fattn.cu` 里 `GGML_ABORT`。
 
-**构建踩坑**：本机只注册了 **CUDA 13.0 的 MSBuild 集成**（CUDA 13 不支持 VS2019），
-用 VS 生成器时 MSBuild 会用 nvcc 13.0 编译 `.cu`（`CUDA 13.0.targets`），而且
-`fattn-*/mmq-*` 模板实例文件在 -j16 下 30 分钟都编不完。改用 **Ninja 生成器**后由 CMake
-直接驱动 nvcc 12.6（与 cl 19.29 兼容），绕开了 VS 集成。
-
-| 后端 | bs=1 | bs=3 | bs=8 |
-|---|---|---|---|
-| Vulkan f32 | 3.89 ms | 5.49 | 8.10 |
-| CUDA f32 | 构建中（`scripts/build-cuda.bat`），完成即补 | | |
+- 想走 CUDA 只有两条路：把注意力换成等价的 `mul_mat + soft_max + mul_mat`（实测过：CPU 上
+  逐 token 一致，Vulkan 上 logits Δ 只从 3.46e-3 降到 2.3e-3 —— 说明 Vulkan 的误差主要来自
+  matmul 而非 FA 的 f16 K/V，且要付 +2 dispatch/层的代价），或者改 head 划分。**两者收益都不成立，
+  按项目所有者决定放弃 CUDA 线**（Metal/Vulkan/CPU 已覆盖目标平台）。
+- 构建踩坑留档：本机只注册了 CUDA 13.0 的 MSBuild 集成（CUDA 13 不支持 VS2019），用 VS 生成器时
+  MSBuild 会用 nvcc 13.0 编译 `.cu`；且 `fattn-*/mmq-*` 模板实例文件在 -j16 下 30 分钟编不完。
+  若将来重试：用 Ninja 生成器让 CMake 直接驱动 nvcc 12.6。
 
 ## 6. 复现
 
