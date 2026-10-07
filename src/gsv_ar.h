@@ -44,11 +44,14 @@ public:
     // 生成。sampler 用 gsv_sampler_cfg (默认即 TTS.py 的推断默认: top_k=15/top_p=1.0/temp=1.0/rep=1.35)
     // early_stop_num: -1 表示不启用 (与 torch 一致: 生成 token 数 > early_stop_num 即停止)
     // max_steps: 迭代上限 (torch 为 1500)
+    // oracle_tokens: 非空时做"教师强制"——每步用 oracle[idx] 代替采样结果 (上下文完全一致),
+    // 同时仍按 sampler 计算并(可选)转储概率分布 —— 用于量化验收的分布级指标
     gsv_ar_result generate(const std::vector<gsv_ar_request> & reqs,
                            const gsv_sampler_cfg & sampler,
                            uint64_t seed_base,
                            int early_stop_num = -1,
-                           int max_steps = 1500);
+                           int max_steps = 1500,
+                           const std::vector<int32_t> * oracle_tokens = nullptr);
 
     // 测试/诊断: 首步 last-token logits (b 行 × vocab)
     void first_logits(const std::vector<gsv_ar_request> & reqs, std::vector<float> & logits_out);

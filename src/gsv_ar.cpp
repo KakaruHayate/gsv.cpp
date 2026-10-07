@@ -458,7 +458,8 @@ gsv_ar_result gsv_ar::generate(const std::vector<gsv_ar_request> & reqs,
                                const gsv_sampler_cfg & sampler,
                                uint64_t seed_base,
                                int early_stop_num,
-                               int max_steps) {
+                               int max_steps,
+                               const std::vector<int32_t> * oracle_tokens) {
     impl & s = *p;
     gsv_ar_result res;
     const int B = (int) reqs.size();
@@ -486,6 +487,7 @@ gsv_ar_result gsv_ar::generate(const std::vector<gsv_ar_request> & reqs,
     std::vector<gsv_rng> rng;
     rng.reserve(B);
     for (int b = 0; b < B; b++) rng.emplace_back(seed_base + 0x9E3779B9ull * (uint64_t) b);
+    std::vector<float> prob_dump;   // [steps][V] (seq0), 由 GSV_AR_PROB_DUMP 触发
 
     for (int idx = 0; idx < max_steps; idx++) {
         for (int b = 0; b < B; b++) {
@@ -498,7 +500,9 @@ gsv_ar_result gsv_ar::generate(const std::vector<gsv_ar_request> & reqs,
             for (int i = 0; i < np; i++) prev[i] = y[b][y[b].size() - np + i];
             float probs[1025];
             gsv_logits_to_probs(sampler, row, s.VOCAB, prev, np, probs);
-            const int tok = gsv_sample(probs, s.VOCAB, rng[b], nullptr);
+            if (b == 0 && getenv("GSV_AR_PROB_DUMP")) prob_dump.insert(prob_dump.end(), probs, probs + s.VOCAB);
+            int tok = gsv_sample(probs, s.VOCAB, rng[b], nullptr);
+            if (oracle_tokens != nullptr && idx < (int) oracle_tokens->size()) tok = (*oracle_tokens)[idx];
             y[b].push_back(tok);
             if (tok == s.EOS) {
                 idx_list[b] = idx;
@@ -534,5 +538,11 @@ gsv_ar_result gsv_ar::generate(const std::vector<gsv_ar_request> & reqs,
             res.lens.push_back(max_steps);
         }
     prof_report("decode");
+    const char * pd = getenv("GSV_AR_PROB_DUMP");
+    if (pd != nullptr && !prob_dump.empty()) {
+        FILE * f = fopen(pd, "wb");
+        if (f) { fwrite(prob_dump.data(), 4, prob_dump.size(), f); fclose(f);
+                 fprintf(stderr, "[gsv_ar] prob dump: %zu steps -> %s", prob_dump.size() / s.VOCAB, pd); }
+    }
     return res;
 }

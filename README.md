@@ -12,6 +12,7 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
 | AR 采样链（rep-penalty/top-p/temperature/top-k/softmax + exp-trick 采样） | ✅ probs 对拍 7e-9；注入 q 的采样索引与 torch 一致 |
 | AR batch 能力（多序列 KV cache + padding/causal mask） | ✅ batched 首步 6.2e-6；解码步 4~5e-6；greedy 生成逐 token 一致（含 early-stop 路径） |
 | AR 引擎（`src/gsv_ar`：GGUF 加载 + 前端 + 生成循环 + 常驻 KV cache） | ✅ 引擎端到端对拍 5.7e-6 / token 一致；**性能 2.1×（bs=1）/ 1.7×（bs=3）于 torch eager**，见 [docs/benchmark_ar.md](docs/benchmark_ar.md) |
+| AR 量化（最小近无损档） | ✅ **F16 158MB（TV 0.0002）/ attn+ffn Q8_0 89MB（TV 0.0035）**；低于此档 TV 翻倍，见 [docs/quant_ar.md](docs/quant_ar.md) |
 | 条件编码段（HuBERT/RVQ/enc_p/MRTE/ref_enc/bridge/wns1） | ⬜ |
 | DiT（CFM + static cache，v5turbo 4 步） | ⬜ |
 | vocoder（ONNX，DiffSinger 式导出） | ⬜ |
