@@ -61,6 +61,10 @@ struct gsv_ar::impl {
     float text_pe_alpha = 1.0f, audio_pe_alpha = 1.0f;
     ggml_context * wctx = nullptr;
     gguf_context * gf = nullptr;
+    ggml_backend_buffer_t wbuf = nullptr;
+    // 前端在 host 侧使用的权重副本 (GPU 后端时 tensor->data 不可直读)
+    std::vector<float> h_text_emb, h_audio_emb, h_bert_proj, h_bert_proj_b;
+    float h_text_alpha = 1.0f, h_audio_alpha = 1.0f;
     // runtime
     ggml_backend_t backend = nullptr;
     ggml_gallocr_t galloc = nullptr;
@@ -131,10 +135,10 @@ struct gsv_ar::impl {
         S = max_len + prompt_len;
         xy.assign((size_t)B * S * D, 0.0f);
         mask.assign((size_t)B * S * S, 0.0f);
-        const float * te = (const float *) text_emb->data;
-        const float * bp = (const float *) bert_proj->data;      // ne=(BERT_DIM, D)
-        const float * bpb = (const float *) bert_proj_b->data;
-        const float * ae = (const float *) audio_emb->data;
+        const float * te  = h_text_emb.data();
+        const float * bp  = h_bert_proj.data();      // ne=(BERT_DIM, D)
+        const float * bpb = h_bert_proj_b.data();
+        const float * ae  = h_audio_emb.data();
         for (int b = 0; b < B; b++) {
             const gsv_ar_request & r = reqs[b];
             const int T = (int) r.phones.size();
@@ -147,14 +151,14 @@ struct gsv_ar::impl {
                     float acc = bpb[d];
                     const float * wr = bp + (size_t)d * BERT_DIM;
                     for (int k = 0; k < BERT_DIM; k++) acc += wr[k] * r.bert[(size_t)k * T + t];
-                    dst[d] = tok[d] + acc + text_pe_alpha * pe_tab[(size_t)t * D + d];
+                    dst[d] = tok[d] + acc + h_text_alpha * pe_tab[(size_t)t * D + d];
                 }
             }
             for (int t = 0; t < prompt_len; t++) {
                 float * dst = xy.data() + ((size_t)b * S + max_len + t) * D;
                 const float * emb = ae + (size_t) r.prompt[t] * D;
                 for (int d = 0; d < D; d++)
-                    dst[d] = emb[d] + audio_pe_alpha * pe_tab[(size_t)t * D + d];
+                    dst[d] = emb[d] + h_audio_alpha * pe_tab[(size_t)t * D + d];
             }
             // mask: 左 padding key 屏蔽; x query 看不到 y key; y query causal
             for (int q = 0; q < S; q++)
@@ -293,7 +297,7 @@ struct gsv_ar::impl {
     }
 
     void emb_lookup(int tok, float * out) const {
-        const float * base = (const float *) audio_emb->data;
+        const float * base = h_audio_emb.data();
         for (int d = 0; d < D; d++) out[d] = base[(size_t)tok * D + d];
     }
 };
@@ -302,6 +306,7 @@ gsv_ar::gsv_ar() : p(new impl()) {}
 gsv_ar::~gsv_ar() {
     if (p->galloc) ggml_gallocr_free(p->galloc);
     if (p->backend) ggml_backend_free(p->backend);
+    if (p->wbuf) ggml_backend_buffer_free(p->wbuf);
     if (p->gf) gguf_free(p->gf);
     delete p;
 }
@@ -315,10 +320,67 @@ int gsv_ar::prompt_len_expected() const { return p->prompt_len; }
 gsv_ar * gsv_ar::load(const std::string & gguf_path, const gsv_ar_cfg & cfg) {
     gsv_ar * m = new gsv_ar();
     impl & s = *m->p;
+    // 必须在任何 Vulkan 设备初始化之前设置 (ggml-vulkan 在 get_device 时读取)
+    if (cfg.disable_coopmat2 && getenv("GGML_VK_DISABLE_COOPMAT2") == nullptr) {
+#ifdef _WIN32
+        _putenv_s("GGML_VK_DISABLE_COOPMAT2", "1");
+#else
+        setenv("GGML_VK_DISABLE_COOPMAT2", "1", 0);
+#endif
+    }
 
-    gguf_init_params gip = { false, &s.wctx };
+    // 设备选择 (cfg.device: "" = CPU, "vulkan"/"gpu" = 第一个 GPU 设备)
+    ggml_backend_dev_t dev = nullptr;
+    {
+        const bool want_gpu = cfg.device == "gpu" || cfg.device == "vulkan" || cfg.device == "GPU" || cfg.device == "Vulkan";
+        const int n_dev = (int) ggml_backend_dev_count();
+        for (int i = 0; i < n_dev && !dev; i++) {
+            ggml_backend_dev_t d = ggml_backend_dev_get(i);
+            const auto ty = ggml_backend_dev_type(d);
+            if (want_gpu) { if (ty == GGML_BACKEND_DEVICE_TYPE_GPU || ty == GGML_BACKEND_DEVICE_TYPE_IGPU) dev = d; }
+            else if (ty == GGML_BACKEND_DEVICE_TYPE_CPU) dev = d;
+        }
+        if (!dev) {
+            for (int i = 0; i < n_dev && !dev; i++) {
+                ggml_backend_dev_t d = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_CPU) dev = d;
+            }
+        }
+        if (!dev) { fprintf(stderr, "[gsv_ar] no usable backend device"); delete m; return nullptr; }
+        if (cfg.verbose) printf("[gsv_ar] device: %s (%s)", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+    }
+    s.backend = ggml_backend_dev_init(dev, nullptr);
+    if (!s.backend) { fprintf(stderr, "[gsv_ar] backend init failed"); delete m; return nullptr; }
+    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && cfg.n_threads > 0)
+        ggml_backend_cpu_set_n_threads(s.backend, cfg.n_threads);
+    s.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(s.backend));
+
+    gguf_init_params gip = { /*no_alloc*/ true, &s.wctx };
     s.gf = gguf_init_from_file(gguf_path.c_str(), gip);
     if (!s.gf) { fprintf(stderr, "[gsv_ar] failed to open %s\n", gguf_path.c_str()); delete m; return nullptr; }
+    // 后端 buffer 分配 + 从文件上传 (no_alloc 模式下 tensor 没有数据)
+    s.wbuf = ggml_backend_alloc_ctx_tensors(s.wctx, s.backend);
+    if (!s.wbuf) { fprintf(stderr, "[gsv_ar] weight buffer alloc failed"); delete m; return nullptr; }
+    {
+        FILE * fp = fopen(gguf_path.c_str(), "rb");
+        if (!fp) { fprintf(stderr, "[gsv_ar] reopen failed"); delete m; return nullptr; }
+        const size_t data_off = gguf_get_data_offset(s.gf);
+        const int64_t n_tensors = gguf_get_n_tensors(s.gf);
+        for (int64_t ti = 0; ti < n_tensors; ti++) {
+            const char * tname = gguf_get_tensor_name(s.gf, ti);
+            ggml_tensor * tt = ggml_get_tensor(s.wctx, tname);
+            if (!tt) continue;
+            const size_t nbytes = ggml_nbytes(tt);
+            std::vector<char> buf(nbytes);
+            if (fseek(fp, (long)(data_off + gguf_get_tensor_offset(s.gf, ti)), SEEK_SET) != 0 ||
+                fread(buf.data(), 1, nbytes, fp) != nbytes) {
+                fprintf(stderr, "[gsv_ar] read tensor %s failed", tname);
+                fclose(fp); delete m; return nullptr;
+            }
+            ggml_backend_tensor_set(tt, buf.data(), 0, nbytes);
+        }
+        fclose(fp);
+    }
     auto kv_u32 = [&](const char * key, int def) {
         const int64_t id = gguf_find_key(s.gf, key);
         return id < 0 ? def : (int) gguf_get_val_u32(s.gf, id);
@@ -357,15 +419,24 @@ gsv_ar * gsv_ar::load(const std::string & gguf_path, const gsv_ar_cfg & cfg) {
                 s.text_emb->type, s.audio_emb->type, s.bert_proj->type);
         delete m; return nullptr;
     }
-    s.text_pe_alpha  = *(const float *) t("ar.text_pe_alpha")->data;
-    s.audio_pe_alpha = *(const float *) t("ar.audio_pe_alpha")->data;
+    // host 侧副本 (CPU/GPU 后端统一)
+    auto to_host = [&](ggml_tensor * tt, std::vector<float> & out) {
+        out.assign(ggml_nelements(tt), 0.0f);
+        ggml_backend_tensor_get(tt, out.data(), 0, out.size() * 4);
+    };
+    to_host(s.text_emb, s.h_text_emb);
+    to_host(s.audio_emb, s.h_audio_emb);
+    to_host(s.bert_proj, s.h_bert_proj);
+    to_host(s.bert_proj_b, s.h_bert_proj_b);
+    {
+        float a1 = 0, a2 = 0;
+        ggml_backend_tensor_get(t("ar.text_pe_alpha"), &a1, 0, 4);
+        ggml_backend_tensor_get(t("ar.audio_pe_alpha"), &a2, 0, 4);
+        s.h_text_alpha = a1; s.h_audio_alpha = a2;
+    }
 
     g_prof = getenv("GSV_AR_PROFILE") != nullptr;
     s.mk_pe();
-    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    s.backend = ggml_backend_dev_init(dev, nullptr);
-    if (cfg.n_threads > 0) ggml_backend_cpu_set_n_threads(s.backend, cfg.n_threads);
-    s.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(s.backend));
     if (cfg.verbose)
         printf("[gsv_ar] loaded %s: D=%d head=%d layers=%d vocab=%d EOS=%d bert=%d alpha=(%.4f, %.4f)\n",
                gguf_path.c_str(), s.D, s.NH, s.NL, s.VOCAB, s.EOS, s.BERT_DIM, s.text_pe_alpha, s.audio_pe_alpha);
@@ -454,7 +525,7 @@ gsv_ar_result gsv_ar::generate(const std::vector<gsv_ar_request> & reqs,
             s.emb_lookup(y[b].back(), e);
             const int pos = s.prompt_len + idx;
             for (int d = 0; d < s.D; d++)
-                x_in[(size_t) d + (size_t) b * s.D] = e[d] + s.audio_pe_alpha * s.pe_tab[(size_t) pos * s.D + d];
+                x_in[(size_t) d + (size_t) b * s.D] = e[d] + s.h_audio_alpha * s.pe_tab[(size_t) pos * s.D + d];
         }
         s.run_decode(x_in, pad_len, lg);
     }

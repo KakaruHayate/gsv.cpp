@@ -17,9 +17,12 @@ struct gsv_ar_request {
 };
 
 struct gsv_ar_cfg {
-    int  n_threads  = 0;      // 0 = 用 ggml 默认
+    int  n_threads  = 0;      // CPU 后端线程数 (0 = ggml 默认)
     int  max_batch  = 8;      // 预留 (KV cache 上限按实际请求数动态分配)
     bool verbose    = false;
+    std::string device;       // "" = CPU; "vulkan"/"gpu" = 选第一个 GPU 设备
+    bool disable_coopmat2 = true;  // Vulkan: coopmat2 在 F32 matmul 上掉精度 (实测 logits 0.0035->0.0201),
+                                   // 且性能几乎无差 -> 默认禁用
 };
 
 struct gsv_ar_result {

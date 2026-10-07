@@ -27,6 +27,7 @@ int main(int argc, char ** argv) {
     gsv_ar_cfg cfg;
     cfg.n_threads = 8;
     cfg.verbose = true;
+    if (const char * dev = getenv("GSV_AR_DEVICE")) cfg.device = dev;
     gsv_ar * m = gsv_ar::load(model_path, cfg);
     if (!m) return 1;
 

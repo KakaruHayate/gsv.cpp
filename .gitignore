@@ -11,3 +11,4 @@ tests/golden/
 __pycache__/
 *.pyc
 scripts/*.log
+tests/vk/

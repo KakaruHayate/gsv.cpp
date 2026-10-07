@@ -27,6 +27,7 @@ int main(int argc, char ** argv) {
     const int n_threads = argc > 4 ? atoi(argv[4]) : 8;
 
     gsv_ar_cfg cfg; cfg.n_threads = n_threads;
+    if (const char * dev = getenv("GSV_AR_DEVICE")) cfg.device = dev;
     gsv_ar * m = gsv_ar::load(model_path, cfg);
     if (!m) return 1;
     if (n_threads > 0) printf("[bench] threads=%d\n", n_threads);
@@ -52,7 +53,7 @@ int main(int argc, char ** argv) {
     gsv_sampler_cfg sc; sc.top_k = 1; sc.top_p = 1.0f; sc.temperature = 1.0f; sc.repetition_penalty = 1.0f;  // greedy == torch 参考
 
     printf("[bench] generate %d tokens (greedy), warmup ...\n", n_gen);
-    for (int bs : {1, 3, 8}) {
+    for (int bs : {1, 3, 8, 20}) {
         std::vector<gsv_ar_request> reqs;
         for (int i = 0; i < bs; i++) reqs.push_back(base[i % 3]);
 
