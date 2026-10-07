@@ -300,6 +300,111 @@ struct gsv_ar::impl {
         ggml_free(ctx);
     }
 
+    // ---- 解码图缓存 ----
+    // 每步重建图是 bs=1 时约 1/4 的开销 (0.78ms/3.3ms)。这里把解码图做成"固定 key 数":
+    //   key = concat(cache[0..Lmax), 新列)  -> (HD, Lmax+1, NH, B), 形状恒定
+    //   新列用 set_rows 按 idx(=当前长度) 写回 cache (副作用, 与 flash 读的行不重叠)
+    //   mask 屏蔽左 padding 与 [L..Lmax) 的无效槽, 新列槽 (Lmax) 放行
+    // 于是 (Lmax, B) 不变时图/显存计划可复用, 只在跨桶 (L 超过 Lmax) 时重建。
+    bool use_graph_cache = true;
+    struct dec_state {
+        ggml_context * ctx = nullptr;
+        ggml_cgraph  * graph = nullptr;
+        ggml_tensor  * x = nullptr, * mask = nullptr, * idx = nullptr, * logits = nullptr;
+        int Lmax = 0, B = 0;
+    } dgs;
+
+    void dec_free() {
+        if (dgs.ctx) { ggml_free(dgs.ctx); dgs.ctx = nullptr; }
+        dgs.graph = nullptr; dgs.x = dgs.mask = dgs.idx = dgs.logits = nullptr;
+        dgs.Lmax = 0; dgs.B = 0;
+    }
+
+    void dec_build(int Lmax) {
+        dec_free();
+        const int B = cache.B;
+        ggml_init_params ip = { ggml_tensor_overhead() * 2048, NULL, true };
+        ggml_context * ctx = ggml_init(ip);
+        dgs.x    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, 1, B);            ggml_set_input(dgs.x);
+        dgs.mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, Lmax + 1, 1, 1, B);  ggml_set_input(dgs.mask);
+        dgs.idx  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);                  ggml_set_input(dgs.idx);
+
+        ggml_tensor * cur = dgs.x;
+        std::vector<ggml_tensor *> writes;
+        for (int li = 0; li < NL; li++) {
+            ggml_tensor * qkv = ggml_add(ctx, ggml_mul_mat(ctx, ws[li].qkv_w, cur), ws[li].qkv_b);
+            ggml_tensor * qkv4 = ggml_reshape_4d(ctx, qkv, D, 3, 1, B);
+            ggml_tensor * qh   = ggml_view_4d(ctx, qkv4, HD, 1, NH, B, 4 * HD, 4 * HD, qkv4->nb[3], 0);
+            ggml_tensor * ksrc = ggml_view_4d(ctx, qkv4, HD, 1, NH, B, 4 * HD, 4 * HD, qkv4->nb[3], qkv4->nb[1]);
+            ggml_tensor * vsrc = ggml_view_4d(ctx, qkv4, HD, 1, NH, B, 4 * HD, 4 * HD, qkv4->nb[3], 2 * qkv4->nb[1]);
+            // KV 追加: 按 idx 写入 cache 的第 len 行 (同一行索引对 K/V 与所有 head/batch 生效)
+            writes.push_back(ggml_set_rows(ctx, kc_t[li], ksrc, dgs.idx));
+            writes.push_back(ggml_set_rows(ctx, vc_t[li], vsrc, dgs.idx));
+            ggml_tensor * kfull = ggml_concat(ctx, k_view(ctx, li, Lmax), ksrc, 1);
+            ggml_tensor * vfull = ggml_concat(ctx, v_view(ctx, li, Lmax), vsrc, 1);
+            ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, qh, kfull, vfull, dgs.mask,
+                                                        1.0f / std::sqrt((float)HD), 0.0f, 0.0f);
+            attn_out = ggml_reshape_3d(ctx, attn_out, D, 1, B);
+            ggml_tensor * o = ggml_add(ctx, ggml_mul_mat(ctx, ws[li].out_w, attn_out), ws[li].out_b);
+            ggml_tensor * n1 = ln_affine(ctx, cur, o, ws[li].n1w, ws[li].n1b, 1e-5f);
+            ggml_tensor * h = add_act(ctx, ggml_mul_mat(ctx, ws[li].f1w, n1), ws[li].f1b, GGML_ACT_RELU);
+            h = ggml_add(ctx, ggml_mul_mat(ctx, ws[li].f2w, h), ws[li].f2b);
+            cur = ln_affine(ctx, n1, h, ws[li].n2w, ws[li].n2b, 1e-5f);
+        }
+        dgs.logits = ggml_mul_mat(ctx, predict, cur);
+        ggml_set_output(dgs.logits);
+        dgs.graph = ggml_new_graph_custom(ctx, 4096, false);
+        ggml_build_forward_expand(dgs.graph, dgs.logits);
+        for (ggml_tensor * w : writes) ggml_build_forward_expand(dgs.graph, w);   // set_rows 是副作用根
+        ggml_gallocr_alloc_graph(galloc, dgs.graph);
+        dgs.Lmax = Lmax; dgs.B = B; dgs.ctx = ctx;
+    }
+
+    // 桶: L + 25% 余量 (上限 Lmax_alloc)。紧桶让"每步多算 (Lmax-L) 个 key 的
+    // attention/concat"几乎为零, 同时把重建摊到 ~L/4 步; 2 的幂桶在 CPU 上会明显变慢
+    int bucket_for(int L) const {
+        int b = L + std::max(8, L / 4);
+        if (b > Lmax_alloc) b = Lmax_alloc;
+        return b;
+    }
+
+    void run_decode_cached(const std::vector<float> & x_host, const std::vector<int> & pad_len,
+                           std::vector<float> & logits_out) {
+        const double t_a = now_ms();
+        const int B = cache.B;
+        const int L = cache.len + 1;
+        if (dgs.ctx == nullptr || dgs.B != B || L > dgs.Lmax) {
+            int Lmax = bucket_for(L);
+            if (Lmax > Lmax_alloc) Lmax = Lmax_alloc;
+            if (Lmax < L) { run_decode(x_host, pad_len, logits_out); return; }   // 兜底
+            dec_build(Lmax);
+        }
+        const int Lmax = dgs.Lmax;
+        // 有效 key 只有: 历史 [0, cache.len) 与图内新列 (索引 Lmax)。
+        // 注意尾部屏蔽必须从 cache.len 开始 (未写入的槽在跨调用/跨桶后是旧数据, 不能放行)。
+        const int Lh = cache.len;
+        std::vector<ggml_fp16_t> mask_host((size_t)(Lmax + 1) * B);
+        for (int b = 0; b < B; b++)
+            for (int k = 0; k <= Lmax; k++) {
+                const bool bad = (k < pad_len[b]) || (k >= Lh && k < Lmax);
+                mask_host[(size_t) k + (size_t) b * (Lmax + 1)] = ggml_fp32_to_fp16(bad ? -INFINITY : 0.0f);
+            }
+        const double t_b = now_ms();
+        const int32_t idx_host = cache.len;   // 新列写入的行号 = 当前长度
+        ggml_backend_tensor_set(dgs.x,    x_host.data(), 0, x_host.size() * 4);
+        ggml_backend_tensor_set(dgs.mask, mask_host.data(), 0, mask_host.size() * 2);
+        ggml_backend_tensor_set(dgs.idx,  &idx_host, 0, 4);
+        const double t_c = now_ms();
+        ggml_backend_graph_compute(backend, dgs.graph);
+        const double t_d = now_ms();
+        logits_out.assign((size_t)VOCAB * B, 0.0f);
+        ggml_backend_tensor_get(dgs.logits, logits_out.data(), 0, logits_out.size() * 4);
+        const double t_e = now_ms();
+        g_ms_build += t_b - t_a; g_ms_copy += t_c - t_b; g_ms_compute += t_d - t_c; g_ms_io += t_e - t_d;
+        g_steps++;
+        cache.len = L;
+    }
+
     void emb_lookup(int tok, float * out) const {
         const float * base = h_audio_emb.data();
         for (int d = 0; d < D; d++) out[d] = base[(size_t)tok * D + d];
@@ -307,7 +412,7 @@ struct gsv_ar::impl {
 };
 
 gsv_ar::gsv_ar() : p(new impl()) {}
-gsv_ar::~gsv_ar() {
+gsv_ar::~gsv_ar() { p->dec_free();
     if (p->galloc) ggml_gallocr_free(p->galloc);
     if (p->backend) ggml_backend_free(p->backend);
     if (p->wbuf) ggml_backend_buffer_free(p->wbuf);
@@ -454,13 +559,31 @@ gsv_ar * gsv_ar::load(const std::string & gguf_path, const gsv_ar_cfg & cfg) {
         s.fuse_ln = s.fuse_act = sup;
     }
     if (getenv("GSV_NO_FUSE"))     s.fuse_ln = s.fuse_act = false;
+    // 图缓存需要后端支持 set_rows(F32 + i32); 不支持时退回逐步建图
+    {
+        ggml_init_params gp = { ggml_tensor_overhead() * 32, NULL, true };
+        ggml_context * gctx = ggml_init(gp);
+        ggml_tensor * ga = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, 64, 16);
+        ggml_tensor * gb = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, 64, 1);
+        ggml_tensor * gi = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
+        ggml_tensor * gs = ggml_set_rows(gctx, ga, gb, gi);
+        // 只在 GPU 上启用: 固定 key 数会让每步多拷 (Lmax-L) 列的 K/V, GPU 上这部分
+        // 几乎免费 (带宽富裕) 而建图占 24%; CPU 是带宽受限, 实测反而慢 10~25%。
+        const bool is_gpu = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                            ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU;
+        s.use_graph_cache = is_gpu && ggml_backend_supports_op(s.backend, gs);
+        ggml_free(gctx);
+    }
+    if (getenv("GSV_AR_NO_GRAPHCACHE")) s.use_graph_cache = false;
     if (getenv("GSV_NO_FUSE_LN"))  s.fuse_ln = false;
     if (getenv("GSV_NO_FUSE_ACT")) s.fuse_act = false;
     s.mk_pe();
     if (cfg.verbose)
         printf("[gsv_ar] loaded %s: D=%d head=%d layers=%d vocab=%d EOS=%d bert=%d alpha=(%.4f, %.4f)\n",
                gguf_path.c_str(), s.D, s.NH, s.NL, s.VOCAB, s.EOS, s.BERT_DIM, s.text_pe_alpha, s.audio_pe_alpha);
-    if (cfg.verbose) printf("[gsv_ar] fused ops: ln=%s act=%s\n", s.fuse_ln ? "on" : "off", s.fuse_act ? "on" : "off");
+    if (cfg.verbose) printf("[gsv_ar] fused ops: ln=%s act=%s | decode graph cache: %s\n",
+                            s.fuse_ln ? "on" : "off", s.fuse_act ? "on" : "off",
+                            s.use_graph_cache ? "on" : "off");
     return m;
 }
 
@@ -552,7 +675,8 @@ gsv_ar_result gsv_ar::generate(const std::vector<gsv_ar_request> & reqs,
             for (int d = 0; d < s.D; d++)
                 x_in[(size_t) d + (size_t) b * s.D] = e[d] + s.h_audio_alpha * s.pe_tab[(size_t) pos * s.D + d];
         }
-        s.run_decode(x_in, pad_len, lg);
+        if (s.use_graph_cache) s.run_decode_cached(x_in, pad_len, lg);
+        else                   s.run_decode(x_in, pad_len, lg);
     }
     for (int b = 0; b < B; b++)
         if (idx_list[b] < 0) {
