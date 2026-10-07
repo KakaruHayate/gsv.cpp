@@ -116,6 +116,20 @@ struct gsv_ar::impl {
         return ggml_view_4d(ctx, t, HD, 1, NH, cache.B, t->nb[1], t->nb[2], t->nb[3], (int64_t) col * t->nb[1]);
     }
 
+    bool fuse_ln = true, fuse_act = true;   // 融合算子开关 (GSV_NO_FUSE / GSV_NO_FUSE_LN / GSV_NO_FUSE_ACT)
+
+    // LN(x)*w + b: 融合算子不可用时退回 norm+mul+add
+    ggml_tensor * ln_affine(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w, ggml_tensor * b, float eps) {
+        if (fuse_ln) return ggml_layernorm_affine(ctx, x, w, b, eps);
+        return ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, x, eps), w), b);
+    }
+    // act(a + b): 融合算子不可用时退回 add + 激活
+    ggml_tensor * add_act(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b, int act) {
+        if (fuse_act) return ggml_add_act(ctx, a, b, act);
+        ggml_tensor * t = ggml_add(ctx, a, b);
+        return act == GGML_ACT_RELU ? ggml_relu(ctx, t) : ggml_gelu_erf(ctx, t);
+    }
+
     void mk_pe() {
         pe_tab.assign((size_t)Y_PE_MAX * D, 0.0f);
         for (int pos = 0; pos < Y_PE_MAX; pos++)
@@ -200,11 +214,11 @@ struct gsv_ar::impl {
             attn_out = ggml_reshape_3d(ctx, attn_out, D, S, B);
             ggml_tensor * o = ggml_add(ctx, ggml_mul_mat(ctx, ws[li].out_w, attn_out), ws[li].out_b);
             ggml_tensor * c2 = ggml_add(ctx, cur, o);
-            ggml_tensor * n1 = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, c2, 1e-5f), ws[li].n1w), ws[li].n1b);
-            ggml_tensor * h = ggml_relu(ctx, ggml_add(ctx, ggml_mul_mat(ctx, ws[li].f1w, n1), ws[li].f1b));
+            ggml_tensor * n1 = ln_affine(ctx, c2, ws[li].n1w, ws[li].n1b, 1e-5f);
+            ggml_tensor * h = add_act(ctx, ggml_mul_mat(ctx, ws[li].f1w, n1), ws[li].f1b, GGML_ACT_RELU);
             h = ggml_add(ctx, ggml_mul_mat(ctx, ws[li].f2w, h), ws[li].f2b);
             ggml_tensor * c3 = ggml_add(ctx, n1, h);
-            cur = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, c3, 1e-5f), ws[li].n2w), ws[li].n2b);
+            cur = ln_affine(ctx, c3, ws[li].n2w, ws[li].n2b, 1e-5f);
         }
         ggml_tensor * logits = ggml_mul_mat(ctx, predict, cur);
         ggml_tensor * last_view = ggml_view_3d(ctx, logits, VOCAB, 1, B, logits->nb[1], logits->nb[2], (int64_t)(S - 1) * logits->nb[1]);
@@ -263,11 +277,11 @@ struct gsv_ar::impl {
             attn_out = ggml_reshape_3d(ctx, attn_out, D, 1, B);
             ggml_tensor * o = ggml_add(ctx, ggml_mul_mat(ctx, ws[li].out_w, attn_out), ws[li].out_b);
             ggml_tensor * c2 = ggml_add(ctx, cur, o);
-            ggml_tensor * n1 = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, c2, 1e-5f), ws[li].n1w), ws[li].n1b);
-            ggml_tensor * h = ggml_relu(ctx, ggml_add(ctx, ggml_mul_mat(ctx, ws[li].f1w, n1), ws[li].f1b));
+            ggml_tensor * n1 = ln_affine(ctx, c2, ws[li].n1w, ws[li].n1b, 1e-5f);
+            ggml_tensor * h = add_act(ctx, ggml_mul_mat(ctx, ws[li].f1w, n1), ws[li].f1b, GGML_ACT_RELU);
             h = ggml_add(ctx, ggml_mul_mat(ctx, ws[li].f2w, h), ws[li].f2b);
             ggml_tensor * c3 = ggml_add(ctx, n1, h);
-            cur = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, c3, 1e-5f), ws[li].n2w), ws[li].n2b);
+            cur = ln_affine(ctx, c3, ws[li].n2w, ws[li].n2b, 1e-5f);
         }
         ggml_tensor * logits = ggml_mul_mat(ctx, predict, cur);
         ggml_set_output(logits);
@@ -429,10 +443,27 @@ gsv_ar * gsv_ar::load(const std::string & gguf_path, const gsv_ar_cfg & cfg) {
     }
 
     g_prof = getenv("GSV_AR_PROFILE") != nullptr;
+    // 融合算子支持探测: 用代表性形状建一次节点问后端 (CPU 恒支持; Vulkan 需 shader 在册)
+    {
+        ggml_init_params fp = { ggml_tensor_overhead() * 32, NULL, true };
+        ggml_context * fctx = ggml_init(fp);
+        ggml_tensor * fx = ggml_new_tensor_2d(fctx, GGML_TYPE_F32, 64, 4);
+        ggml_tensor * fw = ggml_new_tensor_1d(fctx, GGML_TYPE_F32, 64);
+        ggml_tensor * fb = ggml_new_tensor_1d(fctx, GGML_TYPE_F32, 64);
+        ggml_tensor * fln = ggml_layernorm_affine(fctx, fx, fw, fb, 1e-5f);
+        ggml_tensor * fac = ggml_add_act(fctx, fx, fw, GGML_ACT_RELU);
+        const bool sup = ggml_backend_supports_op(s.backend, fln) && ggml_backend_supports_op(s.backend, fac);
+        ggml_free(fctx);
+        s.fuse_ln = s.fuse_act = sup;
+    }
+    if (getenv("GSV_NO_FUSE"))     s.fuse_ln = s.fuse_act = false;
+    if (getenv("GSV_NO_FUSE_LN"))  s.fuse_ln = false;
+    if (getenv("GSV_NO_FUSE_ACT")) s.fuse_act = false;
     s.mk_pe();
     if (cfg.verbose)
         printf("[gsv_ar] loaded %s: D=%d head=%d layers=%d vocab=%d EOS=%d bert=%d alpha=(%.4f, %.4f)\n",
                gguf_path.c_str(), s.D, s.NH, s.NL, s.VOCAB, s.EOS, s.BERT_DIM, s.text_pe_alpha, s.audio_pe_alpha);
+    if (cfg.verbose) printf("[gsv_ar] fused ops: ln=%s act=%s\n", s.fuse_ln ? "on" : "off", s.fuse_act ? "on" : "off");
     return m;
 }
 

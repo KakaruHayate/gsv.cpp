@@ -7,16 +7,22 @@
 
 | 配置 | 每 token 延迟 | 吞吐 | 相对优化前 |
 |---|---|---|---|
-| **Vulkan f32（bs=1）** | **5.08 → 3.89 ms** | 197 → 257 tok/s | **-23%** |
-| Vulkan f32（bs=3 / bs=8） | 6.84 → 5.49 / 9.07 → 8.10 ms | 546 / 987 tok/s | -20% / -11% |
+| **Vulkan f32（bs=1）** | **5.08 → 3.89（阶段 1）→ 3.57 ms（+融合算子）** | 197 → **280 tok/s** | **-30%** |
+| Vulkan f32（bs=3） | 6.84 → 5.49 → **5.25 ms** | 571 tok/s | **-23%** |
+| Vulkan f32（bs=8 / bs=20） | 9.07 → 8.10 / 15.27 → ~16.8（见 §5 噪声说明） | | -5~11% |
 | Vulkan **+ q8_attn_ffn 权重**（bs=1） | **3.54 ms** | **283 tok/s** | -30%（含精度档） |
-| CPU f32（bs=1，8 线程） | 19.64 → 17.6 ms | 57 tok/s | 建图/算子优化对 CPU 影响很小（CPU 受权重带宽限制） |
+| CPU f32（bs=1，8 线程） | 同期配对：20.97 → **19.29 ms** | | 融合算子 -8%（跨时段绝对值 17.3~21.0 ms 波动） |
 | **CPU + q8_attn_ffn 权重**（bs=1） | **9.1 ms** | **110 tok/s** | **-54%**（近无损档，见 §3） |
 | CPU f16（bs=1） | 13.4 ms | 75 tok/s | -32% |
 
 一句话：**GPU 单流延迟的瓶颈是"每步固定开销"（dispatch + 建图），不是一个 token 的算力**；
-本次砍掉 144 次拷贝 dispatch、48 次冗余图遍历、去掉每步一次 cast，Vulkan 单流 -23%；
+本次砍掉 144 次拷贝 dispatch、48 次冗余图遍历、去掉每步一次 cast（阶段 1，Vulkan 单流 -23%），
+再把每层 5 次 elementwise 合成 2 个新算子（阶段 2，bs=1 再 -19%，见 §2.5）；
 CPU 路径的杠杆是**权重精度**（f32→Q8_0 近无损档直接 -54%），不是算子数。
+
+> **测量噪声警告**：这台机器上 Vulkan 的 bs=1/bs=8 数字在不同时段会漂 ±10~20%（GPU 时钟/host 负载）。
+> 只有**同一时段、相邻运行的配对比较**才有意义；跨时段/跨文档的绝对值请当作 ±20% 看待
+> （§5 记录了一次 "同一配置 3.46 → 4.78 ms" 的漂移）。
 
 ## 1. 每步开销剖析（优化前，Vulkan bs=1）
 
@@ -54,6 +60,42 @@ residual 1 + norm 1 + mul 1 + add 1 = **28 dispatch/层 → 674/步**（+ ~170 �
 > 否则 Vulkan 不插 barrier、顺序不定（表现为随机早停）。本次没有动这个结构，只是把
 > "写 cache 的数据"从 `cont` 结果换成了视图。
 
+## 2.5 阶段 2：两个融合算子（ggml 新增，CPU + Vulkan）
+
+每层原本有 5 次"小算子"：`norm + mul(n1w) + add(n1b)` ×2 处、`add(f1b) + relu`。它们的张量都很小
+（[512, 1, B] 或 [2048, 1, B]），但**每次都是独立 dispatch**，而且 `mul`/`add` 带 `[D]` 向量是
+**广播型 elementwise**——Vulkan 上走的是通用 fastdiv 路径（每元素一次索引计算），比普通 elementwise 更慢。
+
+新增两个算子（`patches/` 里的 audio-patch 现在含 118 个算子，CPU + Vulkan 双实现）：
+
+| 算子 | 语义 | 替换 | 省 |
+|---|---|---|---|
+| `ggml_layernorm_affine(ctx,x,w,b,eps)` | `(x-mean)/sqrt(var+eps)*w+b`，一次遍历 | `norm + mul + add` | 2 dispatch ×2 处/层 |
+| `ggml_add_act(ctx,a,b,act)` | `act(a+b)`，b 按 ne0 广播（`act`: 0=none,1=relu,2=gelu_erf） | `add + relu/gelu` | 1 dispatch/层 |
+
+每层 dispatch 22 → 17（AR）/ 18 → 14（BERT）；Vulkan 端 2 个 shader
+（`layernorm_affine.comp` 每 workgroup 一行、`add_act.comp` 每线程一元素；erf 用上游
+`geglu_erf.comp` 同款 A&S 近似，因为 glslc 没有 erf 内建）。
+
+**配对实测（同时段相邻运行，n_gen=100）**：
+
+| 场景 | 未融合 | 融合 | 变化 |
+|---|---|---|---|
+| Vulkan bs=1 | 4.39 / 4.52 ms | **3.57 / 3.66 ms** | **-19%** |
+| Vulkan bs=3 | 6.12 / 7.11 ms | **5.25 / 5.30 ms** | **-14%** |
+| Vulkan bs=20（300 步） | 17.66 / 17.67 ms | **16.80 / 17.00 ms** | -5% |
+| CPU bs=1（8 线程） | 20.97 ms | **19.29 ms** | **-8%** |
+| BERT Vulkan f16（T=25） | 8.34 ms | 8.53 ms | 噪声内（±2%） |
+| BERT CPU（16 线程） | 127.5（f32）/ 131.7（f16） ms | **116.2 / 115.7 ms** | **-9% / -12%** |
+
+- 收益集中在**小 batch（单流）**与 CPU：bs 越小，"固定开销"占比越高，省 dispatch 越值钱。
+- BERT 在 Vulkan 上收益落在噪声里（它的 matmul 形状是 [1024,1024]×[1024,25]，TP=25 行，
+  后端把 bias 融进 matmul 的路径不同），但 CPU 上有实打实的 -9~12%。
+- 验收：`tests/test_fused_ops.cpp` 用 5 种形状（D=56/64/512/1024/4096）× 2 种激活，与"未融合链"
+  逐元素对拍（CPU + Vulkan 全 PASS）；AR/BERT 的 golden 对拍数值不变（5.25e-6 / 1e-5，token 全一致）。
+- 开关：默认开启（加载时用 `ggml_backend_supports_op` 探测，不支持则自动回退）；
+  `GSV_NO_FUSE=1` / `GSV_NO_FUSE_LN=1` / `GSV_NO_FUSE_ACT=1` 可分别关闭（A/B 用）。
+
 ## 3. 权重精度档对单流延迟（本次新增的实测）
 
 | 模型 | 体积 | CPU bs=1 | Vulkan bs=1 | 100-token 门（CPU / Vulkan） |
@@ -62,6 +104,8 @@ residual 1 + norm 1 + mul 1 + add 1 = **28 dispatch/层 → 674/步**（+ ~170 �
 | f16 | 151 MB | 13.4 ms | 3.95 ms | PASS / PASS |
 | **q8_attn_ffn（近无损档）** | **85 MB** | **9.1 ms** | **3.54 ms** | **PASS / PASS** |
 | k_q6k | 67 MB | 9.0 ms | — | PASS（`docs/quant_ar.md`） |
+
+（本表为阶段 1 之后的测量；融合算子会把 bs=1 的 Vulkan 数字再降 ~15~19%，见 §2.5。）
 
 - CPU 是**权重带宽受限**：f32 每 token 读 ~300 MB，Q8_0 只读 ~90 MB → 延迟几乎按体积线性下降；
   8 线程与 16 线程无差别（17.6 vs 17.9 ms）进一步印证是带宽而非算力瓶颈。
@@ -72,10 +116,17 @@ residual 1 + norm 1 + mul 1 + add 1 = **28 dispatch/层 → 674/步**（+ ~170 �
 
 | 方向 | 预计收益 | 代价/风险 |
 |---|---|---|
-| **融合算子**：`norm + mul + add` → 1 个 `layernorm_affine`（每层 2 处，省 4/层）；`add + relu` 复用 patch 已有的 `ADD_LEAKY_RELU`（CPU-only，需补 Vulkan shader，省 1/层） | 每层 22 → 17 dispatch，bs=1 ≈ **3.3 ms（-17%）** | 需在 ggml 加算子 + Vulkan shader + 重放 audio-patch（约 250 行，工作路径与 patch 里 116 个算子一致） |
+| ~~融合算子 `layernorm_affine` / `add_act`~~ | ~~bs=1 -17%~~ | **已在 §2.5 完成**：bs=1 -19%、bs=3 -14%、CPU -8% |
 | 图复用（把 KV 列偏移从图里拿掉，建图 0.99 ms → 0） | ≈ **2.9 ms（-25%）** | 需要 mutate `tensor->data`（非 ggml 公开 API）或给 `ggml_cpy` 加"可变视图"语义；属于 hack，需谨慎 |
 | prefill（TTFT）：56 token 前缀 45.5 ms | 与 decode 同源（674 dispatch + chunk 化 attention） | 分块 prefill / 更大 tile；当前已领先 torch CUDA Graph 1.7× |
 | FA 的 K/V 常驻 F16（Vulkan 的 FA 内核本来就只吃 F16 K/V） | 省一半 KV 流量，Vulkan 上数值等价 | 会改变 CPU 端数值（f16 化 K/V），需重跑验收 |
+
+### 4.1 测量噪声记录（重要）
+
+同一份二进制、同一配置重复跑，Vulkan bs=1 出现过 **3.46 / 3.91 / 4.06 / 4.39 / 4.78 ms** 的漂移
+（跨时段；同一时段内重复一般 ±3%）。原因是这台机器上 bs=1 的每步只有 ~4 ms，GPU 时钟与 host 负载
+都会直接落在数字上。所以本文件的所有结论都基于**同时段配对测量**；跨时段比较请忽略 ±20% 以内的差异。
+判定方法：先跑 A、再跑 B、再跑 A（ABA），若 A 的两次差异小于 B 的偏移才认为 B 有效。
 
 ## 5. CUDA 后端（本次未做，原因记录）
 

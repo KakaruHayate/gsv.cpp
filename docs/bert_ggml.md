@@ -9,7 +9,7 @@
 | 模块 | `src/gsv_bert.{h,cpp}`：22 层 post-LN encoder（**只跑 0..21 层**，等价 `hidden_states[-3]`），F32 计算 + `flash_attn_ext` |
 | 精度（CPU，vs HF fp32） | 4 文本最终特征 max\|Δ\| = **1.0e-5**，cos = 1.00000000；逐层 23 个隐藏状态全部对齐（max 9.5e-6） |
 | 精度（Vulkan，vs HF fp32） | max\|Δ\| = 1.2e-2 / 均值 4.0e-4（cos 0.9999999）——见 §4 的容限论证，**在产品指标上安全** |
-| 速度（T=25） | ggml CPU-f32 **149 ms**（16 线程 f16 **110 ms**）/ ggml Vulkan-f32 **10.6 ms** / ggml Vulkan-f16 **8.5 ms**；torch CPU-fp32 169 ms / torch GPU-fp32 49 ms / torch GPU-fp16 50 ms（**比 torch 最快路径快 ~5.9×**） |
+| 速度（T=25） | ggml CPU **116 ms（16 线程，f32/f16 同档，已含融合算子）** / ggml Vulkan-f16 **8.5 ms** / Vulkan-f32 10.6 ms；torch CPU-fp32 169 ms / torch GPU-fp32 49 ms / torch GPU-fp16 50 ms（**比 torch 最快路径快 ~5.9×**） |
 | 最小近无损精度 | **F16：662 MB**（1.9×↓）——CPU 均值 2.7e-4 / Vulkan 2.0e-3 |
 | ✗ 拒绝 | **Q8_0 及以下**（均值 ≥1.2e-2，max 达 0.17~1.0）：BERT 对隐藏状态级误差远比 AR 敏感（§5） |
 | Vocoder 无关 | BERT 只影响 semantic token，与声码器无耦合；不影响"声码器严格不量化"的决策 |
@@ -119,12 +119,20 @@ CPU 结果（复现见上）：4 文本 `max|Δ| = 3.8e-6 ~ 1.05e-5`，cos = 1.0
 （~400 次 dispatch + 每次调用的建图/gallocr），只有 ~21% 是真算力（25 token 时 13.9 GFLOP，
 8.5 ms ↔ 1.6 TFLOPS 有效，仅为 RTX 2070 fp32 峰值的 21%）。所以**减少 dispatch 数就是它的提速路线**。
 
-**能做的（工程层，预计再 -15~20%）**：每层仍有 18 dispatch，其中 4 个是纯 elementwise
-（`norm + mul + add` 两处 = 6 个、`add bias` 两处、`add` 残差两处、`gelu`）。把
-`norm(x)·w + b` 合成一个 `layernorm_affine` 算子即可省 4/层（22 层 = 88 dispatch），
-`add + relu` 类融合再省一点。收益与 AR 那侧同一套改造（需要 Vulkan shader + 重放 audio-patch），
-做完预计 Vulkan f16 8.5 → ~7 ms。**注意 BERT 的 LN 仿射不能"折叠进下游 matmul"**：
-post-LN 结构的 LN 输出同时喂给残差流和下一个 matmul，折叠会改变残差（AR 同理，已实测推导）。
+**能做的（工程层）—— 已做完**：把 `norm+mul+add` 合成 `ggml_layernorm_affine`（3 处/层：embedding LN +
+两个 post-LN），把 `add+gelu_erf` 合成 `ggml_add_act`（1 处/层），每层 18 → 14 dispatch（算子实现见
+[ar_latency.md §2.5](ar_latency.md)，CPU + Vulkan 双实现，默认开启）。实测：
+
+| 配置 | 未融合 | 融合 | 变化 |
+|---|---|---|---|
+| CPU f32（16 线程，T=25） | 127.5 ms | **116.2 ms** | **-9%** |
+| CPU f16（16 线程，T=25） | 131.7 ms | **115.7 ms** | **-12%** |
+| Vulkan f16（T=25） | 8.34 ms | 8.53 ms | 噪声内（±2%） |
+
+Vulkan 上没收益的原因：BERT 的 matmul 形状（[1024,1024]×[1024,25]）走的是带 bias 融合的多头 matmul
+路径，我新增的 elementwise 融合在这条路径上省下的 dispatch 占比很小；CPU 上没有这种后端融合，
+所以收益实打实。**顺带记录一条推导结论**：BERT 的 LN 仿射**不能**折叠进下游 matmul——post-LN 结构里
+LN 的输出同时喂给残差流和下一个 matmul，折叠会改变残差（AR 同理）。
 
 **不建议做的（模型层）**：
 

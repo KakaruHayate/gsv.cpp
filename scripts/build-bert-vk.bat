@@ -16,5 +16,6 @@ set LIBS=llama.cpp\build-vk-rel\ggml\src\Release\ggml-base.lib llama.cpp\build-v
 set INC=/utf-8 /I src /I llama.cpp\ggml\include /I llama.cpp\ggml\src /I llama.cpp\src
 
 cl /nologo /O2 /EHsc /W1 %INC% tests\test_bert_ggml.cpp src\gsv_bert.cpp /Fe:tests\rel\test_bert_rel.exe /Fo:tests\rel\ /link %LIBS% || exit /b 1
+cl /nologo /O2 /EHsc /W1 %INC% tests\test_fused_ops.cpp /Fe:tests\rel\test_fused_ops_rel.exe /Fo:tests\rel\ /link %LIBS% || exit /b 1
 copy /y llama.cpp\build-vk-rel\bin\Release\ggml*.dll tests\rel\ >nul
-echo BUILD_OK -^> tests\rel\test_bert_rel.exe
+echo BUILD_OK -^> tests\rel\test_bert_rel.exe tests\rel\test_fused_ops_rel.exe

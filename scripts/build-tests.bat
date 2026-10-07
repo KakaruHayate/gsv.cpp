@@ -26,7 +26,7 @@ if errorlevel 1 exit /b 1
 set LIBS=llama.cpp\build-cpu\ggml\src\Debug\ggml-base.lib llama.cpp\build-cpu\ggml\src\Debug\ggml-cpu.lib llama.cpp\build-cpu\ggml\src\Debug\ggml.lib
 set INC=/utf-8 /I src /I llama.cpp\ggml\include /I llama.cpp\ggml\src /I llama.cpp\src
 
-for %%T in (test_ar_step0 test_ar_decode test_ar_batch test_ar_sampler test_min_ffn test_ar_engine) do (
+for %%T in (test_ar_step0 test_ar_decode test_ar_batch test_ar_sampler test_min_ffn test_ar_engine test_fused_ops) do (
   cl /nologo /O2 /EHsc /W1 %INC% tests\%%T.cpp src\gsv_sampler.cpp src\gsv_ar.cpp /Fe:tests\%%T.exe /Fo:tests\ /link %LIBS%
   if errorlevel 1 exit /b 1
 )
