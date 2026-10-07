@@ -1,4 +1,4 @@
-From c78f1b0784acc609102e7cb5c7f8b349b7321a07 Mon Sep 17 00:00:00 2001
+From 0327b058690a60dd5f29087a554cf532a3229445 Mon Sep 17 00:00:00 2001
 From: KakaruHayate <kakaru@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 20:49:32 +0800
 Subject: [PATCH] ggml: port ggml-audio-patch learned-ops + qvac-ops + vulkan
@@ -15,20 +15,20 @@ Subject: [PATCH] ggml: port ggml-audio-patch learned-ops + qvac-ops + vulkan
   VK_EXT_shader_atomic_float probing, disk-backed persistent pipeline cache
 - CPU/CUDA/Metal dispatch + supports_op updated; ggml op count 116 -> 118
 ---
- ggml/include/ggml.h                           |  339 +++++
+ ggml/include/ggml.h                           |  342 +++++
  ggml/src/ggml-backend-meta.cpp                |   17 +-
  ggml/src/ggml-cpu/ggml-cpu.c                  |  104 +-
- ggml/src/ggml-cpu/ops.cpp                     | 1295 ++++++++++++++++-
+ ggml/src/ggml-cpu/ops.cpp                     | 1300 ++++++++++++++++-
  ggml/src/ggml-cpu/ops.h                       |   19 +
  ggml/src/ggml-cuda/conv-transpose-1d.cu       |   29 +-
  ggml/src/ggml-cuda/ggml-cuda.cu               |    2 +
  ggml/src/ggml-metal/ggml-metal-device.cpp     |    2 +-
  ggml/src/ggml-metal/ggml-metal-device.m       |    4 +-
  ggml/src/ggml-metal/ggml-metal-ops.cpp        |    1 +
- ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp    |   16 +
- .../ggml-vulkan/ggml-vulkan-push-constants.h  |   60 +
+ ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp    |   18 +
+ .../ggml-vulkan/ggml-vulkan-push-constants.h  |   61 +
  ggml/src/ggml-vulkan/ggml-vulkan-types.h      |  149 ++
- ggml/src/ggml-vulkan/ggml-vulkan.cpp          |  550 ++++++-
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          |  553 ++++++-
  .../ggml-vulkan/vulkan-shaders/add_act.comp   |   55 +
  .../vulkan-shaders/affine_prelu.comp          |   40 +
  .../vulkan-shaders/channel_shuffle.comp       |   33 +
@@ -36,17 +36,17 @@ Subject: [PATCH] ggml: port ggml-audio-patch learned-ops + qvac-ops + vulkan
  .../vulkan-shaders/conv_transpose_1d.comp     |   17 +-
  ggml/src/ggml-vulkan/vulkan-shaders/gru.comp  |   77 +
  .../ggml-vulkan/vulkan-shaders/gru_small.comp |   77 +
- .../vulkan-shaders/layernorm_affine.comp      |   60 +
+ .../vulkan-shaders/layernorm_affine.comp      |   64 +
  .../vulkan-shaders/rel_pos_bias.comp          |   63 +
  .../vulkan-shaders/scatter_elements.comp      |   67 +
  .../vulkan-shaders/vulkan-shaders-gen.cpp     |   24 +
  .../vulkan-shaders/zero_upsample.comp         |   30 +
- ggml/src/ggml.c                               |  723 ++++++++-
+ ggml/src/ggml.c                               |  731 ++++++++-
  tests-learned/bench_learned_ops.c             |  347 +++++
  tests-learned/bench_qvac_ops.c                |  616 ++++++++
  tests-learned/test_learned_ops.c              |  647 ++++++++
  tests-learned/test_qvac_ops.c                 |  887 +++++++++++
- 31 files changed, 6723 insertions(+), 45 deletions(-)
+ 31 files changed, 6749 insertions(+), 45 deletions(-)
  create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/add_act.comp
  create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/affine_prelu.comp
  create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/channel_shuffle.comp
@@ -63,7 +63,7 @@ Subject: [PATCH] ggml: port ggml-audio-patch learned-ops + qvac-ops + vulkan
  create mode 100644 tests-learned/test_qvac_ops.c
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 224bdef..8f25043 100644
+index 224bdef..5ce684a 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -601,6 +601,63 @@ extern "C" {
@@ -215,7 +215,7 @@ index 224bdef..8f25043 100644
      GGML_API struct ggml_tensor * ggml_conv_2d(
              struct ggml_context * ctx,
              struct ggml_tensor  * a,   // convolution kernel
-@@ -2587,6 +2708,224 @@ extern "C" {
+@@ -2587,6 +2708,227 @@ extern "C" {
              struct ggml_tensor  * pw,
              struct ggml_tensor  * ph);
  
@@ -420,11 +420,14 @@ index 224bdef..8f25043 100644
 +        GGML_ACT_GELU_ERF = 2,
 +    };
 +
-+    // Fused LayerNorm(x)*w + b over ne0 (AR/BERT transformer blocks).
-+    // x [ne0, ne1, ne2, ne3] contiguous; w, b are [ne0] vectors.
++    // Fused LayerNorm(x + r)*w + b over ne0 (AR/BERT transformer blocks):
++    // collapses residual-add + norm + affine into one pass.
++    // x is [ne0, ne1, ne2, ne3] contiguous; r is the same shape (or NULL = no
++    // residual); w, b are [ne0] vectors.
 +    GGML_API struct ggml_tensor * ggml_layernorm_affine(
 +            struct ggml_context * ctx,
 +            struct ggml_tensor  * x,
++            struct ggml_tensor  * r,
 +            struct ggml_tensor  * w,
 +            struct ggml_tensor  * b,
 +            float                 eps);
@@ -657,7 +660,7 @@ index 7c274c0..802d1ce 100644
                      {
                          if (node->src[0]->type == GGML_TYPE_F16 && node->type != GGML_TYPE_F16) {
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 16a916d..41ccdf7 100644
+index 16a916d..f2e72ca 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -11,6 +11,7 @@
@@ -1011,7 +1014,7 @@ index 16a916d..41ccdf7 100644
  // ggml_compute_forward_im2col_back_f32
  
  void ggml_compute_forward_im2col_back_f32(
-@@ -10636,6 +10879,1032 @@ void ggml_compute_forward_add_rel_pos(
+@@ -10636,6 +10879,1037 @@ void ggml_compute_forward_add_rel_pos(
      }
  }
  
@@ -1532,31 +1535,36 @@ index 16a916d..41ccdf7 100644
 +        struct ggml_tensor * dst) {
 +
 +    const struct ggml_tensor * x = dst->src[0];
-+    const struct ggml_tensor * w = dst->src[1];
-+    const struct ggml_tensor * b = dst->src[2];
++    const struct ggml_tensor * r = dst->src[1];
++    const struct ggml_tensor * w = dst->src[2];
++    const struct ggml_tensor * b = dst->src[3];
 +
-+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && r->type == GGML_TYPE_F32);
 +    GGML_ASSERT(w->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32);
-+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(dst));
++    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(r) && ggml_is_contiguous(dst));
 +
 +    const int64_t ne00  = x->ne[0];
 +    const int64_t nrows = ggml_nrows(x);
 +    const float   eps   = ggml_get_op_params_f32(dst, 0);
++    const bool    has_r = ggml_get_op_params_i32(dst, 1) != 0;
 +
 +    const float * xd = (const float *) x->data;
++    const float * rd = (const float *) r->data;
 +    const float * wd = (const float *) w->data;
 +    const float * bd = (const float *) b->data;
 +    float       * yd = (float       *) dst->data;
 +
 +    for (int64_t row = params->ith; row < nrows; row += params->nth) {
 +        const float * xr = xd + row * ne00;
++        const float * rr = rd + row * ne00;
 +        float       * yr = yd + row * ne00;
 +
 +        ggml_float sum  = 0.0;
 +        ggml_float sum2 = 0.0;
 +        for (int64_t i = 0; i < ne00; ++i) {
-+            sum  += xr[i];
-+            sum2 += (ggml_float) xr[i] * (ggml_float) xr[i];
++            const float v = xr[i] + (has_r ? rr[i] : 0.0f);
++            sum  += v;
++            sum2 += (ggml_float) v * (ggml_float) v;
 +        }
 +
 +        const float mean = (float) (sum / ne00);
@@ -1564,7 +1572,7 @@ index 16a916d..41ccdf7 100644
 +        const float inv  = 1.0f / sqrtf(var + eps);
 +
 +        for (int64_t i = 0; i < ne00; ++i) {
-+            yr[i] = (xr[i] - mean) * inv * wd[i] + bd[i];
++            yr[i] = (xr[i] + (has_r ? rr[i] : 0.0f) - mean) * inv * wd[i] + bd[i];
 +        }
 +    }
 +}
@@ -2221,10 +2229,10 @@ index dfe46ba..8102461 100644
                  n_fuse = ggml_metal_op_im2col(ctx, idx);
              } break;
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp b/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp
-index 8d8fe65..0fbfde9 100644
+index 8d8fe65..233e942 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan-debug.cpp
-@@ -1342,6 +1342,22 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
+@@ -1342,6 +1342,24 @@ void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph
              const int32_t s2 = tensor->op_params[2];
              const int32_t s3 = tensor->op_params[3];
              tensor_clone = ggml_roll(ggml_ctx, src_clone[0], s0, s1, s2, s3);
@@ -2238,7 +2246,9 @@ index 8d8fe65..0fbfde9 100644
 +        } else if (tensor->op == GGML_OP_AFFINE_PRELU) {
 +            tensor_clone = ggml_affine_prelu(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]);
 +        } else if (tensor->op == GGML_OP_LAYERNORM_AFFINE) {
-+            tensor_clone = ggml_layernorm_affine(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
++            tensor_clone = ggml_layernorm_affine(ggml_ctx, src_clone[0],
++                                                 ggml_get_op_params_i32(tensor, 1) != 0 ? src_clone[1] : nullptr,
++                                                 src_clone[2], src_clone[3],
 +                                                 ggml_get_op_params_f32(tensor, 0));
 +        } else if (tensor->op == GGML_OP_ADD_ACT) {
 +            tensor_clone = ggml_add_act(ggml_ctx, src_clone[0], src_clone[1], ggml_get_op_params_i32(tensor, 0));
@@ -2248,10 +2258,10 @@ index 8d8fe65..0fbfde9 100644
          else {
              std::cerr << "Missing vk_check_results OP: " << ggml_op_name(tensor->op) << std::endl;
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
-index f1f66a6..60723ec 100644
+index f1f66a6..dbfbda7 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
-@@ -492,6 +492,39 @@ struct vk_op_rms_norm_mul_rope_push_constants {
+@@ -492,6 +492,40 @@ struct vk_op_rms_norm_mul_rope_push_constants {
      vk_op_rope_push_constants rope;
  };
  
@@ -2274,11 +2284,12 @@ index f1f66a6..60723ec 100644
 +    uint32_t ne, F, FT, C;
 +};
 +
-+// fused LayerNorm(x)*w + b (AR/BERT): one workgroup per row
++// fused LayerNorm(x + r)*w + b (AR/BERT): one workgroup per row
 +struct vk_op_layernorm_affine_push_constants {
 +    uint32_t ne;
 +    uint32_t ne00;
 +    float    eps;
++    uint32_t has_r;   // 0 = no residual (binding 1 aliases x)
 +};
 +
 +// fused activation of (a + b), b broadcast per ne0
@@ -2291,7 +2302,7 @@ index f1f66a6..60723ec 100644
  struct vk_op_soft_max_push_constants {
      uint32_t KX;
      uint32_t KY;
-@@ -621,6 +654,33 @@ struct vk_op_conv_transpose_1d_push_constants {
+@@ -621,6 +655,33 @@ struct vk_op_conv_transpose_1d_push_constants {
      int32_t s0;
  };
  
@@ -2519,7 +2530,7 @@ index 4158ff7..94f97f7 100644
  
  inline void vk_command_pool::init(vk_device& device, vk_queue *q_) {
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index 5587dfc..9daa904 100644
+index 5587dfc..c61413b 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -774,7 +774,8 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
@@ -2544,7 +2555,7 @@ index 5587dfc..9daa904 100644
 +    ggml_vk_create_pipeline(device, device->pipeline_zero_upsample_f32, "zero_upsample_f32", zero_upsample_f32_len, zero_upsample_f32_data, "main", 2, sizeof(vk_op_zero_upsample_push_constants), {512, 1, 1}, {}, 1);
 +    ggml_vk_create_pipeline(device, device->pipeline_channel_shuffle_f32, "channel_shuffle_f32", channel_shuffle_f32_len, channel_shuffle_f32_data, "main", 2, sizeof(vk_op_channel_shuffle_push_constants), {512, 1, 1}, {}, 1);
 +    ggml_vk_create_pipeline(device, device->pipeline_affine_prelu_f32, "affine_prelu_f32", affine_prelu_f32_len, affine_prelu_f32_data, "main", 5, sizeof(vk_op_affine_prelu_push_constants), {512, 1, 1}, {}, 1);
-+    ggml_vk_create_pipeline(device, device->pipeline_layernorm_affine_f32, "layernorm_affine_f32", layernorm_affine_f32_len, layernorm_affine_f32_data, "main", 4, sizeof(vk_op_layernorm_affine_push_constants), {1, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_layernorm_affine_f32, "layernorm_affine_f32", layernorm_affine_f32_len, layernorm_affine_f32_data, "main", 5, sizeof(vk_op_layernorm_affine_push_constants), {1, 1, 1}, {}, 1);
 +    ggml_vk_create_pipeline(device, device->pipeline_add_act_f32, "add_act_f32", add_act_f32_len, add_act_f32_data, "main", 3, sizeof(vk_op_add_act_push_constants), {512, 1, 1}, {}, 1);
 +
      ggml_vk_create_pipeline(device, device->pipeline_repeat_i32, "repeat_i32", repeat_i32_len, repeat_i32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
@@ -2817,7 +2828,7 @@ index 5587dfc..9daa904 100644
          if (ctx->device->shader_int64 && ctx->device->buffer_device_address) {
              // buffer device address path doesn't use dst buffer
              dst_buf.size = 1;
-@@ -11813,6 +11990,200 @@ void ggml_vk_conv_transpose_1d(ggml_backend_vk_context * ctx, vk_context& subctx
+@@ -11813,6 +11990,202 @@ void ggml_vk_conv_transpose_1d(ggml_backend_vk_context * ctx, vk_context& subctx
      ggml_vk_op_f32(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_CONV_TRANSPOSE_1D, std::move(p));
  }
  
@@ -2900,14 +2911,16 @@ index 5587dfc..9daa904 100644
 +
 +static void ggml_vk_layernorm_affine(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
 +    const ggml_tensor * src0 = dst->src[0];  // x [ne0, ...] contiguous
-+    const ggml_tensor * src1 = dst->src[1];  // w [ne0]
-+    const ggml_tensor * src2 = dst->src[2];  // b [ne0]
++    const ggml_tensor * src1 = dst->src[1];  // r [ne0, ...] residual
++    const ggml_tensor * src2 = dst->src[2];  // w [ne0]
++    const ggml_tensor * src3 = dst->src[3];  // b [ne0]
 +    const float eps = ggml_get_op_params_f32(dst, 0);
 +
-+    ggml_vk_op_f32<vk_op_layernorm_affine_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_LAYERNORM_AFFINE, {
++    ggml_vk_op_f32<vk_op_layernorm_affine_push_constants>(ctx, subctx, src0, src1, src2, src3, dst, GGML_OP_LAYERNORM_AFFINE, {
 +        (uint32_t)ggml_nelements(dst),
 +        (uint32_t)src0->ne[0],
 +        eps,
++        (uint32_t)ggml_get_op_params_i32(dst, 1),
 +    });
 +}
 +
@@ -3018,7 +3031,7 @@ index 5587dfc..9daa904 100644
  void ggml_vk_col2im_1d(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
      // src0: [K_OC, T_in] columns from matmul
      // dst:  [T_out, OC]
-@@ -12477,6 +12848,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
+@@ -12477,6 +12850,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
      case GGML_OP_RMS_NORM_BACK:
          ggml_vk_rms_norm_back(ctx, compute_ctx, src0, src1, node);
  
@@ -3029,7 +3042,7 @@ index 5587dfc..9daa904 100644
          break;
      case GGML_OP_L2_NORM:
          ggml_vk_l2_norm(ctx, compute_ctx, src0, node);
-@@ -12623,6 +12998,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
+@@ -12623,6 +13000,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
  
          break;
      case GGML_OP_IM2COL:
@@ -3037,7 +3050,7 @@ index 5587dfc..9daa904 100644
          ggml_vk_im2col(ctx, compute_ctx, src0, src1, node);
  
          break;
-@@ -12641,6 +13017,42 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
+@@ -12641,6 +13019,42 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
      case GGML_OP_CONV_TRANSPOSE_1D:
          ggml_vk_conv_transpose_1d(ctx, compute_ctx, src0, src1, node);
  
@@ -3080,7 +3093,7 @@ index 5587dfc..9daa904 100644
          break;
      case GGML_OP_POOL_1D:
          ggml_vk_pool_1d(ctx, compute_ctx, src0, node);
-@@ -14679,6 +15091,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+@@ -14679,6 +15093,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
          ggml_vk_synchronize(ctx);
      }
  
@@ -3092,7 +3105,7 @@ index 5587dfc..9daa904 100644
      return GGML_STATUS_SUCCESS;
  
      UNUSED(backend);
-@@ -15834,6 +16251,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+@@ -15834,6 +16253,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
              return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_I32
                  && ggml_is_contiguous(op->src[1]) && op->src[1]->type == GGML_TYPE_I32;
          case GGML_OP_IM2COL:
@@ -3100,7 +3113,7 @@ index 5587dfc..9daa904 100644
              return ggml_is_contiguous(op->src[1])
                  && op->src[1]->type == GGML_TYPE_F32
                  && (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
-@@ -15943,7 +16361,89 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+@@ -15943,7 +16363,90 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
          case GGML_OP_SSM_CONV:
              return op->src[0]->type == GGML_TYPE_F32;
          case GGML_OP_CONV_TRANSPOSE_1D:
@@ -3177,9 +3190,10 @@ index 5587dfc..9daa904 100644
 +                   op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
 +        case GGML_OP_LAYERNORM_AFFINE:
 +            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
-+                   op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
++                   op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
++                   op->type == GGML_TYPE_F32 &&
 +                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
-+                   ggml_is_contiguous(op->src[2]);
++                   ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op->src[3]);
 +        case GGML_OP_ADD_ACT:
 +            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
 +                   op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
@@ -3191,7 +3205,7 @@ index 5587dfc..9daa904 100644
          case GGML_OP_COL2IM_1D:
              return (op->src[0]->type == GGML_TYPE_F32 ||
                      op->src[0]->type == GGML_TYPE_F16 ||
-@@ -16384,6 +16884,48 @@ vk_device_struct::~vk_device_struct() {
+@@ -16384,6 +16887,48 @@ vk_device_struct::~vk_device_struct() {
      compute_queue.reset();
      transfer_queue.reset();
  
@@ -4022,10 +4036,10 @@ index 0000000..1d90032
 +}
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/layernorm_affine.comp b/ggml/src/ggml-vulkan/vulkan-shaders/layernorm_affine.comp
 new file mode 100644
-index 0000000..d7ddee8
+index 0000000..c548cf1
 --- /dev/null
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/layernorm_affine.comp
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,64 @@
 +#version 450
 +
 +#include "types.glsl"
@@ -4033,9 +4047,10 @@ index 0000000..d7ddee8
 +#extension GL_EXT_control_flow_attributes : enable
 +#define BLOCK_SIZE 512
 +
-+// Fused LayerNorm(x) * w + b over ne0 (AR/BERT transformer blocks): one workgroup per
-+// row, same reduction structure as norm.comp, plus the per-ne0 affine.  Collapses
-+// norm + mul + add into a single pass.  x, w, b are contiguous F32, w/b are [ne00].
++// Fused LayerNorm(x + r) * w + b over ne0 (AR/BERT transformer blocks): one workgroup
++// per row, same reduction structure as norm.comp, plus residual + per-ne0 affine.
++// Collapses residual-add + norm + mul + add into a single pass.
++// x, r, w, b are contiguous F32, w/b are [ne00].
 +layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 +
 +layout (push_constant) uniform parameter
@@ -4043,12 +4058,14 @@ index 0000000..d7ddee8
 +    uint  ne;    // total dst elements
 +    uint  ne00;  // row length (normalized dimension)
 +    float eps;
++    uint  has_r; // 1 = read data_r, 0 = no residual (binding 1 aliases x)
 +} p;
 +
 +layout(binding = 0) readonly  buffer X {float data_x[];};
-+layout(binding = 1) readonly  buffer W {float data_w[];};
-+layout(binding = 2) readonly  buffer B {float data_b[];};
-+layout(binding = 3) writeonly buffer D {float data_d[];};
++layout(binding = 1) readonly  buffer R {float data_r[];};
++layout(binding = 2) readonly  buffer W {float data_w[];};
++layout(binding = 3) readonly  buffer B {float data_b[];};
++layout(binding = 4) writeonly buffer D {float data_d[];};
 +
 +shared vec2 sum[BLOCK_SIZE];
 +
@@ -4065,7 +4082,7 @@ index 0000000..d7ddee8
 +    sum[tid] = vec2(0.0f, 0.0f);
 +
 +    [[unroll]] for (uint i0 = tid; i0 < p.ne00; i0 += BLOCK_SIZE) {
-+        const float xi = data_x[base + i0];
++        const float xi = data_x[base + i0] + (p.has_r != 0u ? data_r[base + i0] : 0.0f);
 +        sum[tid].x += xi;
 +        sum[tid].y += xi * xi;
 +    }
@@ -4083,7 +4100,8 @@ index 0000000..d7ddee8
 +    const float inv  = inversesqrt(var + p.eps);
 +
 +    [[unroll]] for (uint i0 = tid; i0 < p.ne00; i0 += BLOCK_SIZE) {
-+        data_d[base + i0] = (data_x[base + i0] - mean) * inv * data_w[i0] + data_b[i0];
++        const float xv = data_x[base + i0] + (p.has_r != 0u ? data_r[base + i0] : 0.0f);
++        data_d[base + i0] = (xv - mean) * inv * data_w[i0] + data_b[i0];
 +    }
 +}
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/rel_pos_bias.comp b/ggml/src/ggml-vulkan/vulkan-shaders/rel_pos_bias.comp
@@ -4300,7 +4318,7 @@ index 0000000..925ebe0
 +    data_d[idx] = (f % p.s == 0u) ? D_TYPE(data_a[r * p.F + f / p.s]) : D_TYPE(0.0f);
 +}
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 9bcabdb..b11b99c 100644
+index 9bcabdb..9a9ba2e 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1099,9 +1099,30 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -4580,7 +4598,7 @@ index 9bcabdb..b11b99c 100644
  // ggml_conv_2d
  
  // a: [OC，IC, KH, KW]
-@@ -5877,6 +6069,505 @@ struct ggml_tensor * ggml_add_rel_pos_inplace(
+@@ -5877,6 +6069,513 @@ struct ggml_tensor * ggml_add_rel_pos_inplace(
      return ggml_add_rel_pos_impl(ctx, a, pw, ph, true);
  }
  
@@ -4920,6 +4938,7 @@ index 9bcabdb..b11b99c 100644
 +struct ggml_tensor * ggml_layernorm_affine(
 +        struct ggml_context * ctx,
 +        struct ggml_tensor  * x,
++        struct ggml_tensor  * r,
 +        struct ggml_tensor  * w,
 +        struct ggml_tensor  * b,
 +        float                 eps) {
@@ -4927,15 +4946,22 @@ index 9bcabdb..b11b99c 100644
 +    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(w) && ggml_is_contiguous(b));
 +    GGML_ASSERT(w->ne[0] == x->ne[0] && b->ne[0] == x->ne[0]);
 +    GGML_ASSERT(ggml_nelements(w) == x->ne[0] && ggml_nelements(b) == x->ne[0]);
++    if (r != NULL) {
++        GGML_ASSERT(r->type == GGML_TYPE_F32 && ggml_is_contiguous(r));
++        GGML_ASSERT(ggml_are_same_shape(x, r));
++    }
 +
 +    struct ggml_tensor * result = ggml_dup_tensor(ctx, x);
 +
 +    ggml_set_op_params_f32(result, 0, eps);
++    ggml_set_op_params_i32(result, 1, r != NULL ? 1 : 0);
 +
 +    result->op     = GGML_OP_LAYERNORM_AFFINE;
 +    result->src[0] = x;
-+    result->src[1] = w;
-+    result->src[2] = b;
++    // 无残差时用 x 自身占位 (shader/CPU 按 flag 跳过读取): 避免空 src 的非法绑定
++    result->src[1] = r != NULL ? r : x;
++    result->src[2] = w;
++    result->src[3] = b;
 +
 +    return result;
 +}
@@ -5086,7 +5112,7 @@ index 9bcabdb..b11b99c 100644
  // ggml_rwkv_wkv6
  
  struct ggml_tensor * ggml_rwkv_wkv6(
-@@ -7128,7 +7819,8 @@ static void ggml_compute_backward(
+@@ -7128,7 +7827,8 @@ static void ggml_compute_backward(
              }
              GGML_ASSERT((!src2 || !src2_needs_grads) && "gradients for freq factors not implemented");
          } break;
@@ -5096,7 +5122,7 @@ index 9bcabdb..b11b99c 100644
              if (src1_needs_grads) {
                  const int32_t s0    = ggml_get_op_params_i32(tensor, 0);
                  const int32_t s1    = ggml_get_op_params_i32(tensor, 1);
-@@ -7388,8 +8080,9 @@ void ggml_build_backward_expand(
+@@ -7388,8 +8088,9 @@ void ggml_build_backward_expand(
          bool ignore_src[GGML_MAX_SRC] = {false};
          switch (node->op) {
              // gradients in node->src[0] for one reason or another have no effect on output gradients

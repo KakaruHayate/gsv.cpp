@@ -118,10 +118,11 @@ struct gsv_ar::impl {
 
     bool fuse_ln = true, fuse_act = true;   // 融合算子开关 (GSV_NO_FUSE / GSV_NO_FUSE_LN / GSV_NO_FUSE_ACT)
 
-    // LN(x)*w + b: 融合算子不可用时退回 norm+mul+add
-    ggml_tensor * ln_affine(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w, ggml_tensor * b, float eps) {
-        if (fuse_ln) return ggml_layernorm_affine(ctx, x, w, b, eps);
-        return ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, x, eps), w), b);
+    // LN(x + r)*w + b: 融合算子不可用时退回 add + norm + mul + add
+    ggml_tensor * ln_affine(ggml_context * ctx, ggml_tensor * x, ggml_tensor * r,
+                            ggml_tensor * w, ggml_tensor * b, float eps) {
+        if (fuse_ln) return ggml_layernorm_affine(ctx, x, r, w, b, eps);
+        return ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, ggml_add(ctx, x, r), eps), w), b);
     }
     // act(a + b): 融合算子不可用时退回 add + 激活
     ggml_tensor * add_act(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b, int act) {
@@ -213,12 +214,10 @@ struct gsv_ar::impl {
             attn_out = ggml_reshape_4d(ctx, attn_out, D, S, B, 1);
             attn_out = ggml_reshape_3d(ctx, attn_out, D, S, B);
             ggml_tensor * o = ggml_add(ctx, ggml_mul_mat(ctx, ws[li].out_w, attn_out), ws[li].out_b);
-            ggml_tensor * c2 = ggml_add(ctx, cur, o);
-            ggml_tensor * n1 = ln_affine(ctx, c2, ws[li].n1w, ws[li].n1b, 1e-5f);
+            ggml_tensor * n1 = ln_affine(ctx, cur, o, ws[li].n1w, ws[li].n1b, 1e-5f);
             ggml_tensor * h = add_act(ctx, ggml_mul_mat(ctx, ws[li].f1w, n1), ws[li].f1b, GGML_ACT_RELU);
             h = ggml_add(ctx, ggml_mul_mat(ctx, ws[li].f2w, h), ws[li].f2b);
-            ggml_tensor * c3 = ggml_add(ctx, n1, h);
-            cur = ln_affine(ctx, c3, ws[li].n2w, ws[li].n2b, 1e-5f);
+            cur = ln_affine(ctx, n1, h, ws[li].n2w, ws[li].n2b, 1e-5f);
         }
         ggml_tensor * logits = ggml_mul_mat(ctx, predict, cur);
         ggml_tensor * last_view = ggml_view_3d(ctx, logits, VOCAB, 1, B, logits->nb[1], logits->nb[2], (int64_t)(S - 1) * logits->nb[1]);
@@ -276,12 +275,10 @@ struct gsv_ar::impl {
             ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, qh, kfull, vfull, mask, 1.0f / std::sqrt((float)HD), 0.0f, 0.0f);
             attn_out = ggml_reshape_3d(ctx, attn_out, D, 1, B);
             ggml_tensor * o = ggml_add(ctx, ggml_mul_mat(ctx, ws[li].out_w, attn_out), ws[li].out_b);
-            ggml_tensor * c2 = ggml_add(ctx, cur, o);
-            ggml_tensor * n1 = ln_affine(ctx, c2, ws[li].n1w, ws[li].n1b, 1e-5f);
+            ggml_tensor * n1 = ln_affine(ctx, cur, o, ws[li].n1w, ws[li].n1b, 1e-5f);
             ggml_tensor * h = add_act(ctx, ggml_mul_mat(ctx, ws[li].f1w, n1), ws[li].f1b, GGML_ACT_RELU);
             h = ggml_add(ctx, ggml_mul_mat(ctx, ws[li].f2w, h), ws[li].f2b);
-            ggml_tensor * c3 = ggml_add(ctx, n1, h);
-            cur = ln_affine(ctx, c3, ws[li].n2w, ws[li].n2b, 1e-5f);
+            cur = ln_affine(ctx, n1, h, ws[li].n2w, ws[li].n2b, 1e-5f);
         }
         ggml_tensor * logits = ggml_mul_mat(ctx, predict, cur);
         ggml_set_output(logits);
@@ -450,7 +447,7 @@ gsv_ar * gsv_ar::load(const std::string & gguf_path, const gsv_ar_cfg & cfg) {
         ggml_tensor * fx = ggml_new_tensor_2d(fctx, GGML_TYPE_F32, 64, 4);
         ggml_tensor * fw = ggml_new_tensor_1d(fctx, GGML_TYPE_F32, 64);
         ggml_tensor * fb = ggml_new_tensor_1d(fctx, GGML_TYPE_F32, 64);
-        ggml_tensor * fln = ggml_layernorm_affine(fctx, fx, fw, fb, 1e-5f);
+        ggml_tensor * fln = ggml_layernorm_affine(fctx, fx, nullptr, fw, fb, 1e-5f);
         ggml_tensor * fac = ggml_add_act(fctx, fx, fw, GGML_ACT_RELU);
         const bool sup = ggml_backend_supports_op(s.backend, fln) && ggml_backend_supports_op(s.backend, fac);
         ggml_free(fctx);

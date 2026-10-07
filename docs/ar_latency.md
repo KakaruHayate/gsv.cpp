@@ -7,9 +7,8 @@
 
 | 配置 | 每 token 延迟 | 吞吐 | 相对优化前 |
 |---|---|---|---|
-| **Vulkan f32（bs=1）** | **5.08 → 3.89（阶段 1）→ 3.57 ms（+融合算子）** | 197 → **280 tok/s** | **-30%** |
-| Vulkan f32（bs=3） | 6.84 → 5.49 → **5.25 ms** | 571 tok/s | **-23%** |
-| Vulkan f32（bs=8 / bs=20） | 9.07 → 8.10 / 15.27 → ~16.8（见 §5 噪声说明） | | -5~11% |
+| **Vulkan f32（bs=1）** | **5.08 → 3.89（阶段 1）→ 3.29 ms（+融合算子）** | 197 → **304 tok/s** | **-35%** |
+| Vulkan f32（bs=3 / bs=8） | 6.84 → 5.49 → **4.84 ms** / 9.07 → **7.30 ms** | 620 / 1096 tok/s | **-29% / -20%** |
 | Vulkan **+ q8_attn_ffn 权重**（bs=1） | **3.54 ms** | **283 tok/s** | -30%（含精度档） |
 | CPU f32（bs=1，8 线程） | 同期配对：20.97 → **19.29 ms** | | 融合算子 -8%（跨时段绝对值 17.3~21.0 ms 波动） |
 | **CPU + q8_attn_ffn 权重**（bs=1） | **9.1 ms** | **110 tok/s** | **-54%**（近无损档，见 §3） |
@@ -70,10 +69,10 @@ residual 1 + norm 1 + mul 1 + add 1 = **28 dispatch/层 → 674/步**（+ ~170 �
 
 | 算子 | 语义 | 替换 | 省 |
 |---|---|---|---|
-| `ggml_layernorm_affine(ctx,x,w,b,eps)` | `(x-mean)/sqrt(var+eps)*w+b`，一次遍历 | `norm + mul + add` | 2 dispatch ×2 处/层 |
+| `ggml_layernorm_affine(ctx,x,r,w,b,eps)` | `(x+r-mean)/sqrt(var+eps)*w+b`，一次遍历（`r` 可空=无残差） | `add + norm + mul + add` | 3 dispatch ×2 处/层 |
 | `ggml_add_act(ctx,a,b,act)` | `act(a+b)`，b 按 ne0 广播（`act`: 0=none,1=relu,2=gelu_erf） | `add + relu/gelu` | 1 dispatch/层 |
 
-每层 dispatch 22 → 17（AR）/ 18 → 14（BERT）；Vulkan 端 2 个 shader
+每层 dispatch 22 → **15**（AR）/ 18 → **12**（BERT）；Vulkan 端 2 个 shader
 （`layernorm_affine.comp` 每 workgroup 一行、`add_act.comp` 每线程一元素；erf 用上游
 `geglu_erf.comp` 同款 A&S 近似，因为 glslc 没有 erf 内建）。
 
@@ -81,12 +80,12 @@ residual 1 + norm 1 + mul 1 + add 1 = **28 dispatch/层 → 674/步**（+ ~170 �
 
 | 场景 | 未融合 | 融合 | 变化 |
 |---|---|---|---|
-| Vulkan bs=1 | 4.39 / 4.52 ms | **3.57 / 3.66 ms** | **-19%** |
-| Vulkan bs=3 | 6.12 / 7.11 ms | **5.25 / 5.30 ms** | **-14%** |
-| Vulkan bs=20（300 步） | 17.66 / 17.67 ms | **16.80 / 17.00 ms** | -5% |
-| CPU bs=1（8 线程） | 20.97 ms | **19.29 ms** | **-8%** |
-| BERT Vulkan f16（T=25） | 8.34 ms | 8.53 ms | 噪声内（±2%） |
-| BERT CPU（16 线程） | 127.5（f32）/ 131.7（f16） ms | **116.2 / 115.7 ms** | **-9% / -12%** |
+| Vulkan bs=1 | 4.23 / 4.54 ms | **3.29 / 3.33 ms** | **-24%** |
+| Vulkan bs=3 | 5.65 / 5.85 ms | **4.84 / 4.88 ms** | **-16%** |
+| Vulkan bs=8 | 8.04 / 8.23 ms | **7.30 / 7.35 ms** | **-10%** |
+| CPU bs=1（8 线程，只含第一版融合） | 20.97 ms | **19.29 ms** | -8% |
+| BERT Vulkan f16（T=25） | 9.46 / 10.41 ms | 8.87 / **7.90** ms | 方向为正，噪声内 |
+| BERT CPU（16 线程） | 110.0 / 111.2 ms | **108.2** / 123.7 ms | 噪声内（本机 BERT 效应小于漂移） |
 
 - 收益集中在**小 batch（单流）**与 CPU：bs 越小，"固定开销"占比越高，省 dispatch 越值钱。
 - BERT 在 Vulkan 上收益落在噪声里（它的 matmul 形状是 [1024,1024]×[1024,25]，TP=25 行，
