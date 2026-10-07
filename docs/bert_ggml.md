@@ -114,6 +114,11 @@ CPU 结果（复现见上）：4 文本 `max|Δ| = 3.8e-6 ~ 1.05e-5`，cos = 1.0
 
 ## 5.1 BERT 还有多少提速空间
 
+**时间都花在哪**：按 T 扫描拆固定/变动成本（Vulkan f16）：T=25 → 8.5 ms，T=512 → 43.4 ms，
+即每多一个 token 只多 ~0.072 ms，反推 **T=25 时约 79% 是与序列长度无关的固定成本**
+（~400 次 dispatch + 每次调用的建图/gallocr），只有 ~21% 是真算力（25 token 时 13.9 GFLOP，
+8.5 ms ↔ 1.6 TFLOPS 有效，仅为 RTX 2070 fp32 峰值的 21%）。所以**减少 dispatch 数就是它的提速路线**。
+
 **能做的（工程层，预计再 -15~20%）**：每层仍有 18 dispatch，其中 4 个是纯 elementwise
 （`norm + mul + add` 两处 = 6 个、`add bias` 两处、`add` 残差两处、`gelu`）。把
 `norm(x)·w + b` 合成一个 `layernorm_affine` 算子即可省 4/层（22 层 = 88 dispatch），
