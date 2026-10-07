@@ -320,14 +320,8 @@ int gsv_ar::prompt_len_expected() const { return p->prompt_len; }
 gsv_ar * gsv_ar::load(const std::string & gguf_path, const gsv_ar_cfg & cfg) {
     gsv_ar * m = new gsv_ar();
     impl & s = *m->p;
-    // 必须在任何 Vulkan 设备初始化之前设置 (ggml-vulkan 在 get_device 时读取)
-    if (cfg.disable_coopmat2 && getenv("GGML_VK_DISABLE_COOPMAT2") == nullptr) {
-#ifdef _WIN32
-        _putenv_s("GGML_VK_DISABLE_COOPMAT2", "1");
-#else
-        setenv("GGML_VK_DISABLE_COOPMAT2", "1", 0);
-#endif
-    }
+    // 注意: ggml-vulkan 在**静态初始化**阶段就读取 GGML_VK_DISABLE_COOPMAT2 (早于 main),
+    // 因此内部设置无效, 只能提示调用方在启动前设置 (实测: 外部设置 logits Δ 0.0035, 未设置 0.0201)
 
     // 设备选择 (cfg.device: "" = CPU, "vulkan"/"gpu" = 第一个 GPU 设备)
     ggml_backend_dev_t dev = nullptr;
@@ -348,6 +342,11 @@ gsv_ar * gsv_ar::load(const std::string & gguf_path, const gsv_ar_cfg & cfg) {
         }
         if (!dev) { fprintf(stderr, "[gsv_ar] no usable backend device"); delete m; return nullptr; }
         if (cfg.verbose) printf("[gsv_ar] device: %s (%s)", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+        if (want_gpu && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+            getenv("GGML_VK_DISABLE_COOPMAT2") == nullptr) {
+            fprintf(stderr, "[gsv_ar] warning: Vulkan coopmat2 未禁用, AR 精度会下降 (logits Δ 0.0035 -> 0.0201); "
+                            "请在进程启动前设置 GGML_VK_DISABLE_COOPMAT2=1");
+        }
     }
     s.backend = ggml_backend_dev_init(dev, nullptr);
     if (!s.backend) { fprintf(stderr, "[gsv_ar] backend init failed"); delete m; return nullptr; }

@@ -111,6 +111,32 @@ int main(int argc, char ** argv) {
         if (bad) worst = 1e9;
     }
 
+    // ---- 4) 量化验收: 100 token greedy vs f32 参考 (GSV_AR_ACC=1) ----
+    if (getenv("GSV_AR_ACC")) {
+        gsv_sampler_cfg sc; sc.top_k = 1; sc.top_p = 1.0f; sc.temperature = 1.0f; sc.repetition_penalty = 1.0f;
+        auto res = m->generate(reqs, sc, 12345, 99, 1500);
+        auto ref_idx = read_bin(gd, "batch.greedy100.idx");
+        int bad = 0, first_bad = -1, len_bad = 0;
+        for (int b = 0; b < B; b++) {
+            char nb[64];
+            snprintf(nb, sizeof(nb), "batch.greedy100.seq%d.tokens", b);
+            auto ref_tok = read_bin(gd, nb);
+            const auto & got = res.tokens[b];
+            if (ref_tok.size() != got.size()) len_bad++;
+            const size_t n = ref_tok.size() < got.size() ? ref_tok.size() : got.size();
+            bool ok = true;
+            for (size_t i = 0; i < n; i++)
+                if ((int32_t) ref_tok[i] != got[i]) { ok = false; if (first_bad < 0) first_bad = (int) i; break; }
+            if (!ok) bad++;
+        }
+        printf("[4] ACC(100 token): token 差异 %d/%d (首次分歧 @%d), len 差异 %d, idx=[%d,%d,%d] ref=[%d,%d,%d]",
+               bad, B, first_bad, len_bad,
+               res.lens.size() > 0 ? res.lens[0] : -1, res.lens.size() > 1 ? res.lens[1] : -1, res.lens.size() > 2 ? res.lens[2] : -1,
+               (int) ref_idx[0], (int) ref_idx[1], (int) ref_idx[2]);
+        printf("  %s", (bad || len_bad) ? "FAIL" : "PASS");
+        if (bad || len_bad) worst = 1e9;
+    }
+
     printf("%s (worst = %.3g)\n", worst < 1e-3 ? "ALL PASS" : "FAIL", worst);
     delete m;
     return worst < 1e-3 ? 0 : 2;

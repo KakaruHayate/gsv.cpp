@@ -24,9 +24,9 @@ def add_tensor(writer, name, tensor, dtype=gguf.GGMLQuantizationType.F32):
     arr = t.numpy()
     if dtype == gguf.GGMLQuantizationType.F16:
         arr = arr.astype("float16")     # gguf-py 的 raw_dtype 只打标, 需自行转数据
-    elif dtype == gguf.GGMLQuantizationType.Q8_0:
+    elif dtype not in (gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16):
         import numpy as _np
-        arr = gguf.quants.quantize(_np.ascontiguousarray(arr), gguf.GGMLQuantizationType.Q8_0)
+        arr = gguf.quants.quantize(_np.ascontiguousarray(arr), dtype)
     writer.add_tensor(name, arr, raw_dtype=dtype)
 
 
@@ -36,6 +36,8 @@ def main():
     ap.add_argument("--out", default="models/gsv-ar-f32.gguf")
     ap.add_argument("--f16", action="store_true", help="权重存 F16 (norm/bias/emb 保持 F32)")
     ap.add_argument("--q8", action="store_true", help="权重存 Q8_0 (norm/bias/emb 保持 F32)")
+    ap.add_argument("--spec", default="",
+                    help="per-group 类型, 如 attn=q8_0,ffn=q6_k,predict=f16,emb=f16 (组: attn/ffn/predict/emb; 默认 f32)")
     args = ap.parse_args()
 
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
@@ -51,12 +53,39 @@ def main():
         F16 = gguf.GGMLQuantizationType.F16
     else:
         F16 = gguf.GGMLQuantizationType.F32
+    SPEC = {}
+    if args.spec:
+        for kv in args.spec.split(","):
+            k, _, v = kv.partition("=")
+            SPEC[k.strip()] = v.strip().lower()
+
+    QT = {
+        "f32": gguf.GGMLQuantizationType.F32,
+        "f16": gguf.GGMLQuantizationType.F16,
+        "bf16": gguf.GGMLQuantizationType.BF16,
+        "q8_0": gguf.GGMLQuantizationType.Q8_0,
+        "q6_k": gguf.GGMLQuantizationType.Q6_K,
+        "q5_k": gguf.GGMLQuantizationType.Q5_K,
+        "q4_k": gguf.GGMLQuantizationType.Q4_K,
+        "q5_1": gguf.GGMLQuantizationType.Q5_1,
+        "q5_0": gguf.GGMLQuantizationType.Q5_0,
+        "q4_1": gguf.GGMLQuantizationType.Q4_1,
+        "q4_0": gguf.GGMLQuantizationType.Q4_0,
+    }
+
     def ft(name):
-        # 量化敏感项保持 F32: norm/bias/embedding/alpha
+        # 量化敏感项强制 F32: norm / bias / alpha / bert_proj(host 侧直读)
         low = name.lower()
-        if ("norm" in low) or name.endswith("_b") or ("emb" in low) or ("alpha" in low) or ("bert" in low):
-            # bert_proj: 引擎在 host 侧做投影, 必须是 F32 (或改为图内实现)
+        if ("norm" in low) or name.endswith("_b") or ("alpha" in low) or ("bert" in low):
             return gguf.GGMLQuantizationType.F32
+        if "text_emb" in low or "audio_emb" in low:
+            return QT.get(SPEC.get("emb", "f32"), gguf.GGMLQuantizationType.F32)
+        if "predict" in low:
+            return QT.get(SPEC.get("predict", "f32"), gguf.GGMLQuantizationType.F32)
+        if "ffn" in low:
+            return QT.get(SPEC.get("ffn", "f32"), gguf.GGMLQuantizationType.F32)
+        if "qkv" in low or "out_w" in low:
+            return QT.get(SPEC.get("attn", "f32"), gguf.GGMLQuantizationType.F32)
         return F16
 
     writer = gguf.GGUFWriter(args.out, "gsv.ar")
@@ -87,15 +116,15 @@ def main():
 
     for li in range(layers):
         p = f"transformer.block{li}"
-        add_tensor(writer, f"{p}.qkv_w", w(f"model.h.layers.{li}.self_attn.in_proj_weight"), ft("w"))
+        add_tensor(writer, f"{p}.qkv_w", w(f"model.h.layers.{li}.self_attn.in_proj_weight"), ft(f"{p}.qkv_w"))
         add_tensor(writer, f"{p}.qkv_b", w(f"model.h.layers.{li}.self_attn.in_proj_bias"))
-        add_tensor(writer, f"{p}.out_w", w(f"model.h.layers.{li}.self_attn.out_proj.weight"), ft("w"))
+        add_tensor(writer, f"{p}.out_w", w(f"model.h.layers.{li}.self_attn.out_proj.weight"), ft(f"{p}.out_w"))
         add_tensor(writer, f"{p}.out_b", w(f"model.h.layers.{li}.self_attn.out_proj.bias"))
         add_tensor(writer, f"{p}.norm1_w", w(f"model.h.layers.{li}.norm1.weight"))
         add_tensor(writer, f"{p}.norm1_b", w(f"model.h.layers.{li}.norm1.bias"))
-        add_tensor(writer, f"{p}.ffn1_w", w(f"model.h.layers.{li}.linear1.weight"), ft("w"))
+        add_tensor(writer, f"{p}.ffn1_w", w(f"model.h.layers.{li}.linear1.weight"), ft(f"{p}.ffn1_w"))
         add_tensor(writer, f"{p}.ffn1_b", w(f"model.h.layers.{li}.linear1.bias"))
-        add_tensor(writer, f"{p}.ffn2_w", w(f"model.h.layers.{li}.linear2.weight"), ft("w"))
+        add_tensor(writer, f"{p}.ffn2_w", w(f"model.h.layers.{li}.linear2.weight"), ft(f"{p}.ffn2_w"))
         add_tensor(writer, f"{p}.ffn2_b", w(f"model.h.layers.{li}.linear2.bias"))
         add_tensor(writer, f"{p}.norm2_w", w(f"model.h.layers.{li}.norm2.weight"))
         add_tensor(writer, f"{p}.norm2_b", w(f"model.h.layers.{li}.norm2.bias"))

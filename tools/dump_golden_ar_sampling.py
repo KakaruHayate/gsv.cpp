@@ -170,6 +170,12 @@ def main():
                     idx_list[i] = 1499
             return y_list, idx_list
 
+        # 量化验收参考: 100 token greedy (early_stop=99)
+        y_list100, idx_list100 = greedy_run(99)
+        dump(outdir, "batch.greedy100.idx", torch.tensor(idx_list100, dtype=torch.float32).reshape(1, B))
+        for i in range(B):
+            dump(outdir, f"batch.greedy100.seq{i}.tokens", y_list100[i].float().reshape(1, -1))
+
         y_list, idx_list = greedy_run(args.early_stop)
         dump(outdir, "batch.greedy.idx", torch.tensor(idx_list, dtype=torch.float32).reshape(1, B))
         for i in range(B):
