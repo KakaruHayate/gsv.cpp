@@ -1,0 +1,264 @@
+#include "gsv_bert.h"
+
+#include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
+#include "gguf.h"
+
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <chrono>
+
+// 单次 encode 计时 (GSV_BERT_PROFILE=1)
+static double now_ms() {
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+}
+
+struct bert_layer_w {
+    ggml_tensor * q_w, * q_b, * k_w, * k_b, * v_w, * v_b, * attn_out_w, * attn_out_b, * attn_ln_w, * attn_ln_b;
+    ggml_tensor * ff1_w, * ff1_b, * ff2_w, * ff2_b, * out_ln_w, * out_ln_b;
+};
+
+struct gsv_bert::impl {
+    int D = 1024, NH = 16, HD = 64, NL = 22, VOCAB = 21128, MAXPOS = 512, FFD = 4096;
+    float EPS = 1e-12f;
+
+    ggml_tensor * word_emb = nullptr, * pos_emb = nullptr, * type_emb = nullptr;
+    ggml_tensor * emb_ln_w = nullptr, * emb_ln_b = nullptr;
+    std::vector<bert_layer_w> ws;
+
+    ggml_context * wctx = nullptr;
+    gguf_context * gf = nullptr;
+    ggml_backend_buffer_t wbuf = nullptr;
+    ggml_backend_t backend = nullptr;
+    ggml_gallocr_t galloc = nullptr;
+
+    // post-LN: t = LN(t) * w + b
+    ggml_tensor * ln(ggml_context * ctx, ggml_tensor * t, ggml_tensor * w, ggml_tensor * b) {
+        return ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, t, EPS), w), b);
+    }
+
+    // 查表 + 转 F32 (F16 表的 get_rows 输出为 F16)
+    ggml_tensor * emb_row(ggml_context * ctx, ggml_tensor * tbl, ggml_tensor * idx) {
+        ggml_tensor * r = ggml_get_rows(ctx, tbl, idx);
+        if (r->type != GGML_TYPE_F32) r = ggml_cast(ctx, r, GGML_TYPE_F32);
+        return r;
+    }
+
+    // 全序列前向: ids [T] -> x [D, T] (行主序 d + t*D); n_layers < 0 = 全部
+    void run(const int32_t * ids, int T, std::vector<float> & out, int n_layers);
+};
+
+void gsv_bert::impl::run(const int32_t * ids, int T, std::vector<float> & out, int n_layers) {
+    if (T < 1 || T > MAXPOS) { fprintf(stderr, "[gsv_bert] bad T=%d (max_pos=%d)\n", T, MAXPOS); return; }
+    if (n_layers < 0 || n_layers > NL) n_layers = NL;
+
+    ggml_init_params ip = { ggml_tensor_overhead() * 65536, NULL, true };
+    ggml_context * ctx = ggml_init(ip);
+
+    ggml_tensor * t_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);   ggml_set_input(t_ids);
+    ggml_tensor * t_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);   ggml_set_input(t_pos);
+    ggml_tensor * t_typ = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);   ggml_set_input(t_typ);
+    // 无 padding, mask 全 0 (flash_attn_ext 需要 F16 mask); n_layers=0 时注意力不参与图, 不建 mask
+    ggml_tensor * t_msk = nullptr;
+    if (n_layers > 0) { t_msk = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, T, T, 1, 1); ggml_set_input(t_msk); }
+
+    ggml_tensor * cur = ggml_add(ctx, ggml_add(ctx,
+                            emb_row(ctx, word_emb, t_ids),
+                            emb_row(ctx, pos_emb, t_pos)),
+                            emb_row(ctx, type_emb, t_typ));                    // [D, T]
+    cur = ln(ctx, cur, emb_ln_w, emb_ln_b);
+
+    for (int li = 0; li < n_layers; li++) {
+        const bert_layer_w & w = ws[li];
+        ggml_tensor * q = ggml_add(ctx, ggml_mul_mat(ctx, w.q_w, cur), w.q_b);
+        ggml_tensor * k = ggml_add(ctx, ggml_mul_mat(ctx, w.k_w, cur), w.k_b);
+        ggml_tensor * v = ggml_add(ctx, ggml_mul_mat(ctx, w.v_w, cur), w.v_b);
+        ggml_tensor * qh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, q, HD, NH, T, 1), 0, 2, 1, 3));
+        ggml_tensor * kh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, k, HD, NH, T, 1), 0, 2, 1, 3));
+        ggml_tensor * vh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, v, HD, NH, T, 1), 0, 2, 1, 3));
+        ggml_tensor * attn = ggml_flash_attn_ext(ctx, qh, kh, vh, t_msk, 1.0f / std::sqrt((float) HD), 0.0f, 0.0f);
+        attn = ggml_reshape_2d(ctx, ggml_reshape_4d(ctx, attn, D, T, 1, 1), D, T);
+        ggml_tensor * ao = ggml_add(ctx, ggml_mul_mat(ctx, w.attn_out_w, attn), w.attn_out_b);
+        cur = ln(ctx, ggml_add(ctx, cur, ao), w.attn_ln_w, w.attn_ln_b);      // post-LN 1
+        ggml_tensor * h = ggml_gelu_erf(ctx, ggml_add(ctx, ggml_mul_mat(ctx, w.ff1_w, cur), w.ff1_b));
+        ggml_tensor * fo = ggml_add(ctx, ggml_mul_mat(ctx, w.ff2_w, h), w.ff2_b);
+        cur = ln(ctx, ggml_add(ctx, cur, fo), w.out_ln_w, w.out_ln_b);        // post-LN 2
+    }
+    ggml_set_output(cur);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 8192, false);
+    ggml_build_forward_expand(graph, cur);
+    if (!ggml_gallocr_alloc_graph(galloc, graph))
+        fprintf(stderr, "[gsv_bert] alloc_graph failed (T=%d n_layers=%d)\n", T, n_layers);
+
+    std::vector<int32_t> pos(T), typ(T, 0);
+    for (int i = 0; i < T; i++) pos[i] = i;
+    ggml_backend_tensor_set(t_ids, ids, 0, (size_t) T * 4);
+    ggml_backend_tensor_set(t_pos, pos.data(), 0, (size_t) T * 4);
+    ggml_backend_tensor_set(t_typ, typ.data(), 0, (size_t) T * 4);
+    if (t_msk) {
+        std::vector<ggml_fp16_t> msk((size_t) T * T, ggml_fp32_to_fp16(0.0f));
+        ggml_backend_tensor_set(t_msk, msk.data(), 0, msk.size() * 2);
+    }
+
+    ggml_backend_graph_compute(backend, graph);
+
+    // ggml 布局: idx = d + t*D; 导出为 [D, T] 行主序 (idx = d*T + t)
+    auto to_host_td = [&](ggml_tensor * t, std::vector<float> & dst) {
+        std::vector<float> tmp(ggml_nelements(t));
+        ggml_backend_tensor_get(t, tmp.data(), 0, tmp.size() * 4);
+        dst.assign(tmp.size(), 0.0f);
+        for (int d = 0; d < D; d++)
+            for (int i = 0; i < T; i++) dst[(size_t) d * T + i] = tmp[(size_t) d + (size_t) i * D];
+    };
+    to_host_td(cur, out);
+
+    ggml_free(ctx);
+}
+
+gsv_bert::gsv_bert() : p(new impl) {}
+gsv_bert::~gsv_bert() {
+    impl & s = *p;
+    if (s.galloc) ggml_gallocr_free(s.galloc);
+    if (s.backend) ggml_backend_free(s.backend);
+    if (s.wbuf) ggml_backend_buffer_free(s.wbuf);
+    if (s.wctx) ggml_free(s.wctx);
+    if (s.gf) gguf_free(s.gf);
+    delete p;
+}
+
+int gsv_bert::hidden()      const { return p->D; }
+int gsv_bert::layers_used() const { return p->NL; }
+int gsv_bert::max_pos()     const { return p->MAXPOS; }
+
+void gsv_bert::encode(const int32_t * ids, int T, std::vector<float> & features) {
+    p->run(ids, T, features, -1);
+}
+
+void gsv_bert::encode_feat(const int32_t * ids, int T, std::vector<float> & feat) {
+    // 管线后处理: 去掉 [CLS]/[SEP] -> [D, T-2]
+    std::vector<float> full;
+    p->run(ids, T, full, -1);
+    const int T2 = T - 2;
+    if (T2 <= 0) { feat.clear(); return; }
+    feat.assign((size_t) p->D * T2, 0.0f);
+    for (int d = 0; d < p->D; d++)
+        for (int i = 0; i < T2; i++) feat[(size_t) d * T2 + i] = full[(size_t) d * T + i + 1];
+}
+
+void gsv_bert::encode_layers(const int32_t * ids, int T, std::vector<float> & features,
+                             std::vector<std::vector<float>> & per_layer) {
+    // 逐层导出: 每层独立建图 (中间张量不是图根, 常驻 arena 会被复用), 语义 = hidden_states[k]
+    features.clear();
+    per_layer.assign(p->NL + 1, {});
+    for (int k = 0; k <= p->NL; k++) {
+        std::vector<float> out;
+        p->run(ids, T, out, k);
+        if (k == p->NL) features = out;
+        per_layer[k] = std::move(out);
+    }
+}
+
+gsv_bert * gsv_bert::load(const std::string & gguf_path, const gsv_bert_cfg & cfg) {
+    gsv_bert * m = new gsv_bert();
+    impl & s = *m->p;
+
+    ggml_backend_dev_t dev = nullptr;
+    {
+        const bool want_gpu = cfg.device == "gpu" || cfg.device == "vulkan" || cfg.device == "GPU" || cfg.device == "Vulkan";
+        const int n_dev = (int) ggml_backend_dev_count();
+        for (int i = 0; i < n_dev && !dev; i++) {
+            ggml_backend_dev_t d = ggml_backend_dev_get(i);
+            const auto ty = ggml_backend_dev_type(d);
+            if (want_gpu) { if (ty == GGML_BACKEND_DEVICE_TYPE_GPU || ty == GGML_BACKEND_DEVICE_TYPE_IGPU) dev = d; }
+            else if (ty == GGML_BACKEND_DEVICE_TYPE_CPU) dev = d;
+        }
+        if (!dev)
+            for (int i = 0; i < n_dev && !dev; i++) {
+                ggml_backend_dev_t d = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_CPU) dev = d;
+            }
+        if (!dev) { fprintf(stderr, "[gsv_bert] no usable backend device\n"); delete m; return nullptr; }
+        if (cfg.verbose) printf("[gsv_bert] device: %s (%s)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+        if (want_gpu && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+            getenv("GGML_VK_DISABLE_COOPMAT2") == nullptr)
+            fprintf(stderr, "[gsv_bert] warning: Vulkan coopmat2 未禁用, 精度会下降; 请在进程启动前设置 GGML_VK_DISABLE_COOPMAT2=1\n");
+    }
+    s.backend = ggml_backend_dev_init(dev, nullptr);
+    if (!s.backend) { fprintf(stderr, "[gsv_bert] backend init failed\n"); delete m; return nullptr; }
+    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && cfg.n_threads > 0)
+        ggml_backend_cpu_set_n_threads(s.backend, cfg.n_threads);
+    s.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(s.backend));
+
+    gguf_init_params gip = { /*no_alloc*/ true, &s.wctx };
+    s.gf = gguf_init_from_file(gguf_path.c_str(), gip);
+    if (!s.gf) { fprintf(stderr, "[gsv_bert] failed to open %s\n", gguf_path.c_str()); delete m; return nullptr; }
+    s.wbuf = ggml_backend_alloc_ctx_tensors(s.wctx, s.backend);
+    if (!s.wbuf) { fprintf(stderr, "[gsv_bert] weight buffer alloc failed\n"); delete m; return nullptr; }
+    {
+        FILE * fp = fopen(gguf_path.c_str(), "rb");
+        if (!fp) { fprintf(stderr, "[gsv_bert] reopen failed\n"); delete m; return nullptr; }
+        const size_t data_off = gguf_get_data_offset(s.gf);
+        const int64_t n_tensors = gguf_get_n_tensors(s.gf);
+        for (int64_t ti = 0; ti < n_tensors; ti++) {
+            const char * tname = gguf_get_tensor_name(s.gf, ti);
+            ggml_tensor * tt = ggml_get_tensor(s.wctx, tname);
+            if (!tt) continue;
+            const size_t nbytes = ggml_nbytes(tt);
+            std::vector<char> buf(nbytes);
+            if (fseek(fp, (long)(data_off + gguf_get_tensor_offset(s.gf, ti)), SEEK_SET) != 0 ||
+                fread(buf.data(), 1, nbytes, fp) != nbytes) {
+                fprintf(stderr, "[gsv_bert] read tensor %s failed\n", tname);
+                fclose(fp); delete m; return nullptr;
+            }
+            ggml_backend_tensor_set(tt, buf.data(), 0, nbytes);
+        }
+        fclose(fp);
+    }
+    auto kv_u32 = [&](const char * key, int def) {
+        const int64_t id = gguf_find_key(s.gf, key);
+        return id < 0 ? def : (int) gguf_get_val_u32(s.gf, id);
+    };
+    auto kv_f32 = [&](const char * key, float def) {
+        const int64_t id = gguf_find_key(s.gf, key);
+        return id < 0 ? def : gguf_get_val_f32(s.gf, id);
+    };
+    s.NL     = kv_u32("bert.layers_used", 22);
+    s.D      = kv_u32("bert.hidden", 1024);
+    s.NH     = kv_u32("bert.head", 16);
+    s.FFD    = kv_u32("bert.inter", 4096);
+    s.VOCAB  = kv_u32("bert.vocab", 21128);
+    s.MAXPOS = kv_u32("bert.max_pos", 512);
+    s.EPS    = kv_f32("bert.ln_eps", 1e-12f);
+    s.HD     = s.D / s.NH;
+
+    auto t = [&](const char * n) {
+        ggml_tensor * tt = ggml_get_tensor(s.wctx, n);
+        if (!tt) fprintf(stderr, "[gsv_bert] missing tensor %s\n", n);
+        return tt;
+    };
+    if (!(s.word_emb  = t("bert.word_emb")))  { delete m; return nullptr; }
+    if (!(s.pos_emb   = t("bert.pos_emb")))   { delete m; return nullptr; }
+    if (!(s.type_emb  = t("bert.type_emb")))  { delete m; return nullptr; }
+    if (!(s.emb_ln_w  = t("bert.emb_ln_w")))  { delete m; return nullptr; }
+    if (!(s.emb_ln_b  = t("bert.emb_ln_b")))  { delete m; return nullptr; }
+    s.ws.resize(s.NL);
+    char buf[128];
+    for (int li = 0; li < s.NL; li++) {
+        #define GW_L(f, nm) snprintf(buf, sizeof(buf), "bert.l%d." nm, li); if (!(s.ws[li].f = t(buf))) { delete m; return nullptr; }
+        GW_L(q_w, "q_w"); GW_L(q_b, "q_b"); GW_L(k_w, "k_w"); GW_L(k_b, "k_b"); GW_L(v_w, "v_w"); GW_L(v_b, "v_b");
+        GW_L(attn_out_w, "attn_out_w"); GW_L(attn_out_b, "attn_out_b");
+        GW_L(attn_ln_w, "attn_ln_w"); GW_L(attn_ln_b, "attn_ln_b");
+        GW_L(ff1_w, "ff1_w"); GW_L(ff1_b, "ff1_b"); GW_L(ff2_w, "ff2_w"); GW_L(ff2_b, "ff2_b");
+        GW_L(out_ln_w, "out_ln_w"); GW_L(out_ln_b, "out_ln_b");
+        #undef GW_L
+    }
+    if (cfg.verbose)
+        printf("[gsv_bert] loaded %s: D=%d head=%d layers=%d inter=%d vocab=%d max_pos=%d eps=%g\n",
+               gguf_path.c_str(), s.D, s.NH, s.NL, s.FFD, s.VOCAB, s.MAXPOS, (double) s.EPS);
+    return m;
+}

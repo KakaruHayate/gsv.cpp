@@ -13,6 +13,7 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
 | AR batch 能力（多序列 KV cache + padding/causal mask） | ✅ batched 首步 6.2e-6；解码步 4~5e-6；greedy 生成逐 token 一致（含 early-stop 路径） |
 | AR 引擎（`src/gsv_ar`：GGUF 加载 + 前端 + 生成循环 + 常驻 KV cache） | ✅ 引擎端到端对拍 5.7e-6 / token 一致；**性能 2.1×（bs=1）/ 1.7×（bs=3）于 torch eager**，见 [docs/benchmark_ar.md](docs/benchmark_ar.md) |
 | AR 量化（最小近无损档） | ✅ **F16 158MB（TV 0.0002）/ attn+ffn Q8_0 89MB（TV 0.0035）**；低于此档 TV 翻倍，见 [docs/quant_ar.md](docs/quant_ar.md) |
+| BERT 前端（chinese-roberta-wwm-ext-large，22 层 encoder） | ✅ CPU 对拍 max\|Δ\| = 1.0e-5（逐层 23 个隐藏状态全部 cos=1.0）；Vulkan 13.1ms（f32）/10.1ms（f16）≈ torch 最快路径 3.8×；**量化下限 F16 662MB**（Q8 及以下越 token 稳定阈值）；见 [docs/bert_ggml.md](docs/bert_ggml.md) |
 | 条件编码段（HuBERT/RVQ/enc_p/MRTE/ref_enc/bridge/wns1） | ⬜ |
 | DiT（CFM + static cache，v5turbo 4 步） | ⬜ |
 | vocoder（ONNX，fp32 严格不量化） | ✅ 导出 57.8MB / sha256 `13f95a88…`；对拍 max\|Δ\| ≤1.1e-4、corr 1.0；ORT-DML ≈ torch CUDA，ORT-CPU 快 torch 1.85×，见 [docs/vocoder_onnx.md](docs/vocoder_onnx.md) |
@@ -23,22 +24,32 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
   对 `llama.cpp@f0c41e0` 应用；`llama.cpp/` 目录本身不入库（见下方"获取 ggml 基线"）
 - `docs/V5-ggml-port-research.md` — 选型与移植调研报告（链路清单、参考仓库映射、已确认决策）
 - `docs/benchmark_ar.md` — AR 段基准（vs torch，含精度-速度权衡与剖析）
+- `docs/quant_ar.md` — AR 量化（验收协议：logits/greedy/TF 分布 TV；最小近无损档）
+- `docs/vocoder_onnx.md` — vocoder ONNX 导出（fp32 严格不量化、DML 动态形状陷阱）
+- `docs/bert_ggml.md` — BERT 前端（切层依据、逐层对拍、Vulkan 精度容限探针、量化扫描）
 - `models/` — 权重（不入库）：s1v3.ckpt(AR) / s2Gv5turbo.pth / vocoder.pth / chinese-hubert-base / chinese-roberta-wwm-ext-large
 - `src/` — 引擎代码
   - `gsv_sampler.{h,cpp}`：AR 采样链（严格复刻 `AR/models/utils.py::logits_to_probs` 的顺序与语义）+ exp-trick 采样
   - `gsv_ar.{h,cpp}`：AR 引擎（GGUF 加载、phones/bert/prompt 前端、batched 首步/增量解码、常驻 KV cache、生成循环）。`GSV_AR_PROFILE=1` 输出分阶段耗时
-- `scripts/build-tests.bat` — 一键构建 ggml + 全部对拍可执行文件（VS2019 BuildTools，含 `/utf-8`）
+  - `gsv_bert.{h,cpp}`：BERT 前端（22 层 post-LN encoder + flash attention；`encode()`/`encode_feat()`/`encode_layers()`）
+- `scripts/build-tests.bat` — 一键构建 ggml + 全部对拍可执行文件（VS2019 BuildTools，含 `/utf-8`；脚本须保持纯 ASCII）
+- `scripts/build-bert-vk.bat` — BERT Release+Vulkan 构建（用 `llama.cpp/build-vk-rel`，产物 `tests/rel/`）
 - `tools/` — 权重转换与 golden 导出（Python，diffsinger env）
   - `convert_ar.py`：s1v3.ckpt → `models/gsv-ar-f32.gguf`
   - `dump_golden_ar.py`：torch 侧 golden（step0 各段 + K/V cache + decode 步）
   - `dump_golden_ar_sampling.py`：采样链 golden（probs/q/idx）+ batch golden（batched 首步/解码步 + greedy 参考 + phones/bert 输入）
   - `bench_ar.py`：torch 侧 AR 基准（与 bench_ar.cpp 同 workload）
+  - `convert_bert.py`：chinese-roberta-wwm-ext-large → `models/gsv-bert-*.gguf`（`--spec attn=...,ffn=...,emb=...`）
+  - `dump_golden_bert.py`：BERT golden（ids / hidden[-3] / 管线特征 / 逐层 hs0..22）
+  - `bench_bert.py`：torch 侧 BERT 基准（CPU fp32 / GPU fp32 / GPU fp16）
+  - `quantize_gguf.cpp`：GGUF 量化器（含 K-quants；`--spec` 分组同转换脚本）
 - `tests/` — C++ 对拍（MSVC 链接 `llama.cpp/build-cpu` 的 ggml）
   - `test_ar_step0.cpp`：全前向对拍（支持 GSV_AR_DEBUG_LAYERS / TOKEN / RECALC）
   - `test_ar_decode.cpp`：增量 decode 对拍（KV cache，单序列）
   - `test_ar_batch.cpp`：batch 图 + greedy 生成循环 + 采样链接入（含 mask 解析构造校验）
   - `test_ar_sampler.cpp`：采样链 probs 对拍 + 注入 q 的 argmax 规则
-  - `test_ar_engine.cpp`：引擎端到端（前端 + 首步 logits + greedy/early-stop 生成）
+  - `test_ar_engine.cpp`：引擎端到端（前端 + 首步 logits + greedy/early-stop 生成；`GSV_AR_BERT_NOISE=<σ>` 注入前端噪声探针）
+  - `test_bert_ggml.cpp`：BERT 对拍/基准（`GSV_BERT_DEVICE`/`MODEL`/`THREADS`/`LAYERS`，`--bench`）
   - `bench_ar.cpp`：AR 基准（bs=1/3/8，见 docs/benchmark_ar.md）
   - `test_min_ffn.cpp`：最小 LN+FFN 对拍（排查用）
   - `golden/`（不入库）由上述 dump 脚本生成
@@ -63,15 +74,20 @@ git apply ../patches/0001-ggml-audio-patch-port-on-llamacpp.patch
 # 2) GGUF 转换 + golden 导出（conda diffsinger）
 python tools/convert_ar.py
 python tools/dump_golden_ar.py
+python tools/convert_bert.py                       # f32 1.24GB
+python tools/convert_bert.py --spec "attn=f16,ffn=f16,emb=f16,type=f16" --out models/gsv-bert-f16.gguf
+python tools/dump_golden_bert.py
 
 # 3) 构建 ggml（CPU）+ 对拍程序
 scripts\build-tests.bat
+scripts\build-bert-vk.bat          # BERT 的 Release+Vulkan 版（bench 用）
 
 # 4) 对拍
 tests\test_ar_step0.exe   models\gsv-ar-f32.gguf tests\golden
 tests\test_ar_decode.exe  models\gsv-ar-f32.gguf tests\golden
 tests\test_ar_batch.exe   models\gsv-ar-f32.gguf tests\golden
 tests\test_ar_sampler.exe tests\golden
+tests\test_bert_ggml.exe  --bench                          # GSV_BERT_DEVICE=vulkan 走 GPU
 ```
 
 ## 关键移植结论（踩坑记录）
@@ -83,4 +99,8 @@ tests\test_ar_sampler.exe tests\golden
 - **MSVC 必须加 `/utf-8`**：源码含中文注释且为 LF 时，默认 936 代码页会把行末中文字节与换行配对、吞掉换行，导致下一行被并入注释（表现为莫名其妙的 "不是成员" 报错）。
 - **torch 对拍脚本**：`torch.manual_seed` 必须在 `Text2SemanticLightningModule` 构造**之后**（构造消耗 RNG 流）。
 - **采样链顺序不可调换**：rep-penalty → top-p → temperature → top-k（`<` 比较，等值保留）→ softmax；`idx<11` 时排除 EOS 等价于 `logits[:, :-1]`。
+- **图中间张量读不回来**：`ggml_set_output` 只影响 gallocr 的原地复用/回收判定，图根以外的中间张量在 `backend_graph_compute` 之后读到的可能是被复用/覆盖的数据（实测只有最后一个节点正确、其余全是垃圾）。要逐层导出就**按层数重建图**（`encode_layers()`），不要靠 OUTPUT 标记。
+- **Vulkan flash attention 只有 F16 K/V**（`pipeline_flash_attn_f32_f16`）：F32 K/V 会被降精度 → BERT 隐藏状态 1e-2 级偏差、AR logits Δ 0.0035。关 `GGML_VK_DISABLE_COOPMAT2` 不够，关 `GGML_VK_DISABLE_COOPMAT` 也几乎不改善（实测误差不变）。是否可接受用**前端噪声容限探针**判定（`GSV_AR_BERT_NOISE`：σ≤1e-2 时 100-token 逐 token 仍一致，σ=5e-2 开始分歧）。
+- **Windows 上 `INTER` 是宏**（`windef.h`），不能当成员名。
+- **`.bat` 必须纯 ASCII + 无括号歧义**：UTF-8 中文注释的批处理（LF 行尾、936 代码页）会被 cmd 解析错位；`echo (...)` 里的括号会截断 `if (...)` 块。
 - audio-patch 补丁路径需从独立 ggml 布局 `src/`→`ggml/src/`、`include/`→`ggml/include/`；vulkan 的 `vk_device_struct` 已拆到 `ggml-vulkan-types.h`；pipeline cache 的静态成员需 `vk_device_struct::` 限定调用。

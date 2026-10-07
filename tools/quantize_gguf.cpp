@@ -25,13 +25,22 @@ static ggml_type parse_type(const std::string & s) {
     return it->second;
 }
 
-// 与 tools/convert_ar.py 的 ft() 保持一致的组划分
+// 与 tools/convert_ar.py / tools/convert_bert.py 的 ft() 保持一致的组划分
 static std::string group_of(const std::string & name) {
-    if (name.find("norm") != std::string::npos || name.size() > 2 && name.compare(name.size() - 2, 2, "_b") == 0 ||
-        name.find("alpha") != std::string::npos || name.find("bert") != std::string::npos)
+    const bool is_bert = name.rfind("bert.", 0) == 0;   // BERT encoder 张量 (bert.xxx)
+    if (name.find("norm") != std::string::npos || name.find("_ln_") != std::string::npos ||
+        (name.size() > 2 && name.compare(name.size() - 2, 2, "_b") == 0) ||
+        name.find("alpha") != std::string::npos || name.find("bert_proj") != std::string::npos)
         return "fixed";                        // 强制 F32
     if (name.find("text_emb") != std::string::npos || name.find("audio_emb") != std::string::npos) return "emb";
     if (name.find("predict") != std::string::npos) return "predict";
+    if (is_bert) {
+        if (name.find("_emb") != std::string::npos) return "emb";                    // word/pos/type_emb
+        if (name.find("ff1_w") != std::string::npos || name.find("ff2_w") != std::string::npos) return "ffn";
+        if (name.find("q_w") != std::string::npos || name.find("k_w") != std::string::npos ||
+            name.find("v_w") != std::string::npos || name.find("attn_out_w") != std::string::npos) return "attn";
+        return "other";
+    }
     if (name.find("ffn") != std::string::npos) return "ffn";
     if (name.find("qkv") != std::string::npos || name.find("out_w") != std::string::npos) return "attn";
     return "other";

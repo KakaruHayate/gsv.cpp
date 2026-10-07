@@ -57,6 +57,28 @@ int main(int argc, char ** argv) {
     printf("[engine] B=%d lengths=[%d,%d,%d] bert_dim=%d\n", B,
            (int) reqs[0].phones.size(), (int) reqs[1].phones.size(), (int) reqs[2].phones.size(), m->bert_dim());
 
+    // bert 特征噪声注入探针: 估计前端 (BERT) 误差对 token 流的影响
+    // GSV_AR_BERT_NOISE=<s>: s>=0 为绝对 sigma, s<0 为相对 sigma (|s| * |feat|)
+    if (const char * ns = getenv("GSV_AR_BERT_NOISE")) {
+        const float s = (float) atof(ns);
+        uint64_t st = 0x243F6A8885A308D3ull;
+        auto rnd = [&]() {
+            st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+            return (float) ((st >> 40) / 16777216.0);
+        };
+        double sum = 0; size_t n = 0;
+        for (int b = 0; b < B; b++)
+            for (size_t i = 0; i < reqs[b].bert.size(); i++) {
+                const float u1 = std::max(rnd(), 1e-7f), u2 = rnd();
+                const float g = std::sqrt(-2.0f * std::log(u1)) * std::cos(6.2831853f * u2);
+                const float sig = s >= 0 ? s : -s * std::fabs(reqs[b].bert[i]);
+                reqs[b].bert[i] += sig * g;
+                sum += std::fabs(reqs[b].bert[i]); n++;
+            }
+        printf("[engine] bert 噪声注入 sigma=%g (%s), 注入后均值|feat| = %.4g\n",
+               s, s >= 0 ? "绝对" : "相对", sum / n);
+    }
+
     double worst = 0;
 
     // ---- 1) 前端 + 首步 logits ----
