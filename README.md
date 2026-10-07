@@ -71,9 +71,10 @@ git apply ../patches/0001-ggml-audio-patch-port-on-llamacpp.patch
 # 1) 模型下载（hf-mirror）
 #    s1v3.ckpt, gsv-v5-pretrained/{s2Gv5turbo.pth,vocoder.pth}, TencentGameMate/chinese-hubert-base, hfl/chinese-roberta-wwm-ext-large
 
-# 2) GGUF 转换 + golden 导出（conda diffsinger）
+# 2) GGUF 转换 + golden 导出（conda diffsinger；golden/ 不入库，必须由脚本生成）
 python tools/convert_ar.py
 python tools/dump_golden_ar.py
+python tools/dump_golden_ar_sampling.py            # batch/采样链 golden（test_ar_batch/engine/sampler 需要）
 python tools/convert_bert.py                       # f32 1.24GB
 python tools/convert_bert.py --spec "attn=f16,ffn=f16,emb=f16,type=f16" --out models/gsv-bert-f16.gguf
 python tools/dump_golden_bert.py
@@ -87,6 +88,7 @@ tests\test_ar_step0.exe   models\gsv-ar-f32.gguf tests\golden
 tests\test_ar_decode.exe  models\gsv-ar-f32.gguf tests\golden
 tests\test_ar_batch.exe   models\gsv-ar-f32.gguf tests\golden
 tests\test_ar_sampler.exe tests\golden
+tests\test_ar_engine.exe  models\gsv-ar-f32.gguf tests\golden   # GSV_AR_ACC=1 跑 100-token 量化门
 tests\test_bert_ggml.exe  --bench                          # GSV_BERT_DEVICE=vulkan 走 GPU
 ```
 
