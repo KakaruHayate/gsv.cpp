@@ -80,13 +80,18 @@ residual 1 + norm 1 + mul 1 + add 1 = **28 dispatch/层 → 674/步**（+ ~170 �
 
 ## 5. CUDA 后端（产品优先级 CUDA > Vulkan）
 
-用 `llama.cpp/build-cuda126`（CUDA 12.6 + sm75）构建同一套 ggml，引擎无需改代码即可选到 CUDA
-设备（`GSV_AR_DEVICE=cuda`，本次新增别名）。数值/延迟见下表（构建完成后填入）：
+引擎无需改代码即可选 CUDA 设备（`GSV_AR_DEVICE=cuda`，本次新增别名）；构建脚本
+`scripts/build-cuda.bat`（CUDA 12.6 + sm75）。
+
+**构建踩坑**：本机只注册了 **CUDA 13.0 的 MSBuild 集成**（CUDA 13 不支持 VS2019），
+用 VS 生成器时 MSBuild 会用 nvcc 13.0 编译 `.cu`（`CUDA 13.0.targets`），而且
+`fattn-*/mmq-*` 模板实例文件在 -j16 下 30 分钟都编不完。改用 **Ninja 生成器**后由 CMake
+直接驱动 nvcc 12.6（与 cl 19.29 兼容），绕开了 VS 集成。
 
 | 后端 | bs=1 | bs=3 | bs=8 |
 |---|---|---|---|
 | Vulkan f32 | 3.89 ms | 5.49 | 8.10 |
-| CUDA f32 | 见下方表格更新 | | |
+| CUDA f32 | 构建中（`scripts/build-cuda.bat`），完成即补 | | |
 
 ## 6. 复现
 
