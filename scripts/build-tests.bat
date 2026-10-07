@@ -32,6 +32,8 @@ for %%T in (test_ar_step0 test_ar_decode test_ar_batch test_ar_sampler test_min_
 )
 cl /nologo /O2 /EHsc /W1 %INC% tests\test_bert_ggml.cpp src\gsv_bert.cpp /Fe:tests\test_bert_ggml.exe /Fo:tests\ /link %LIBS%
 if errorlevel 1 exit /b 1
+cl /nologo /O2 /EHsc /W1 %INC% tests\test_cond_rvq.cpp src\gsv_cond.cpp /Fe:tests\test_cond_rvq.exe /Fo:tests\ /link %LIBS%
+if errorlevel 1 exit /b 1
 
 copy /y llama.cpp\build-cpu\bin\Debug\ggml*.dll tests\ >nul
 echo.

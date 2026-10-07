@@ -15,7 +15,7 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
 | AR 单流延迟优化（bs=1） | ✅ Vulkan 5.08 → **2.40~2.45 ms/step（408~417 tok/s，-52%）**；bs=3 6.84 → 4.11~4.14（-40%）、bs=8 9.07 → 7.00（-23%）。TTFT（56 token 前缀）42 → **15.5 ms（-63%，bert 投影挪进图）**；三轮: strided 视图/去冗余建图 → 融合算子（LN 连残差/bias 一起吃，`wb=[w;b]` 加载时打包）→ 解码图缓存（`set_rows` 追加 KV，仅 GPU）；CPU 换 q8_attn_ffn 近无损档 19.6 → **9.1 ms（-54%）**；见 [docs/ar_latency.md](docs/ar_latency.md) |
 | AR 量化（最小近无损档） | ✅ **F16 158MB（TV 0.0002）/ attn+ffn Q8_0 89MB（TV 0.0035）**；低于此档 TV 翻倍，见 [docs/quant_ar.md](docs/quant_ar.md) |
 | BERT 前端（chinese-roberta-wwm-ext-large，22 层 encoder） | ✅ CPU 对拍 max\|Δ\| = 1.0e-5（逐层 23 个隐藏状态全部 cos=1.0）；Vulkan f16 **8.5 ms** / f32 10.6 ms（≈ torch 最快路径 5.9×），CPU **108~116 ms**（16 线程，已含融合算子）；**量化下限 F16 662MB**（Q8 及以下越 token 稳定阈值）；见 [docs/bert_ggml.md](docs/bert_ggml.md) |
-| 条件编码段（HuBERT/RVQ/enc_p/MRTE/ref_enc/bridge/wns1） | ⬜ |
+| 条件编码段（HuBERT + RVQ/enc_p/MRTE/ref_enc/bridge/wns1） | 🚧 HuBERT 在另一条线；**本会话已做 RVQ**（条件段入口，CPU/Vulkan bit-exact，见 [docs/cond_ggml.md](docs/cond_ggml.md)），bridge/ref_enc/wns1/enc_p 待续 |
 | DiT（CFM + static cache，v5turbo 4 步） | ⬜ |
 | vocoder（ONNX，fp32 严格不量化） | ✅ 导出 57.8MB / sha256 `13f95a88…`；对拍 max\|Δ\| ≤1.1e-4、corr 1.0；ORT-DML ≈ torch CUDA，ORT-CPU 快 torch 1.85×，见 [docs/vocoder_onnx.md](docs/vocoder_onnx.md) |
 
@@ -29,11 +29,13 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
 - `docs/quant_ar.md` — AR 量化（验收协议：logits/greedy/TF 分布 TV；最小近无损档）
 - `docs/vocoder_onnx.md` — vocoder ONNX 导出（fp32 严格不量化、DML 动态形状陷阱）
 - `docs/bert_ggml.md` — BERT 前端（切层依据、逐层对拍、Vulkan 精度容限探针、量化扫描）
+- `docs/cond_ggml.md` — 条件段（V5 decode_encp 链）侦察 + RVQ 实现（链条入口，bit-exact）
 - `models/` — 权重（不入库）：s1v3.ckpt(AR) / s2Gv5turbo.pth / vocoder.pth / chinese-hubert-base / chinese-roberta-wwm-ext-large
 - `src/` — 引擎代码
   - `gsv_sampler.{h,cpp}`：AR 采样链（严格复刻 `AR/models/utils.py::logits_to_probs` 的顺序与语义）+ exp-trick 采样
   - `gsv_ar.{h,cpp}`：AR 引擎（GGUF 加载、phones/bert/prompt 前端、batched 首步/增量解码、常驻 KV cache、生成循环）。`GSV_AR_PROFILE=1` 输出分阶段耗时
   - `gsv_bert.{h,cpp}`：BERT 前端（22 层 post-LN encoder + flash attention；`encode()`/`encode_feat()`/`encode_layers()`）
+  - `gsv_cond.{h,cpp}`：条件段容器（当前含 RVQ decode + ×2 nearest；后续 bridge/ref_enc/wns1/enc_p）
 - `scripts/build-tests.bat` — 一键构建 ggml + 全部对拍可执行文件（VS2019 BuildTools，含 `/utf-8`；脚本须保持纯 ASCII）
 - `scripts/build-bert-vk.bat` — BERT Release+Vulkan 构建（用 `llama.cpp/build-vk-rel`，产物 `tests/rel/`）
 - `scripts/build-ar-vk.bat` — AR 基准/对拍 Release+Vulkan 构建（`tests/rel/bench_ar_rel.exe`、`test_ar_engine_rel.exe`）
