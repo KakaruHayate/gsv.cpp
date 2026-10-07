@@ -7,8 +7,8 @@
 
 | 配置 | 每 token 延迟 | 吞吐 | 相对优化前 |
 |---|---|---|---|
-| **Vulkan f32（bs=1）** | **5.08 → 3.89（阶段 1）→ 3.29（融合算子）→ 2.29~2.44 ms（图缓存）** | 197 → **410~436 tok/s** | **-52~55%** |
-| Vulkan f32（bs=3 / bs=8） | 6.84 → **4.09~4.29 ms** / 9.07 → **6.56 ms** | 700 / 1220 tok/s | **-37~40% / -28%** |
+| **Vulkan f32（bs=1）** | **5.08 → 3.89（阶段 1）→ 3.29（融合算子）→ 2.29（图缓存）→ 2.40~2.45 ms（LN 吸收 bias + prefill 视图）** | 197 → **408~417 tok/s** | **-52~53%** |
+| Vulkan f32（bs=3 / bs=8） | 6.84 → **4.11~4.14 ms** / 9.07 → **7.00~7.05 ms** | 726 / 1143 tok/s | **-40% / -23%** |
 | Vulkan **+ q8_attn_ffn 权重**（bs=1） | **3.54 ms**（图缓存尚未叠加该档） | **283 tok/s** | -30%（含精度档） |
 | CPU f32（bs=1，8 线程） | 同期配对：20.97 → **19.29 ms** | | 融合算子 -8%（跨时段绝对值 17.3~21.0 ms 波动） |
 | **CPU + q8_attn_ffn 权重**（bs=1） | **9.1 ms** | **110 tok/s** | **-54%**（近无损档，见 §3） |
@@ -71,8 +71,14 @@ residual 1 + norm 1 + mul 1 + add 1 = **28 dispatch/层 → 674/步**（+ ~170 �
 
 | 算子 | 语义 | 替换 | 省 |
 |---|---|---|---|
-| `ggml_layernorm_affine(ctx,x,r,w,b,eps)` | `(x+r-mean)/sqrt(var+eps)*w+b`，一次遍历（`r` 可空=无残差） | `add + norm + mul + add` | 3 dispatch ×2 处/层 |
+| `ggml_layernorm_affine(ctx,x,r,bias,wb,eps)` | `(x+r+bias-mean)/sqrt(var+eps)*w+b`，一次遍历（`r`/`bias` 可空）；`wb` 是 `[w;b]` 打包张量 | `add(r) + add(bias) + norm + mul + add` | 4 dispatch ×2 处/层 |
 | `ggml_add_act(ctx,a,b,act)` | `act(a+b)`，b 按 ne0 广播（`act`: 0=none,1=relu,2=gelu_erf） | `add + relu/gelu` | 1 dispatch/层 |
+
+**关于 `wb=[w;b]` 打包**：`ggml_vk_op_f32` 只有 4 个 src 槽，而"残差 + bias + 权重 + 偏置"要 5 个输入；
+解法是在**引擎加载时**把每处 LN 的 `w|b` 读回 host 再拼成一个 `[2*ne0]` 张量（放进一个专用小 buffer，
+AR ~200KB / BERT ~530KB），**不动 GGUF 格式也不动转换器**。这样 `out_b`、`f2b`、`attn_out_b`、
+`ff2_b` 这些 per-ne0 的 bias 加法也被 LN 吃掉（每层再省 2 次 dispatch）。
+副作用：Vulkan 首步 logits Δ 从 3.46e-3 降到 **2.39e-3**（少一次广播型 elementwise 往返）。
 
 每层 dispatch 22 → **15**（AR）/ 18 → **12**（BERT）；Vulkan 端 2 个 shader
 （`layernorm_affine.comp` 每 workgroup 一行、`add_act.comp` 每线程一元素；erf 用上游
@@ -152,8 +158,27 @@ residual 1 + norm 1 + mul 1 + add 1 = **28 dispatch/层 → 674/步**（+ ~170 �
 |---|---|---|
 | ~~融合算子 `layernorm_affine` / `add_act`~~ | ~~bs=1 -17%~~ | **已在 §2.5 完成**：bs=1 -19%、bs=3 -14%、CPU -8% |
 | ~~图复用~~ | ~~-25%~~ | **已在 §2.6 完成**（用 `set_rows` 把 KV 列索引变成输入，**没有**动 `tensor->data`）：Vulkan bs=1 -32% |
-| prefill（TTFT）：56 token 前缀 45.5 ms | 与 decode 同源（674 dispatch + chunk 化 attention） | 分块 prefill / 更大 tile；当前已领先 torch CUDA Graph 1.7× |
-| FA 的 K/V 常驻 F16（Vulkan 的 FA 内核本来就只吃 F16 K/V） | 省一半 KV 流量，Vulkan 上数值等价 | 会改变 CPU 端数值（f16 化 K/V），需重跑验收 |
+| ~~prefill（TTFT）~~ | 已剖析，**不做**（见 §4.2） | 42 ms = ~14 ms host 侧输入构建 + ~26 ms 图执行；后者与权重精度无关、与去掉的 144 次 cont 无关 → 每节点提交受限；真正的杠杆是 coopmat2/f16-matmul，与精度策略冲突 |
+| ~~FA 的 K/V 常驻 F16~~ | **不做**（结构上不成立） | 图缓存需要 `concat(缓存, 新列)`，而新列来自 F32 投影输出 → 缓存必须同为 F32；要 f16 缓存就得加一次 cast/层（+24 dispatch），省下的流量在 Vulkan 上本就几乎为零（FA 内核内部已转 f16），CPU 上也被 cast 抵消 |
+
+### 4.2 prefill（TTFT）剖析
+
+`GSV_AR_PROFILE=1` 现在同时输出 prefill 的分段（`first=` 是 bench 的端到端首步）：
+
+| 后端 | run_first 建图 | 图执行 | host 侧输入构建（差值） | 总首步 |
+|---|---|---|---|---|
+| Vulkan f32 | 1.6 ms | **26 ms** | ~14 ms | 41.7 ms |
+| Vulkan f16 / q8 | 2.0 / 1.7 ms | 26 ms | ~14 ms | 41.7 / 41.0 ms（**无差别**） |
+| CPU（8 线程） | 2.1 ms | 127 ms | — | 153 ms |
+
+- 权重精度对 prefill **毫无影响**（f32/f16/q8 都是 41~42 ms）→ 既不是权重带宽也不是 matmul 吞吐受限；
+- 把每层 6 次 `cont` 换成视图直送（-144 dispatch，20% 节点）**也没有可测变化** → 说明 26 ms 图执行
+  卡在"每节点提交"上（~45 µs/节点，而 decode 是 ~6 µs/节点，原因未定论，可能与首步图的分段提交/
+  descriptor 分配有关）；
+- **host 侧输入构建**（`build_inputs` 里的 `bert_proj`：`[D,1024]×[1024,T]`，单线程三重循环 ≈ 30M MAC）
+  约 14 ms —— 这块**可以**挪进图里（`x = text_emb_pe + mul_mat(bert_proj, bert_feat) + bias`），
+  但只省 ~12 ms/句（≈整句 2%），当前不做。
+- 结论：prefill 只占整句 ~6%（42 ms vs decode ~700 ms），且已在当前精度/后端策略的下限附近；
 
 ### 4.1 测量噪声记录（重要）
 

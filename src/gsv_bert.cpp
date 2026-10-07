@@ -37,12 +37,20 @@ struct gsv_bert::impl {
     ggml_gallocr_t galloc = nullptr;
 
     bool fuse_ln = true, fuse_act = true;   // 融合算子开关 (GSV_NO_FUSE / GSV_NO_FUSE_LN / GSV_NO_FUSE_ACT)
+    // [w;b] 打包张量: 0 = embedding LN, 1 = attn_ln, 2 = out_ln (每层)
+    ggml_context * pctx = nullptr;
+    ggml_backend_buffer_t pbuf = nullptr;
+    std::vector<ggml_tensor *> ln_pack;   // [1 + 2*NL]
 
-    // LN(x + r)*w + b (r 可为 NULL): 融合算子不可用时退回 add + norm + mul + add
-    ggml_tensor * ln_affine(ggml_context * ctx, ggml_tensor * x, ggml_tensor * r,
-                            ggml_tensor * w, ggml_tensor * b, float eps) {
-        if (fuse_ln) return ggml_layernorm_affine(ctx, x, r, w, b, eps);
-        if (r) x = ggml_add(ctx, x, r);
+    // LN(x + r + bias)*w + b; wb = [w;b] 打包; r/bias 可为 NULL
+    ggml_tensor * ln_affine(ggml_context * ctx, ggml_tensor * x, ggml_tensor * r, ggml_tensor * bias,
+                            ggml_tensor * wb, float eps) {
+        if (fuse_ln) return ggml_layernorm_affine(ctx, x, r, bias, wb, eps);
+        if (r)    x = ggml_add(ctx, x, r);
+        if (bias) x = ggml_add(ctx, x, bias);
+        const int n = (int) (wb->ne[0] / 2);
+        ggml_tensor * w = ggml_view_1d(ctx, wb, n, 0);
+        ggml_tensor * b = ggml_view_1d(ctx, wb, n, (size_t) n * 4);
         return ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, x, eps), w), b);
     }
 
@@ -75,7 +83,7 @@ void gsv_bert::impl::run(const int32_t * ids, int T, std::vector<float> & out, i
                             emb_row(ctx, word_emb, t_ids),
                             emb_row(ctx, pos_emb, t_pos)),
                             emb_row(ctx, type_emb, t_typ));                    // [D, T]
-    cur = ln_affine(ctx, cur, nullptr, emb_ln_w, emb_ln_b, EPS);   // embedding: 无残差
+    cur = ln_affine(ctx, cur, nullptr, nullptr, ln_pack[0], EPS);   // embedding: 无残差/bias
 
     for (int li = 0; li < n_layers; li++) {
         const bert_layer_w & w = ws[li];
@@ -89,13 +97,13 @@ void gsv_bert::impl::run(const int32_t * ids, int T, std::vector<float> & out, i
         ggml_tensor * vh = ggml_view_4d(ctx, q3, HD, T, NH, 1, nb_s, nb_h, nb_h * T, 2 * q3->nb[1]);
         ggml_tensor * attn = ggml_flash_attn_ext(ctx, qh, kh, vh, t_msk, 1.0f / std::sqrt((float) HD), 0.0f, 0.0f);
         attn = ggml_reshape_2d(ctx, ggml_reshape_4d(ctx, attn, D, T, 1, 1), D, T);
-        ggml_tensor * ao = ggml_add(ctx, ggml_mul_mat(ctx, w.attn_out_w, attn), w.attn_out_b);
-        cur = ln_affine(ctx, cur, ao, w.attn_ln_w, w.attn_ln_b, EPS);                 // post-LN 1
+        ggml_tensor * ao = ggml_mul_mat(ctx, w.attn_out_w, attn);
+        cur = ln_affine(ctx, cur, ao, w.attn_out_b, ln_pack[1 + 2*li + 0], EPS);      // post-LN 1
         ggml_tensor * h = fuse_act
             ? ggml_add_act(ctx, ggml_mul_mat(ctx, w.ff1_w, cur), w.ff1_b, GGML_ACT_GELU_ERF)
             : ggml_gelu_erf(ctx, ggml_add(ctx, ggml_mul_mat(ctx, w.ff1_w, cur), w.ff1_b));
-        ggml_tensor * fo = ggml_add(ctx, ggml_mul_mat(ctx, w.ff2_w, h), w.ff2_b);
-        cur = ln_affine(ctx, cur, fo, w.out_ln_w, w.out_ln_b, EPS);                   // post-LN 2
+        ggml_tensor * fo = ggml_mul_mat(ctx, w.ff2_w, h);
+        cur = ln_affine(ctx, cur, fo, w.ff2_b, ln_pack[1 + 2*li + 1], EPS);           // post-LN 2
     }
     ggml_set_output(cur);
 
@@ -267,14 +275,39 @@ gsv_bert * gsv_bert::load(const std::string & gguf_path, const gsv_bert_cfg & cf
         GW_L(out_ln_w, "out_ln_w"); GW_L(out_ln_b, "out_ln_b");
         #undef GW_L
     }
+    // [w;b] 打包 (供 4-src 融合 LN): 0 = embedding LN, 1+2*li+{0,1} = attn_ln / out_ln
+    {
+        ggml_init_params pp = { ggml_tensor_overhead() * (2 * s.NL + 16), NULL, true };
+        s.pctx = ggml_init(pp);
+        std::vector<ggml_tensor *> tmp(1 + 2 * s.NL, nullptr);
+        for (size_t i = 0; i < tmp.size(); i++)
+            tmp[i] = ggml_new_tensor_1d(s.pctx, GGML_TYPE_F32, 2 * s.D);
+        s.pbuf = ggml_backend_alloc_ctx_tensors(s.pctx, s.backend);
+        if (!s.pbuf) { fprintf(stderr, "[gsv_bert] packed wb buffer alloc failed\n"); delete m; return nullptr; }
+        s.ln_pack.resize(1 + 2 * s.NL);
+        std::vector<float> buf;
+        auto fill = [&](int idx, ggml_tensor * w, ggml_tensor * b) {
+            const int n = (int) w->ne[0];
+            buf.resize((size_t) 2 * n);
+            ggml_backend_tensor_get(w, buf.data(), 0, (size_t) n * 4);
+            ggml_backend_tensor_get(b, buf.data() + n, 0, (size_t) n * 4);
+            ggml_backend_tensor_set(tmp[idx], buf.data(), 0, (size_t) 2 * n * 4);
+            s.ln_pack[idx] = tmp[idx];
+        };
+        fill(0, s.emb_ln_w, s.emb_ln_b);
+        for (int li = 0; li < s.NL; li++) {
+            fill(1 + 2*li + 0, s.ws[li].attn_ln_w, s.ws[li].attn_ln_b);
+            fill(1 + 2*li + 1, s.ws[li].out_ln_w,  s.ws[li].out_ln_b);
+        }
+    }
     // 融合算子支持探测 (CPU 恒支持; Vulkan 需 shader 在册)
     {
         ggml_init_params fp = { ggml_tensor_overhead() * 32, NULL, true };
         ggml_context * fctx = ggml_init(fp);
         ggml_tensor * fx = ggml_new_tensor_2d(fctx, GGML_TYPE_F32, 64, 4);
         ggml_tensor * fw = ggml_new_tensor_1d(fctx, GGML_TYPE_F32, 64);
-        ggml_tensor * fb = ggml_new_tensor_1d(fctx, GGML_TYPE_F32, 64);
-        ggml_tensor * fln = ggml_layernorm_affine(fctx, fx, nullptr, fw, fb, 1e-5f);
+        ggml_tensor * fwb = ggml_new_tensor_1d(fctx, GGML_TYPE_F32, 128);   // [w;b] 打包
+        ggml_tensor * fln = ggml_layernorm_affine(fctx, fx, nullptr, nullptr, fwb, 1e-5f);
         ggml_tensor * fac = ggml_add_act(fctx, fx, fw, GGML_ACT_GELU_ERF);
         const bool sup = ggml_backend_supports_op(s.backend, fln) && ggml_backend_supports_op(s.backend, fac);
         ggml_free(fctx);

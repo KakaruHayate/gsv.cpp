@@ -66,6 +66,7 @@ int main() {
     // ---- layernorm_affine (有/无残差) ----
     const int shapes[][2] = {{64, 8}, {512, 3}, {1024, 2}, {56, 5}, {4096, 1}};
     for (int with_r = 0; with_r <= 1; ++with_r)
+    for (int with_bias = 0; with_bias <= 1; ++with_bias)
     for (const auto & sh : shapes) {
         const int D = sh[0], T = sh[1];
         std::vector<float> xv((size_t) D * T), rv((size_t) D * T), wv(D), bv(D);
@@ -75,6 +76,12 @@ int main() {
         for (auto & v : bv) v = nd(rng) * 0.3f;
         const float eps = 1e-5f;
 
+        // wb = [w; b] 打包 (与引擎一致); 覆盖 无残差/有残差/有残差+bias 三种
+        std::vector<float> wbv(wv);
+        wbv.insert(wbv.end(), bv.begin(), bv.end());
+        std::vector<float> biasv(D);
+        for (auto & v : biasv) v = nd(rng) * 0.4f;
+
         std::vector<ggml_tensor *> ins;
         std::vector<std::vector<float>> vals;
         std::vector<float> got, ref;
@@ -83,11 +90,14 @@ int main() {
             ggml_context * ctx = ggml_init(ip);
             ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, T);
             ggml_tensor * r = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, T);
-            ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D);
-            ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D);
-            ins  = with_r ? std::vector<ggml_tensor *>{x, r, w, b} : std::vector<ggml_tensor *>{x, w, b};
-            vals = with_r ? std::vector<std::vector<float>>{xv, rv, wv, bv} : std::vector<std::vector<float>>{xv, wv, bv};
-            got = run_graph(ctx, ggml_layernorm_affine(ctx, x, with_r ? r : nullptr, w, b, eps), ins, vals);
+            ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D);
+            ggml_tensor * wb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * D);
+            ins  = {x, wb};
+            vals = {xv, wbv};
+            if (with_r)    { ins.push_back(r);    vals.push_back(rv); }
+            if (with_bias) { ins.push_back(bias); vals.push_back(biasv); }
+            got = run_graph(ctx, ggml_layernorm_affine(ctx, x, with_r ? r : nullptr,
+                                                       with_bias ? bias : nullptr, wb, eps), ins, vals);
             ggml_free(ctx);
         }
         {
@@ -95,14 +105,19 @@ int main() {
             ggml_context * ctx = ggml_init(ip);
             ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, T);
             ggml_tensor * r = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, T);
-            ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D);
-            ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D);
-            ggml_tensor * xr = with_r ? ggml_add(ctx, x, r) : x;
+            ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D);
+            ggml_tensor * wb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * D);
+            ggml_tensor * xr = x;
+            if (with_r)    xr = ggml_add(ctx, xr, r);
+            if (with_bias) xr = ggml_add(ctx, xr, bias);
+            ggml_tensor * w = ggml_view_1d(ctx, wb, D, 0);
+            ggml_tensor * b = ggml_view_1d(ctx, wb, D, (size_t) D * 4);
             ref = run_graph(ctx, ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, xr, eps), w), b), ins, vals);
             ggml_free(ctx);
         }
         char tag[64];
-        snprintf(tag, sizeof(tag), "layernorm_affine%s D=%d T=%d", with_r ? "+res" : "", D, T);
+        snprintf(tag, sizeof(tag), "layernorm_affine%s%s D=%d T=%d",
+                 with_r ? "+res" : "", with_bias ? "+bias" : "", D, T);
         if (cmp(got, ref, tag) >= 1e-4 * 3.0) n_bad++;
         else printf("  [%s] PASS\n", tag);
     }
