@@ -301,6 +301,26 @@ conv=F16 不叠加误差（conv 后接 GroupNorm 归一化了 F16 噪声）。Vu
 `astype(float16)`，否则 header 声明 F16 而数据仍按 F32 落盘（体积不变且图内误读）。
 另：conv 权重转置回写（load 时）已支持 F16（`gsv_hubert.cpp` 按类型大小 get/set）。
 
+### Q8_0 档（`quantize_gguf` 组扩展后）
+
+`tools/quantize_gguf.cpp` 已扩展 hubert/wns1/bridge 分组（feat_conv=conv 组、
+transformer q/k/v/out=attn、ffn=ffn 组、ln_w/norm/bias/codebook/pos_conv 强制 F32/F16 fixed）。
+
+| 模型 | 档位 | 体积 | CPU max\|d\| | Vulkan max\|d\| | CPU 耗时 | Vulkan 耗时 |
+|------|------|------|--------------|----------------|----------|-------------|
+| HuBERT | **attn+ffn+conv Q8_0** | **189 MB（F16 199MB 再 ↓5%）** | **5.2e-3** | 待测 | 129/119 ms（慢 15%） | — |
+| wns1 | wns1 权重 Q8_0（k=1 的 1×512 条回退 F16） | **93 MB（w16 127MB 再 ↓27%）** | **9.5e-7（不变！）** | 2.9e-3（不变） | 91/79 ms | 2.10/2.01 ms |
+| bridge | 3D 张量不量化（回退 F16），收益 0 | — | — | — | — | — |
+
+结论：
+- **wns1 Q8_0 是意外赢家**：CPU 精度逐位不变（9.5e-7）、体积再 ↓27%、速度还略快。
+  in_layers k=5 的 [512,1024] 大块 Q8 对称量化恰好适配。
+- **HuBERT Q8_0 不划算**：CPU 误差 1.0e-3→5.2e-3（涨 5×）、速度慢 15%（Q8 去量化开销），
+  体积只比 F16 小 9MB。**维持 F16 档**。
+- 修复：quantizer 的 fixed 判定补了 `.b`/`.bias` 结尾（此前 `feat_proj.b` 等 bias 被
+  误量化为 F16，binary-op 直接断言拒绝 F16 输入）；`ln1_w/ln2_w` 归 fixed
+  （layernorm_affine 要求 F32）；`pos_conv.w` 归 fixed（host 端按 float* 读，F16 越界）。
+
 ## 9. WNS1（VITS WN Encoder）—— 已落地（ORCATERM 实现 + conv 内核优化）
 
 结构：pre Conv1d(512→512,k=1) ×mask → 8 层 WaveNet（in_layers k=5 pad=2、cond_layer k=1 的

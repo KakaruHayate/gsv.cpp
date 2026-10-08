@@ -30,6 +30,8 @@ static std::string group_of(const std::string & name) {
     const bool is_bert = name.rfind("bert.", 0) == 0;   // BERT encoder 张量 (bert.xxx)
     if (name.find("norm") != std::string::npos || name.find("_ln_") != std::string::npos ||
         (name.size() > 2 && name.compare(name.size() - 2, 2, "_b") == 0) ||
+        (name.size() > 2 && name.compare(name.size() - 2, 2, ".b") == 0) ||
+        name.find(".bias") != std::string::npos ||
         name.find("alpha") != std::string::npos || name.find("bert_proj") != std::string::npos)
         return "fixed";                        // 强制 F32
     if (name.find("text_emb") != std::string::npos || name.find("audio_emb") != std::string::npos) return "emb";
@@ -44,6 +46,26 @@ static std::string group_of(const std::string & name) {
     }
     if (name.find("ffn") != std::string::npos) return "ffn";
     if (name.find("qkv") != std::string::npos || name.find("out_w") != std::string::npos) return "attn";
+    // norm_w / enc_norm_w 参与 MUL (F32 语义) → fixed; *_b 同
+    if (name.find("norm_w") != std::string::npos || name.find("enc_norm") != std::string::npos)
+        return "fixed";
+    // hubert.layer.X.ln1_w/ln2_w 被 layernorm_affine 消费 (要求 F32 输入) → fixed
+    if (name.find("hubert.layer.") == 0 &&
+        (name.find(".ln1_w") != std::string::npos || name.find(".ln2_w") != std::string::npos))
+        return "fixed";
+    // HuBERT: feat_conv (conv 组) 与 transformer 头切片 q/k/v/out_w (attn 组)
+    // pos_conv.w 强制 F32 — host 端 pos_conv/enc_ln 读它按 float*, F16 会越界
+    if (name.find("pos_conv") != std::string::npos) return "fixed";
+    if (name.find("feat_conv") != std::string::npos) return "conv";
+    if (name.rfind("hubert.layer.", 0) == 0) {
+        if (name.find(".q_w") != std::string::npos || name.find(".k_w") != std::string::npos ||
+            name.find(".v_w") != std::string::npos || name.find(".out_w") != std::string::npos) return "attn";
+        if (name.find(".ffn1_w") != std::string::npos || name.find(".ffn2_w") != std::string::npos) return "ffn";
+    }
+    if (name.rfind("hubert.", 0) == 0) return "other";
+    // wns1 / cond 段: 权重类 → wns1 组 (bias/codebook 已被 fixed 截获)
+    if (name.rfind("wns1.", 0) == 0) return "wns1";
+    if (name.rfind("bridge", 0) == 0) return "bridge";
     return "other";
 }
 
