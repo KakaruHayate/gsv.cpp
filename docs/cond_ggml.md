@@ -215,17 +215,34 @@ proj k=1 ×mask。权重来自 `models/gsv-cond-f32.gguf`（38 个张量，weigh
 
 复核（独立重跑，T=120 / len=100）：
 
-| 实现 | max\|d\| vs torch golden | avg | min |
-|------|--------------------------|-----|-----|
-| ggml CPU 24T | 6.53e-4 | 100.9 ms | 90.3 |
-| **ggml Vulkan** | 3.57e-3 | **2.65 ms** | **2.36** |
-| torch F32 | — | 42.2 ms (CPU) / 9.50 ms (CUDA) | 35.2 / 8.88 |
-| torch F16 | — | — | 10.10 ms (CUDA，无收益) |
+**已用 audio patch 的算子优化 conv 路径**（`GSV_WNS1_CONV` 选档，默认 2）：
 
-结论：**GPU 侧 ggml Vulkan 比 torch CUDA 快 3.6×**；**CPU 侧慢 2.4×**（同 HuBERT 的 CNN：
-通用 `ggml_conv_1d` im2col 路径 vs oneDNN 直卷积）。CPU 若要加强，先换 patch 的
-`ggml_conv_1d_fast_1d_im2col`（+ F32 im2col），这里的 in_layers 是 stride-1 k=5、[T,512]→1024 的
-较大形状，`conv_direct_1d` 也值得一试（HuBERT 那边不适合是 16 个 49×48 小分组摊不开固定开销）。
+| conv 实现 | CPU 24T avg/min | Vulkan avg/min | 精度 (CPU / Vulkan) |
+|-----------|-----------------|----------------|---------------------|
+| 0 = `ggml_conv_1d`（原样） | 127 / 102.8 ms | 2.77 / 2.33 ms | 6.5e-4 / 3.6e-3 |
+| 1 = `ggml_conv_1d_fast_1d_im2col` | 291 / 101.1 ms（抖动大） | 2.72 / 2.30 ms | 6.5e-4 / 3.6e-3 |
+| **2 = fast im2col + dst F32（默认）** | **79.7 / 62.8 ms** | **2.97 / 2.33 ms** | **1.07e-6 / 2.90e-3** |
+| 3 = `ggml_conv_direct_1d` | 272 / 238 ms | **崩溃（K=1 时）** | 1.67e-6 / — |
+| 4 = 混合（K>1 走 direct） | 131 / 115 ms | 6.40 / 5.56 ms | 6.0e-4 / 2.8e-3 |
+
+**结论：mode 2 胜出（CPU −32%、精度 6.5e-4 → 1.1e-6；Vulkan 持平、精度略好）。**
+
+- `conv_direct_1d` 在这里不划算：T=120 的帧数太小，它的 chunked pipeline 固定开销压不住
+  （Vulkan 慢 2.3×，CPU 慢 2.3×）。它的设计目标是长 T（音频模型常见几百~几千帧）。
+- **发现一个 patch kernel bug**：`ggml_conv_direct_1d` 在 **Vulkan 下 K=1 时崩溃**（与 T 无关；
+  K=2/3/5 正常；CPU 正常）。最小复现：`tests/test_conv_direct_vk.cpp`
+  （`test_conv_direct_vk.exe vulkan 1 120 0`）。疑在 shader/变体选择的权重打包对 KW=1 的处理。
+  我们不依赖它（只用 mode 2），但对 patch 维护者是个待修项。
+
+对 torch 的最终对比（T=120 / len=100）：
+
+| | torch | ggml（mode 2） | 相对 |
+|---|---|---|---|
+| GPU | CUDA F32 9.50 ms（min 8.88） | **Vulkan 2.97 ms（min 2.33）** | **快 4.1×** |
+| CPU | CPU F32 42.2 ms（min 35.2） | CPU 24T 79.7 ms（min 62.8） | 慢 1.8×（原 2.4×） |
+
+CPU 仍落后 1.8×：剩下的是纯 GEMM 吞吐差（oneDNN 直卷积 + AVX-512 阻塞 vs ggml CPU GEMM），
+与 HuBERT 的 CNN 同因。
 
 > 该实现的图语义已逐条核对（mask 时机、门控切分、cond 分层切片、res/skip 分支）与 VITS 一致；
 > 落地前待办：T 目前固定 120（集成需按 T 重建图）、`src/gsv_cond.h` 工作副本的中文注释被写入
