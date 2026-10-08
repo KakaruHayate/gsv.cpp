@@ -123,30 +123,43 @@ m->rvq_decode(codes, T, /*upsample_x2=*/true, out);   // out: [768, 2T], idx = d
 | 实现 | 后端 | avg | min | 相对 |
 |------|------|-----|-----|------|
 | host C++（ORCATERM，OpenMP 全核） | CPU | 288.8 ms | 273.4 | 基线 |
-| **ggml（本实现）** | **CPU 24T** | **139.3 ms** | **124.6** | **2.1× 快于 host** |
-| ggml（本实现） | CPU 16T | 142.7 ms | 129.8 | |
-| *torch 参考* | *CPU* | *84.2 ms* | *74.1* | *torch CPU 仍最快* |
-| **ggml（本实现）** | **Vulkan** | **36.2 ms** | **32.7** | — |
-| torch（transformers，F32） | CUDA | 25.7 ms | 23.9 | 1.41× 快于 Vulkan |
+| **ggml（本实现）** | **CPU 24T** | **105.4 ms** | **99.5** | **2.7× 快于 host** |
+| ggml（本实现） | CPU 16T | 118.0 ms | 108.5 | |
+| *torch 参考* | *CPU* | *84.2 ms* | *74.1* | *torch CPU 仍快 1.25×* |
+| **ggml（本实现）** | **Vulkan** | **12.0 ms** | **10.5** | **2.1× 快于 torch CUDA** |
+| torch（transformers，F32） | CUDA | 25.7 ms | 23.9 | |
 | torch（transformers，F16） | CUDA | 28.1 ms | 26.0 | F16 无收益 |
 
 **CPU 对 CPU**：ggml 图 139 ms vs host C++ 289 ms（2.1×）。host 版瓶颈在 cnn 137 / tr 141 ms，
 ggml 版把 transformer 压到 ~51 ms 的同时 CNN 也从 137 → ~78 ms。
 
-**CUDA 对 Vulkan**：torch CUDA 25.7 ms vs ggml Vulkan 36.2 ms（Vulkan 慢 1.41×）。
-与 AR 解码（ggml Vulkan 反超 torch CUDA 5.7×）相反——HuBERT 是**单次大前向**，
-正好落在 cuDNN/cuBLAS 的舒适区，没有 launch 开销可省。拆解 Vulkan 的 36.2 ms：
+**CUDA 对 Vulkan**：torch CUDA 25.7 ms vs ggml Vulkan 12.0 ms —— **ggml Vulkan 快 2.1×**。
+
+拆解 Vulkan 的 12 ms（`GSV_HUBERT_TIMING=1`）：
 
 | 段 | 耗时 | 说明 |
 |----|------|------|
-| g1 CNN 前端（GPU） | ~20 ms | 7 层 conv 走 im2col(F16)+mul_mat，通用 kernel，是 GPU 侧最大头 |
-| pos_conv + enc LN（**host**） | ~11 ms | groups=16 分组卷积的 host 实现；权重 18.9 MB 被 49 帧重复读 ≈923 MB，带宽受限 |
-| g2 12 层 transformer（GPU） | ~5 ms | 每层 ~0.45 ms |
+| g1 CNN 前端（GPU） | ~2 ms | 7 层 conv 走 im2col(F16)+mul_mat |
+| pos_conv + enc LN（**host**） | ~3.5 ms | 见下方 GEMM 结构说明 |
+| g2 12 层 transformer（GPU） | ~5.7 ms | 每层 ~0.48 ms，现在最大的单项 |
 
-即 Vulkan 路径里 **~11 ms 是固定的 host 串行成本**（torch 侧由 cuDNN 在 GPU 上完成）。
-后续若继续优化，两个目标：(1) pos_conv 重写为 im2col+GEMM（权重只读一遍，预计 -9 ms，
-CPU/Vulkan 通吃）；(2) g1 的 k∈{2,3} conv 用「移位 GEMM 累加」替代 im2col（省掉 F16 转换与
-通用 kernel，两边都能受益）。
+### 优化历程（36.2 ms → 12.0 ms）
+
+两个**非算法性**的瓶颈，合计占原本 ~25 ms：
+
+1. **每帧从 GPU 回传 18.9 MB pos_conv 权重**：为 Vulkan 正确性引入的 `tensor_get` 被放在
+   `encode()` 里（每次调用执行）。改为 load() 时拷回一份 host 常驻副本。
+   仅此一项即 Vulkan −20 ms（PCIe）。
+2. **pos_conv 的权重访问跨 3 KB 步长**（旧布局 `[k][ic][g*48+oc]`，内核每次只用 32 B/64 B line，
+   硬件预取完全失效）：load() 时重排为 `[g][ocg][ic][k]`（k 最内），内核按
+   「任务 = (组, 8 个输出通道)，o 外层、`(ic,k)` 内层，累加器 = 全部 49 帧（7 个 YMM）」实现
+   —— 每个 w 元素只读一遍、纯顺序流。OMP=24 时 10.5 ms → 3.1 ms。
+
+（另外修掉一个自伤：`std::vector<float> acc[64][16]` 动态下标版本让 MSVC 把累加器放到栈上，
+比寄存器版慢 3×；显式命名 8 个 `__m256` 才拿到预期吞吐。）
+
+CPU 侧现况：g1 ≈ 43 ms、g2 ≈ 49 ms、host ≈ 3 ms（合计 105 ms）——已无"送分"项，
+两端都跑在 ~80–90 GMAC/s 的 F32/F16 GEMM 吞吐上；再快需要 BF16/FP16 权重或 AVX-512。
 
 测试：`tests/test_hubert_ggml.cpp`（`GSV_HUBERT_DEVICE=vulkan` 切后端，`GSV_HUBERT_NTHREADS=N` 调线程、
 `GSV_HUBERT_BENCH=N` 基准，`GSV_HUBERT_ENCIN=<file>` 可用 golden enc_in 单测 g2）；

@@ -11,6 +11,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
+#include <immintrin.h>
 #include <string>
 #include <vector>
 
@@ -56,6 +58,10 @@ struct gsv_hubert::impl {
     ggml_cgraph  * g2 = nullptr;
     ggml_tensor  * g2_in = nullptr;
     ggml_tensor  * g2_out = nullptr;     // [768, T]
+
+    // pos_conv / enc LN 的权重由 host 使用 —— load 时拷回一份常驻, 避免每次 encode 传输 18.9MB
+    std::vector<float> pos_w, pos_b, enc_nw, enc_nb;
+    std::vector<float> pos_w_perm;   // [g][ic][k][ocg] —— k/ocg 连续, 供 host GEMM 顺序访问
 
     ggml_tensor * need(const char * n) const {
         ggml_tensor * t = ggml_get_tensor(wctx, n);
@@ -280,6 +286,31 @@ gsv_hubert * gsv_hubert::load(const std::string & gguf_path, const gsv_hubert_cf
         }
         if (cfg.verbose) printf("[gsv_hubert] conv weights transposed to k-inner layout\n");
     }
+    // pos_conv / enc LN 的权重由 host 使用 —— 拷回一份常驻 (避免每次 encode 传输 18.9MB)
+    {
+        auto fetch0 = [&](const char * n, std::vector<float> & dst) {
+            ggml_tensor * t = ggml_get_tensor(s.wctx, n);
+            dst.resize(ggml_nelements(t));
+            ggml_backend_tensor_get(t, dst.data(), 0, dst.size() * 4);
+        };
+        fetch0("hubert.pos_conv.w", s.pos_w);
+        // 重排为 [g][ocg][ic][k] (k 最内): 原布局 [k][ic][g*48+ocg] 下 w 访问跨 3KB 步长
+        // (每 32B 用一条 line, 预取失效 —— 实测 10.5ms); 重排后每个输出通道的
+        // (ic,k) 平面是一段连续 24KB, 内核可按顺序流广播读取, 每个 w 元素只读一遍
+        {
+            const int K = 128, CG = D_HID / 16, C = D_HID, G = 16;
+            s.pos_w_perm.assign(s.pos_w.size(), 0.0f);
+            for (int g = 0; g < G; g++)
+                for (int ocg = 0; ocg < CG; ocg++)
+                    for (int ic = 0; ic < CG; ic++)
+                        for (int k = 0; k < K; k++)
+                            s.pos_w_perm[((size_t)(g * CG + ocg) * CG + ic) * K + k] =
+                                s.pos_w[((size_t)(k * CG + ic)) * C + g * CG + ocg];
+        }
+        fetch0("hubert.pos_conv.b", s.pos_b);
+        fetch0("hubert.enc_norm_w",  s.enc_nw);
+        fetch0("hubert.enc_norm_b",  s.enc_nb);
+    }
     if (getenv("GSV_HUBERT_DEBUG")) fprintf(stderr, "  [load] build_g1...\n");
     s.build_g1();
     s.build_g2();
@@ -294,30 +325,71 @@ static void hubert_pos_conv(const std::vector<float> & x, int T,
         const float * w, const float * bias, std::vector<float> & y) {
     const int K = 128, G = 16, CG = D_HID / 16, C = D_HID;
     y.assign((size_t)T * C, 0.0f);
-    #pragma omp parallel for schedule(static)
-    for(int t = 0; t < T; t++){
-        for(int g = 0; g < G; g++){
-            for(int k = 0; k < K; k++){
-                int ti = t + k - 64;
-                if(ti < 0 || ti >= T) continue;
-                for(int ic = 0; ic < CG; ic++){
-                    float xv = x[(size_t)ti * C + g * CG + ic];
-                    const float * wr = w + ((size_t)k * CG + ic) * C + g * CG;
-                    float * yo = &y[(size_t)t * C + g * CG];
-                    for(int oc = 0; oc < CG; oc++) yo[oc] += xv * wr[oc];
+    // 旧实现的瓶颈: 权重 18.9MB 被每帧重读一遍 (49 x 1.18MB/组 ≈ 923MB, 纯带宽受限 ~11ms)。
+    // 新结构: 以 (组, 输出通道块 OB) 为任务; k/ic 外层 -> 权重块 (OB floats) 常驻 L1,
+    // 输出帧全量累加在 acc[T][OB] (~T*OB*4B) 里, 内层跨 o 向量化。
+    // 权重总读取降到一遍 (18.9MB), 累加顺序与旧实现一致 (k, ic 顺序不变) => 数值逐位相同。
+    // xt 为通道主序 [C][Tpad]: 读 x 沿 t 连续 (帧主序时每 (k,ic) 要跳 49 条 cache line, 16x 放大)
+    const int TPAD = T + K - 1 + 8;   // +8 供尾块 8 宽越界读 (读到零填充)
+    const bool dbg_p = getenv("GSV_HUBERT_TIMING") != nullptr;
+    const auto ppc = [] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    const double p0 = dbg_p ? ppc() : 0;
+    std::vector<float> xt((size_t) C * TPAD, 0.0f);          // 上 64 / 下 63 补零
+    for (int c = 0; c < C; c++)
+        for (int t = 0; t < T; t++)
+            xt[(size_t) c * TPAD + 64 + t] = x[(size_t) t * C + c];
+    if (dbg_p) fprintf(stderr, "      [pos] transpose %.2f ms\n", ppc() - p0);
+
+    // 结构: 任务 = (组 g, 输出通道块 ob 8 个); o 外层, (ic,k) 内层;
+    //   acc 为**全部帧**的 8 宽向量 (7 个 YMM), w 以广播方式从顺序流读取
+    //   => 每个 w 元素只读一遍 (18.9MB), x 留在 L1/L2
+    // 累加顺序 (ic, k 递增) 与初版 (k, ic 递增) 不同 —— 见下方 N 顺序说明
+    const int NTB = (T + 7) / 8;
+#pragma omp parallel for schedule(static) collapse(2)
+    for (int g = 0; g < G; g++) {
+        for (int ob = 0; ob < CG; ob += 8) {
+            for (int o = 0; o < 8; o++) {
+                const int c = g * CG + ob + o;
+                const float * wp = w + (size_t)c * (CG * K);
+                __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+                __m256 a4 = a0, a5 = a0, a6 = a0;
+                for (int ic = 0; ic < CG; ic++) {
+                    const float * xp = &xt[(size_t)(g * CG + ic) * TPAD];
+                    const float * wrow = wp + (size_t)ic * K;
+                    for (int k = 0; k < K; k++) {
+                        const __m256 wv = _mm256_broadcast_ss(wrow + k);
+                        const float * xb = xp + k;
+                        a0 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xb),      a0);
+                        a1 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xb + 8),  a1);
+                        a2 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xb + 16), a2);
+                        a3 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xb + 24), a3);
+                        a4 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xb + 32), a4);
+                        a5 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xb + 40), a5);
+                        a6 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xb + 48), a6);
+                    }
+                }
+                float tmp[64];
+                _mm256_storeu_ps(tmp,      a0); _mm256_storeu_ps(tmp + 8,  a1);
+                _mm256_storeu_ps(tmp + 16, a2); _mm256_storeu_ps(tmp + 24, a3);
+                _mm256_storeu_ps(tmp + 32, a4); _mm256_storeu_ps(tmp + 40, a5);
+                _mm256_storeu_ps(tmp + 48, a6);
+                float * yc = &y[(size_t)c];
+                for (int t = 0; t < T; t++) {
+                    const float v = tmp[t] + bias[c];
+                    yc[(size_t)t * C] = 0.5f * v * (1.0f + erff(v * 0.70710678118f));
                 }
             }
         }
     }
-    for(int t = 0; t < T; t++)
-        for(int c = 0; c < C; c++){
-            const float v = y[(size_t)t * C + c] + bias[c];
-            y[(size_t)t * C + c] = 0.5f * v * (1.0f + erff(v / sqrtf(2.0f)));
-        }
+    if (dbg_p) fprintf(stderr, "      [pos] gemm %.2f ms\n", ppc() - p0);
 }
 
 bool gsv_hubert::encode(const float * audio_norm, int n_samples, std::vector<float> & out) {
     impl & s = *p;
+    const bool dbg_t = getenv("GSV_HUBERT_TIMING") != nullptr;
+    const auto tpc = [] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    double t_a = 0, t_b = 0, t_c = 0, t_d = 0;
+    if (dbg_t) t_a = tpc();
     if (n_samples != TRAW) { fprintf(stderr, "[gsv_hubert] expect %d samples, got %d\n", TRAW, n_samples); return false; }
 
     // ---- 图 1: CNN 前端 + feat_proj -> feat [768, T] ----
@@ -337,24 +409,17 @@ bool gsv_hubert::encode(const float * audio_norm, int n_samples, std::vector<flo
         fprintf(stderr, "  after g1: bad=%zu / %zu\n", bad, feat.size());
     }
 
+    if (dbg_t) { t_b = tpc(); }
     // ---- host: pos_conv + 残差 + enc LN ----
     {
-        // 权重可能在 GPU buffer 上 —— 统一 tensor_get 拷回 host 再算 (仅 3.4MB pos_conv.w)
-        auto fetch = [&](const char * n, std::vector<float> & dst) {
-            ggml_tensor * t = ggml_get_tensor(s.wctx, n);
-            dst.resize(ggml_nelements(t));
-            ggml_backend_tensor_get(t, dst.data(), 0, dst.size() * 4);
-        };
-        std::vector<float> pwv, pbv, nwv, nbv;
-        fetch("hubert.pos_conv.w", pwv);
-        fetch("hubert.pos_conv.b", pbv);
-        fetch("hubert.enc_norm_w", nwv);
-        fetch("hubert.enc_norm_b", nbv);
         std::vector<float> pos;
-        hubert_pos_conv(feat, T_FRAMES, pwv.data(), pbv.data(), pos);
+        const double t_p0 = dbg_t ? tpc() : 0;
+        hubert_pos_conv(feat, T_FRAMES, s.pos_w_perm.data(), s.pos_b.data(), pos);
+        if (dbg_t) fprintf(stderr, "    [pos_conv] %.2f ms\n", tpc() - t_p0);
         for (size_t i = 0; i < feat.size(); i++) feat[i] += pos[i];
-        const float * wd = nwv.data();
-        const float * bd = nbv.data();
+        const float * wd = s.enc_nw.data();
+        const float * bd = s.enc_nb.data();
+        #pragma omp parallel for schedule(static)
         for (int t = 0; t < T_FRAMES; t++) {
             float * xr = &feat[(size_t) t * D_HID];
             double m = 0; for (int d = 0; d < D_HID; d++) m += xr[d]; m /= D_HID;
@@ -363,6 +428,7 @@ bool gsv_hubert::encode(const float * audio_norm, int n_samples, std::vector<flo
             for (int d = 0; d < D_HID; d++) xr[d] = (xr[d] - (float) m) * inv * wd[d] + bd[d];
         }
     }
+    if (dbg_t) { t_c = tpc(); }
     // 调试: 直接用 golden enc_in 作为 g2 输入 (隔离 host 段)
     if (const char * gf2 = getenv("GSV_HUBERT_ENCIN")) {
         std::vector<float> ref((size_t) T_FRAMES * D_HID);
@@ -388,5 +454,10 @@ bool gsv_hubert::encode(const float * audio_norm, int n_samples, std::vector<flo
     }
     out.assign((size_t) D_HID * T_FRAMES, 0.0f);
     ggml_backend_tensor_get(s.g2_out, out.data(), 0, out.size() * 4);
+    if (dbg_t) {
+        t_d = tpc();
+        fprintf(stderr, "  [time] g1 %.2f ms | host(pos_conv+LN) %.2f ms | g2 %.2f ms\n",
+                t_b - t_a, t_c - t_b, t_d - t_c);
+    }
     return true;
 }
