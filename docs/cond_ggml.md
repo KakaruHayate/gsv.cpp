@@ -148,6 +148,6 @@ ggml 版把 transformer 压到 ~51 ms 的同时 CNN 也从 137 → ~78 ms。
 CPU/Vulkan 通吃）；(2) g1 的 k∈{2,3} conv 用「移位 GEMM 累加」替代 im2col（省掉 F16 转换与
 通用 kernel，两边都能受益）。
 
-测试：`tests/test_hubert_ggml.cpp`（`GSV_HUBERT_DEVICE=vulkan` 切后端，`GSV_HUBERT_THREADS`/`GSV_HUBERT_NTHREADS`、
+测试：`tests/test_hubert_ggml.cpp`（`GSV_HUBERT_DEVICE=vulkan` 切后端，`GSV_HUBERT_NTHREADS=N` 调线程、
 `GSV_HUBERT_BENCH=N` 基准，`GSV_HUBERT_ENCIN=<file>` 可用 golden enc_in 单测 g2）；
 torch 侧基准：`tools/bench_hubert_torch.py`（`python tools/bench_hubert_torch.py`，diffsinger env）。
