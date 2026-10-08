@@ -39,6 +39,19 @@ int main(int argc, char ** argv){
     if(!m->encode(x.data(), ge.data(), T, LEN, out)){ delete m; return 1; }
     double md = maxdiff(out, ref);
     printf("  wns1_out   max|d|=%.3e %s\n", md, md < 2e-2 ? "PASS" : "FAIL");
+    // T 变化: 图应按新 T 重建 (集成侧长度可变)
+    {
+        const int T2 = 60, LEN2 = 50;
+        std::vector<float> small((size_t)C * T2), o2;
+        for(int c = 0; c < C; c++)
+            for(int t = 0; t < T2; t++) small[(size_t)c*T2+t] = x[(size_t)c*T + t];
+        bool ok2 = m->encode(small.data(), ge.data(), T2, LEN2, o2);
+        size_t nan2 = 0; for(float v : o2) if(!std::isfinite(v)) nan2++;
+        printf("  T=%d 重建路径: %s (out %zu, 非有限 %zu)\n",
+               T2, (ok2 && nan2 == 0 && o2.size() == (size_t)C*T2) ? "PASS" : "FAIL", o2.size(), nan2);
+        if(!ok2 || nan2 || o2.size() != (size_t)C*T2) return 3;
+    }
+
     const char * be = getenv("GSV_WNS1_BENCH");
     int bn = be ? atoi(be) : 0;
     if(bn > 0){

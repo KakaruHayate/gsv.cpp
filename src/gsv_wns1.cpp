@@ -30,7 +30,7 @@ struct gsv_wns1::impl {
     ggml_tensor * g_ge = nullptr;
     ggml_tensor * g_mask = nullptr;
     ggml_tensor * g_out = nullptr;
-    int T = 120, LEN = 100;
+    int T = 120, LEN = 100;   // T 为"当前图缓存对应的长度"; encode(T != 缓存) 时重建图
     int n_threads = 0;
     bool verbose = false;
     ggml_tensor * need(const char * n) const {
@@ -227,7 +227,16 @@ gsv_wns1 * gsv_wns1::load(const std::string & gguf_path, const gsv_wns1_cfg & cf
 
 bool gsv_wns1::encode(const float * fea, const float * ge, int T, int len, std::vector<float> & out) {
     impl & s = *p;
-    if(T != s.T){ fprintf(stderr,"[gsv_wns1] expect T=%d got %d\n", s.T, T); return false; }
+    if(T <= 0){ fprintf(stderr,"[gsv_wns1] bad T=%d\n", T); return false; }
+    if(T != s.T){
+        // 图按 T 编译 (conv 形状与 mask 长度都绑定 T); T 变化时重建并缓存
+        if(s.galloc){ ggml_gallocr_free(s.galloc); s.galloc = nullptr; }
+        if(s.gctx){ ggml_free(s.gctx); s.gctx = nullptr; }
+        s.g = nullptr; s.g_in = s.g_ge = s.g_mask = s.g_out = nullptr;
+        s.T = T;
+        build_graph(s);
+        if(s.verbose) printf("[gsv_wns1] graph rebuilt for T=%d\n", T);
+    }
     std::vector<float> mk((size_t)s.T);
     for(int t = 0; t < s.T; t++) mk[t] = t < len ? 1.0f : 0.0f;
     ggml_backend_tensor_set(s.g_in, fea, 0, (size_t)C_HID * s.T * 4);
