@@ -232,7 +232,41 @@ Vulkan 的 1.1e-3 相对误差来自后端把 F32 权重转 F16 的 mul_mat（�
 CPU 的 avg 高于 min 是因为每次调用都新建图（`ggml_init` + graph + galloc）；这个算子整体
 不到 1ms，集成后可留待需要时按 T 做图缓存。
 
-## 7. WNS1（VITS WN Encoder）复核 —— ORCATERM 实现，待落地
+## 7. ref_enc（MelStyleEncoder）—— WIP，attention 段卡点记录
+
+结构（对照 `repo/GPT_SoVITS/module/modules.py`）：spectral(Linear 704→128 + Mish ×2)
+→ temporal(2×Conv1dGLU k=5 pad=2: conv(128→256) 分半门控 + 残差) → 帧 mask →
+2 头自注意力(d_k=d_v=64, 温度 √128, mask=-inf, fc+残差) → Linear(128→512) →
+有效帧均值池化 → ge[512]。
+
+**已完成并验证**：
+- golden dump `tools/dump_golden_refenc.py`（含 spectral/temporal/attn/fc 四个中间量，T=200/len=180）
+- spectral 段对拍 3.8e-5 ✓、temporal 段 2.6e-3 ✓（fp32 conv 累加差异量级）
+- 池化/fc 数学语义核对无误；实现 `src/gsv_refenc.{h,cpp}` 骨架 + `tests/test_refenc.cpp`
+
+**卡点：attention 段 CPU/Vulkan 一致 FAIL（max|d|≈87，与后端无关）**。已定位/排除：
+
+1. **llamafile sgemm 稠密假设（已证实，CPU 特有）**：`GGML_LLAMAFILE=ON` 时 mul_mat 把
+   src0 当稠密行主 `[m, k]`（A[i,l] = data[i*lda + l]）——对 nb1 ≠ ne0*4 的 strided 头切片
+   视图会静默读错。最小复现 `tests/test_attn_views.cpp`（步长被错读成 64 而非视图 nb1/4=128）。
+   BERT/AR 未踩中是因为它们的 mul_mat src0 全是连续权重/拷贝。
+2. **cont(strided view) 本身正确**：`tests/test_cont_view.cpp` CPU/Vulkan 均 0 误差——
+   排除 CPY 内核问题。
+3. **per-head 组合数学正确**：`tests/test_attn_combo.cpp`（T=6/DK=2，含 mask）C1/C2 两种
+   mul_mat 组合 err ≤ 3e-7 ✓。
+4. **FA 路径 CPU PASS**：与 BERT 同款的 (DK, T, NH) 视图直送 `flash_attn_ext`，
+   `tests/test_refenc.cpp` CPU 3.8e-4 ✓ —— **模型语义（含 mask 索引方向）确认无误**。
+5. **未解之谜**：同一段代码 per-head mul_mat 路径在 T=200/DK=64 下双后端一致 FAIL 87
+   （单元测试 `tests/test_attn_unit.cpp` 用合成数据复现 1.43，且 sc dump 与 numpy 计算差
+   2.4e-3 相对——远超 fp32 应有的 4e-6）。FA 路径 Vulkan FAIL 0.53：z 值域 ~±1000 使
+   F16 K/V 转换误差在 softmax 中被放大（HuBERT/BERT 值域小故只有 1e-2 量级）。
+
+**结论/出路**（按优先级）：
+- 短期：ge 由 torch 预计算缓存（ref 侧每段音频只算一次，天然可离线），不阻塞链路；
+- 中期：Vulkan FA + F32 K/V 精度调查（fa_kv_ok 接受 F32，但实现疑似内部转 F16）；
+- 备选：per-head 路径换非 llamafile 的 mul_mat（`GGML_LLAMAFILE=OFF` 重编验证）。
+
+## 8. WNS1（VITS WN Encoder）—— 已落地（ORCATERM 实现 + conv 内核优化）
 
 结构：pre Conv1d(512→512,k=1) ×mask → 8 层 WaveNet（in_layers k=5 pad=2、cond_layer k=1 的
 gin=512 全局条件、`tanh⊙sigmoid` 门控、res_skip 双输出；每层 `(x+res)×mask`）→ skip 求和 ×mask →
