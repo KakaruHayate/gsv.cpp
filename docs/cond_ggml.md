@@ -207,7 +207,32 @@ conv 系列 kernel，本轮直接复用（不新增 op）：
 （`conv_direct_1d` 的 Vulkan shader 注释里写明是按 RTX 2070 级硬件调优的，选型启发式按 OC 挑 tile
 变体；我们的 OC=48 属于最小档，固定开销占主导。）
 
-## 6. WNS1（VITS WN Encoder）复核 —— ORCATERM 实现，待落地
+## 6. bridge（Conv1d 192->512 k=1 + LeakyReLU）✅
+
+链路位置：`codes -> RVQ.decode -> x2 nearest -> enc_p -> **bridge** -> x2 nearest -> wns1 -> fea[512,T]`
+（enc_p 的 inter_channels=192 即 bridge 的输入维度；ge 由 ref_enc(MelStyleEncoder) 单独提供）。
+
+实现（`src/gsv_cond.cpp` 的 `gsv_cond::bridge_run`）：k=1 卷积就是一次 `mul_mat`
+（`bridge.weight` 在 GGUF 里是 ne=[1,192,512]，reshape 成 [192,512] 后元素 (ic,oc) 落在
+`4*ic + 768*oc` —— 正是 mul_mat 的 [in,out] 布局，无需拷数据）→ `add` bias →
+`ggml_leaky_relu(0.01)` → `permute+cont` 成 t 主序 [T,512]（与 wns1 的 fea 一致）→
+`upsample_x2` 时在时间轴 `interpolate(NEAREST)` ×2 → [2T,512]。
+
+> 注：patch 里的 `ggml_add_leaky_relu`（融合 add+leaky）是 **CPU only**，其它后端不 emit，
+> 所以这里用标准的 `leaky_relu`（Vulkan 有 pipeline），图在两个后端上完全一致。
+
+对拍（`tests/test_cond_bridge.cpp`，golden T=60）：
+
+| 后端 | conv+leaky max\|d\| | x2 nearest 结构 | 耗时 avg/min | torch 同机 |
+|------|----------------------|----------------|--------------|-----------|
+| CPU 24T | 4.29e-6 | PASS | 0.75 / 0.38 ms | torch CPU 0.33 / 0.23 ms |
+| Vulkan | 1.16e-2（相对 1.1e-3） | PASS | 0.44 / 0.35 ms | torch CUDA 0.39 / 0.35 ms |
+
+Vulkan 的 1.1e-3 相对误差来自后端把 F32 权重转 F16 的 mul_mat（与 HuBERT/wns1 的 Vulkan 项同因）。
+CPU 的 avg 高于 min 是因为每次调用都新建图（`ggml_init` + graph + galloc）；这个算子整体
+不到 1ms，集成后可留待需要时按 T 做图缓存。
+
+## 7. WNS1（VITS WN Encoder）复核 —— ORCATERM 实现，待落地
 
 结构：pre Conv1d(512→512,k=1) ×mask → 8 层 WaveNet（in_layers k=5 pad=2、cond_layer k=1 的
 gin=512 全局条件、`tanh⊙sigmoid` 门控、res_skip 双输出；每层 `(x+res)×mask`）→ skip 求和 ×mask →

@@ -34,6 +34,8 @@ cl /nologo /O2 /EHsc /W1 %INC% tests\test_bert_ggml.cpp src\gsv_bert.cpp /Fe:tes
 if errorlevel 1 exit /b 1
 cl /nologo /O2 /EHsc /W1 %INC% tests\test_cond_rvq.cpp src\gsv_cond.cpp /Fe:tests\test_cond_rvq.exe /Fo:tests\ /link %LIBS%
 if errorlevel 1 exit /b 1
+cl /nologo /O2 /EHsc /W1 %INC% tests\test_cond_bridge.cpp src\gsv_cond.cpp /Fe:tests\test_cond_bridge.exe /Fo:tests\ /link %LIBS%
+if errorlevel 1 exit /b 1
 
 copy /y llama.cpp\build-cpu\bin\Debug\ggml*.dll tests\ >nul
 echo.
@@ -44,3 +46,5 @@ echo      tests\test_ar_batch.exe   models\gsv-ar-f32.gguf tests\golden
 echo      tests\test_ar_sampler.exe tests\golden
 echo      tests\test_ar_engine.exe  models\gsv-ar-f32.gguf tests\golden
 echo      tests\test_bert_ggml.exe  (GSV_BERT_DEVICE=vulkan for GPU)
+echo      tests\test_cond_rvq.exe models\gsv-cond-f32.gguf tests\golden
+echo      tests\test_cond_bridge.exe models\gsv-cond-f32.gguf tests\golden  (GSV_COND_DEVICE=vulkan for GPU)

@@ -15,6 +15,10 @@ struct gsv_cond::impl {
 
     ggml_tensor * rvq_codebook = nullptr;   // [ne0=DIM, ne1=BINS]
 
+    int BRIDGE_IN = 192, BRIDGE_OUT = 512;
+    ggml_tensor * bridge_w = nullptr;       // GGUF ne=[1, 192, 512]; 图中 reshape 成 [192, 512] 供 mul_mat
+    ggml_tensor * bridge_b = nullptr;       // [512]
+
     ggml_context * wctx = nullptr;
     gguf_context * gf = nullptr;
     ggml_backend_buffer_t wbuf = nullptr;
@@ -39,6 +43,30 @@ struct gsv_cond::impl {
         ggml_backend_tensor_get(q, out.data(), 0, out.size() * 4);
         ggml_free(ctx);
     }
+
+    // bridge: Conv1d(192->512, k=1) + LeakyReLU(0.01) + 可选时间轴 x2 nearest
+    //   k=1 卷积即 mul_mat: [512,192] x [192,T] -> [512,T] (无 im2col)
+    //   输出转成 [T, 512] t 主序 (与 wns1 的 fea 布局一致)
+    void bridge_run(const float * x, int T, bool up, std::vector<float> & out) {
+        ggml_init_params ip = { ggml_tensor_overhead() * 512, NULL, true };
+        ggml_context * ctx = ggml_init(ip);
+        ggml_tensor * xi = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, BRIDGE_IN, T);
+        ggml_set_input(xi);
+        ggml_tensor * w = ggml_reshape_2d(ctx, bridge_w, BRIDGE_IN, BRIDGE_OUT);   // [in, out]
+        ggml_tensor * y = ggml_add(ctx, ggml_mul_mat(ctx, w, xi), bridge_b);       // [512, T]
+        y = ggml_leaky_relu(ctx, y, 0.01f, false);
+        y = ggml_cont(ctx, ggml_permute(ctx, y, 1, 0, 2, 3));                      // [T, 512] t 主序
+        if (up) y = ggml_interpolate(ctx, y, 2 * T, BRIDGE_OUT, 1, 1, GGML_SCALE_MODE_NEAREST);
+        ggml_set_output(y);
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx, 512, false);
+        ggml_build_forward_expand(graph, y);
+        ggml_gallocr_alloc_graph(galloc, graph);
+        ggml_backend_tensor_set(xi, x, 0, (size_t) BRIDGE_IN * T * 4);
+        ggml_backend_graph_compute(backend, graph);
+        out.assign(ggml_nelements(y), 0.0f);
+        ggml_backend_tensor_get(y, out.data(), 0, out.size() * 4);
+        ggml_free(ctx);
+    }
 };
 
 gsv_cond::gsv_cond() : p(new impl) {}
@@ -57,6 +85,13 @@ int gsv_cond::rvq_bins() const { return p->BINS; }
 
 void gsv_cond::rvq_decode(const int32_t * codes, int T, bool upsample_x2, std::vector<float> & out) {
     p->rvq_run(codes, T, upsample_x2, out);
+}
+
+int gsv_cond::bridge_in_dim()  const { return p->BRIDGE_IN; }
+int gsv_cond::bridge_out_dim() const { return p->BRIDGE_OUT; }
+
+void gsv_cond::bridge_run(const float * x, int T, bool upsample_x2, std::vector<float> & out) {
+    p->bridge_run(x, T, upsample_x2, out);
 }
 
 gsv_cond * gsv_cond::load(const std::string & gguf_path, const gsv_cond_cfg & cfg) {
@@ -126,8 +161,22 @@ gsv_cond * gsv_cond::load(const std::string & gguf_path, const gsv_cond_cfg & cf
                 (int) s.rvq_codebook->ne[0], (int) s.rvq_codebook->ne[1], s.DIM, s.BINS);
         delete m; return nullptr;
     }
+    s.BRIDGE_IN  = kv_u32("cond.hidden", 192);
+    s.BRIDGE_OUT = kv_u32("cond.bridge_out", 512);
+    s.bridge_w = ggml_get_tensor(s.wctx, "bridge.weight");
+    s.bridge_b = ggml_get_tensor(s.wctx, "bridge.bias");
+    if (!s.bridge_w || !s.bridge_b) {
+        fprintf(stderr, "[gsv_cond] missing bridge.weight/bias\n"); delete m; return nullptr;
+    }
+    if (s.bridge_w->ne[1] != s.BRIDGE_IN || s.bridge_w->ne[2] != s.BRIDGE_OUT) {
+        fprintf(stderr, "[gsv_cond] bridge.weight ne=[%d,%d,%d], 期望 [1,%d,%d]\n",
+                (int) s.bridge_w->ne[0], (int) s.bridge_w->ne[1], (int) s.bridge_w->ne[2],
+                s.BRIDGE_IN, s.BRIDGE_OUT);
+        delete m; return nullptr;
+    }
     if (cfg.verbose)
-        printf("[gsv_cond] loaded %s: rvq dim=%d bins=%d (codebook %s)\n",
-               gguf_path.c_str(), s.DIM, s.BINS, ggml_type_name(s.rvq_codebook->type));
+        printf("[gsv_cond] loaded %s: rvq dim=%d bins=%d (codebook %s), bridge %d->%d\n",
+               gguf_path.c_str(), s.DIM, s.BINS, ggml_type_name(s.rvq_codebook->type),
+               s.BRIDGE_IN, s.BRIDGE_OUT);
     return m;
 }
