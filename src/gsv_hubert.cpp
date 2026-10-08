@@ -78,6 +78,10 @@ struct gsv_hubert::impl {
     }
 
     void build_g1() {
+        const bool cpu_be = ggml_backend_get_device(s_back) &&
+                            ggml_backend_dev_type(ggml_backend_get_device(s_back)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        const bool im2col_f32 = getenv("GSV_HUBERT_IM2COL_F32") ? atoi(getenv("GSV_HUBERT_IM2COL_F32")) != 0 : cpu_be;
+        const bool pos_gpu = this->pos_gpu;
         if (getenv("GSV_HUBERT_DEBUG")) fprintf(stderr, "  [g1] ctx init...\n");
         ggml_init_params ip = { ggml_tensor_overhead() * 8192, NULL, true };
         g1_ctx = ggml_init(ip);
@@ -92,7 +96,19 @@ struct gsv_hubert::impl {
             // ggml im2col 要求 k 最内 (列主 [OC,IC,K]) —— load() 已把字节转置为 k 最内,
             // 此处 reshape 元数据为 [K, IC, OC] (列主) 即可。
             ggml_tensor * w = ggml_reshape_3d(g1_ctx, need(nm), CK[i], i == 0 ? 1 : C_CONV, C_CONV);
-            ggml_tensor * y = ggml_conv_1d(g1_ctx, w, x, CS[i], 0, 1);   // [OL, C, 1]
+            // audio patch 的 1D 专用 im2col (逐行 memcpy/零填充), CPU 上比通用 im2col 快得多;
+            // Vulkan 侧与 IM2COL 共用同一批 pipeline。
+            // F32 版 (im2col_f32) 可省掉 CPU 侧 F16->F32 的 wdata 转换 pass, 并让 CNN 全程 F32。
+            ggml_tensor * y = nullptr;
+            if (im2col_f32) {
+                ggml_tensor * im = ggml_im2col_fast_1d(g1_ctx, w, x, CS[i], 0, 1, GGML_TYPE_F32, 1);
+                ggml_tensor * mm = ggml_mul_mat(g1_ctx,
+                        ggml_reshape_2d(g1_ctx, im, im->ne[0], im->ne[1] * im->ne[2]),
+                        ggml_reshape_2d(g1_ctx, w, w->ne[0] * w->ne[1], w->ne[2]));
+                y = ggml_reshape_3d(g1_ctx, mm, im->ne[1], w->ne[2], im->ne[2]);   // [OL, C, 1]
+            } else {
+                y = ggml_conv_1d_fast_1d_im2col(g1_ctx, w, x, CS[i], 0, 1);        // [OL, C, 1]
+            }
             if (i == 0) {
                 // GroupNorm(512=per-channel): ggml_group_norm needs channels at ne2.
                 // conv out [OL, C, 1] -> [OL, 1, C, 1] view; GN+affine; reshape back.
@@ -165,6 +181,8 @@ struct gsv_hubert::impl {
         const bool dbg = getenv("GSV_HUBERT_DEBUG") != nullptr;
         const bool diet = this->diet;
         const bool pos_gpu = this->pos_gpu;
+        const bool cpu_be = s_back && ggml_backend_dev_type(ggml_backend_get_device(s_back)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        const bool im2col_f32 = getenv("GSV_HUBERT_IM2COL_F32") ? atoi(getenv("GSV_HUBERT_IM2COL_F32")) != 0 : cpu_be;
         const int nl_eff = getenv("GSV_HUBERT_LAYERS") ? atoi(getenv("GSV_HUBERT_LAYERS")) : NL;
         const float scale = 1.0f / sqrtf((float) HD);
         // W(): "格式化名字 + 查表" 在单次调用内完成。切勿写成

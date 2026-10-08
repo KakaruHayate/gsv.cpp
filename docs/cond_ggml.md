@@ -115,22 +115,34 @@ m->rvq_decode(codes, T, /*upsample_x2=*/true, out);   // out: [768, 2T], idx = d
 | 后端 | max\|d\| |
 |------|-----------|
 | host C++（ORCATERM） | 8.6e-6 |
-| ggml CPU（全 F32） | 1.77e-3 |
-| ggml Vulkan（FA 走 F16 K/V） | 1.43e-2 |
+| **ggml CPU（全 F32，含 F32 im2col）** | **6.68e-6** |
+| ggml Vulkan（FA 走 F16 K/V） | 1.49e-2 |
 
 耗时（同一会话、同一输入、warmup 后 30 次迭代取平均；RTX 2070 + i9 32 逻辑核）：
 
 | 实现 | 后端 | avg | min | 相对 |
 |------|------|-----|-----|------|
-| host C++（ORCATERM，OpenMP 全核） | CPU | 413.0 ms | 332.1 | 基线 |
-| **ggml（本实现）** | **CPU 24T** | **125.3 ms** | **103.6** | **3.2× 快于 host** |
-| *torch 参考* | *CPU* | *95.4 ms* | *84.1* | *torch CPU 仍快 ~1.2×* |
-| **ggml（本实现）** | **Vulkan** | **9.1 ms** | **8.0** | **3.1× 快于 torch CUDA** |
+| **ggml（本实现）** | **Vulkan** | **7.1 ms** | **6.9** | **4.0× 快于 torch CUDA** |
 | torch（transformers，F32） | CUDA | 28.4 ms | 25.6 | |
 | torch（transformers，F16） | CUDA | 27.8 ms | 26.5 | F16 无收益 |
+| **ggml（本实现）** | **CPU 24T** | **106 ms** | **101** | — |
+| *torch 参考（同机）* | *CPU* | *87 ms* | *76* | *torch 快 ~1.2×* |
+| host C++（ORCATERM，OpenMP 全核） | CPU | 289 ms | 273 | ggml 快 2.7× |
 
-> 本表为同一会话（机器有其它负载，avg 偏高；min 更能代表能力）。
-> 空载时实测：Vulkan 7.8 ms / CPU 24T 105 ms / host C++ 289 ms。
+> 数值取自机器空载时段；测量期间机器常有外部负载（avg 可高出 30-50%），故以 min 为准。
+
+**CPU 对 CPU 的分段对比**（这是唯一还有差距的地方）：
+
+| 段 | ggml CPU | torch CPU | 结论 |
+|----|----------|-----------|------|
+| CNN 前端 + feat_proj | ~40 ms | 19.7 ms | **慢 2×** ← 唯一落后项 |
+| pos_conv + enc LN | 2.9 ms | 6.2 ms | 快 2× |
+| transformer 12 层 | ~49 ms | 52.8 ms | 略快 |
+| 合计 | ~106 ms | 87 ms | 差 1.2× 全在 CNN |
+
+CNN 落后的原因：oneDNN 用的是直卷积 + AVX-512 级阻塞；我们走
+`im2col(fast 1D) → F32 GEMM`，GEMM 吞吐 ~123 GFLOPS vs oneDNN ~250 GFLOPS。
+ggml CPU 后端的 GEMM 效率不是本仓库能改的，故此项暂到此为止。
 
 **CPU 对 CPU**：ggml 图 139 ms vs host C++ 289 ms（2.1×）。host 版瓶颈在 cnn 137 / tr 141 ms，
 ggml 版把 transformer 压到 ~51 ms 的同时 CNN 也从 137 → ~78 ms。
@@ -175,9 +187,22 @@ ggml 版把 transformer 压到 ~51 ms 的同时 CNN 也从 137 → ~78 ms。
    实测收益 ~0.2 ms（g2 已不是 dispatch 受限，而是 GEMM 吞吐限制：4.2 GMAC / 4.3 ms ≈ 1.0 TFLOP/s，
    对 2070（无 coopmat、F32 权重）已接近其 Vulkan 后端上限）。
 
-CPU 侧现况：g1 ≈ 43 ms、g2 ≈ 49 ms、host ≈ 3 ms（合计 ~105 ms，空载）——已无"送分"项，
-两端都跑在 ~80–90 GMAC/s 的 GEMM 吞吐上；再快需要 BF16/FP16 权重或 AVX-512。
-Vulkan 侧：g1（含图内 pos_conv）≈ 3.7 ms、g2 ≈ 4.3 ms、host ≈ 0。
+CPU 侧现况：g1 ≈ 40 ms、g2 ≈ 49 ms、host ≈ 3 ms（合计 ~106 ms，空载）——差距全在 CNN（见上表）。
+Vulkan 侧：g1（含图内 pos_conv）≈ 3.2 ms、g2 ≈ 3.9 ms、host ≈ 0。
+
+### 复用 ggml-audio patch 自带的 kernel
+
+`patches/0001-ggml-audio-patch-port-on-llamacpp.patch` 已经带了 0xShug0/audio.cpp 移植过来的
+conv 系列 kernel，本轮直接复用（不新增 op）：
+
+| kernel | 用法 | 结果 |
+|--------|------|------|
+| `ggml_conv_1d_fast_1d_im2col` | CNN 7 层 conv（1D 专用 im2col：逐行 memcpy + 零填充，取代通用 im2col 循环） | **Vulkan 9.1 → 7.1 ms**；CPU g1 43 → 40 ms |
+| `ggml_im2col_fast_1d` (dst_type=F32) | 同上，但用 F32 im2col 缓冲（CPU 默认，`GSV_HUBERT_IM2COL_F32=0` 可关） | 省掉 CPU 侧 F16→F32 的 wdata 转换；**CPU 精度 1.77e-3 → 6.68e-6**，速度持平 |
+| `ggml_conv_direct_1d` | 试用于图内 pos_conv 的 16 个分组 conv（stride-1、免 im2col、bias 融合） | **反效果**（Vulkan +11 ms）：该 kernel 的 chunked pipeline 有可观的每次 dispatch 固定开销，16 个小分组摊薄不了；已回退。它适合"单次大 conv"，不适合 16 个 [49×48] 的小分组 |
+
+（`conv_direct_1d` 的 Vulkan shader 注释里写明是按 RTX 2070 级硬件调优的，选型启发式按 OC 挑 tile
+变体；我们的 OC=48 属于最小档，固定开销占主导。）
 
 测试：`tests/test_hubert_ggml.cpp`（`GSV_HUBERT_DEVICE=vulkan` 切后端，`GSV_HUBERT_NTHREADS=N` 调线程、
 `GSV_HUBERT_BENCH=N` 基准，`GSV_HUBERT_ENCIN=<file>` 可用 golden enc_in 单测 g2）；
