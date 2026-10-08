@@ -62,6 +62,14 @@ struct gsv_hubert::impl {
     // pos_conv / enc LN 的权重由 host 使用 —— load 时拷回一份常驻, 避免每次 encode 传输 18.9MB
     std::vector<float> pos_w, pos_b, enc_nw, enc_nb;
     std::vector<float> pos_w_perm;   // [g][ic][k][ocg] —— k/ocg 连续, 供 host GEMM 顺序访问
+    bool diet = true;                // g2 图瘦身: 融合 QKV + layernorm_affine + add_act
+    ggml_context * dctx = nullptr;                                     // diet 融合张量专用 ctx
+    ggml_backend_buffer_t dbuf = nullptr;
+    std::vector<ggml_tensor *> t_ln1_wb, t_ln2_wb;                     // LN (w|b) 打包
+    bool pos_gpu = false;             // GPU 后端: pos_conv 放进 g1 图 (省去 host 段)
+    ggml_tensor * t_pos_w = nullptr;  // [K, IC_g, OC] k-inner (conv_1d 布局)
+    ggml_tensor * t_enc_wb = nullptr; // enc LN 的 (w|b) 打包
+    std::vector<float> pos_xt, pos_y;                                  // pos_conv 常驻工作区
 
     ggml_tensor * need(const char * n) const {
         ggml_tensor * t = ggml_get_tensor(wctx, n);
@@ -104,8 +112,34 @@ struct gsv_hubert::impl {
         x = ggml_add(g1_ctx,
                      ggml_mul(g1_ctx, ggml_norm(g1_ctx, x, LN_EPS), need("hubert.feat_proj.norm_w")),
                      need("hubert.feat_proj.norm_b"));
-        g1_out = ggml_add(g1_ctx, ggml_mul_mat(g1_ctx, need("hubert.feat_proj.w"), x),
-                          need("hubert.feat_proj.b"));
+        ggml_tensor * feat = ggml_add(g1_ctx, ggml_mul_mat(g1_ctx, need("hubert.feat_proj.w"), x),
+                                      need("hubert.feat_proj.b"));   // [768, 49] = [C, T]
+        if (getenv("GSV_HUBERT_DEBUG")) fprintf(stderr, "  [g1] pos_gpu=%d\n", (int) pos_gpu);
+        if (pos_gpu) {
+            // pos_conv 进图: 16 个分组 conv_1d (k-inner 权重 slab 连续) + 转置/拼接组装 + LN
+            // 输入视图: feat 的字节序 == [T, C] 行主 -> 以 ne=(T, C) 解读 (T 步长 4, C 步长 49*4)
+            // feat 的 ne=(C,T); conv_1d 需要 b 为 ne=(W, IC, N) 且 W 步长为 1
+            // -> cont(permute) 成 [T, C] 连续视图 (一次性 150KB 拷贝)
+            ggml_tensor * ftc = ggml_cont(g1_ctx, ggml_permute(g1_ctx, feat, 1, 0, 2, 3));   // [T, C]
+            ggml_tensor * pparts[16];
+            for (int g = 0; g < 16; g++) {
+                ggml_tensor * xg = ggml_view_3d(g1_ctx, ftc, T, 48, 1,
+                                                (size_t) T * 4, (size_t) T * 48 * 4, (size_t) g * 48 * T * 4);
+                ggml_tensor * wg = ggml_view_3d(g1_ctx, t_pos_w, 128, 48, 48,
+                                                128 * 4, 128 * 48 * 4, (size_t) g * 48 * 128 * 48 * 4);
+                ggml_tensor * cg = ggml_conv_1d(g1_ctx, wg, xg, 1, 64, 1);       // [T+1, 48, 1]
+                cg = ggml_view_3d(g1_ctx, cg, T, 48, 1, cg->nb[1], cg->nb[2], 0); // 裁掉末帧
+                cg = ggml_cont(g1_ctx, ggml_permute(g1_ctx, cg, 1, 0, 2, 3));      // [48, T, 1]
+                pparts[g] = cg;
+            }
+            ggml_tensor * pos = pparts[0];
+            for (int g = 1; g < 16; g++) pos = ggml_concat(g1_ctx, pos, pparts[g], 0);   // [768, T, 1]
+            pos = ggml_reshape_2d(g1_ctx, pos, D_HID, T);
+            pos = ggml_gelu_erf(g1_ctx, ggml_add(g1_ctx, pos, need("hubert.pos_conv.b")));
+            g1_out = ggml_layernorm_affine(g1_ctx, feat, pos, nullptr, t_enc_wb, LN_EPS);
+        } else {
+            g1_out = feat;
+        }
         ggml_set_output(g1_out);
         if (getenv("GSV_HUBERT_DEBUG")) fprintf(stderr, "  [g1] graph...\n");
         g1 = ggml_new_graph_custom(g1_ctx, 4096, false);
@@ -129,6 +163,8 @@ struct gsv_hubert::impl {
 
         char nm[192], base[128];
         const bool dbg = getenv("GSV_HUBERT_DEBUG") != nullptr;
+        const bool diet = this->diet;
+        const bool pos_gpu = this->pos_gpu;
         const int nl_eff = getenv("GSV_HUBERT_LAYERS") ? atoi(getenv("GSV_HUBERT_LAYERS")) : NL;
         const float scale = 1.0f / sqrtf((float) HD);
         // W(): "格式化名字 + 查表" 在单次调用内完成。切勿写成
@@ -142,16 +178,36 @@ struct gsv_hubert::impl {
         for (int li = 0; li < nl_eff; li++) {
             if (getenv("GSV_HUBERT_DEBUG")) fprintf(stderr, "  [g2] layer %d...\n", li);
             snprintf(base, sizeof(base), "hubert.layer.%d", li);
+            ggml_tensor * attn = nullptr;
+            if (diet) {
+                // 瘦身版: QKV 融合为一次 matmul, 视图直送 FA (省 3 次 cont 拷贝);
+                // bias 吸收进 layernorm_affine; ffn1 的 bias+gelu 用 add_act 合一
+                ggml_tensor * q = ggml_add(g2_ctx, ggml_mul_mat(g2_ctx, W("q_w"), cur), W("q_b"));
+                ggml_tensor * k = ggml_add(g2_ctx, ggml_mul_mat(g2_ctx, W("k_w"), cur), W("k_b"));
+                ggml_tensor * v = ggml_add(g2_ctx, ggml_mul_mat(g2_ctx, W("v_w"), cur), W("v_b"));
+                // 视图直送 FA (不 cont): permute 只是改步长, FA 两端都按传入步长寻址
+                ggml_tensor * qh = ggml_permute(g2_ctx, ggml_reshape_4d(g2_ctx, q, HD, NH, T, 1), 0, 2, 1, 3);
+                ggml_tensor * kh = ggml_permute(g2_ctx, ggml_reshape_4d(g2_ctx, k, HD, NH, T, 1), 0, 2, 1, 3);
+                ggml_tensor * vh = ggml_permute(g2_ctx, ggml_reshape_4d(g2_ctx, v, HD, NH, T, 1), 0, 2, 1, 3);
+                attn = ggml_flash_attn_ext(g2_ctx, qh, kh, vh, msk, scale, 0.0f, 0.0f);
+                attn = ggml_reshape_2d(g2_ctx, ggml_reshape_4d(g2_ctx, attn, D, T, 1, 1), D, T);
+                ggml_tensor * ao = ggml_mul_mat(g2_ctx, W("out_w"), attn);
+                cur = ggml_layernorm_affine(g2_ctx, cur, ao, W("out_b"), t_ln1_wb[li], LN_EPS);
+                ggml_tensor * h = ggml_add_act(g2_ctx,
+                                               ggml_mul_mat(g2_ctx, W("ffn1_w"), cur), W("ffn1_b"), GGML_ACT_GELU_ERF);
+                ggml_tensor * fo = ggml_mul_mat(g2_ctx, W("ffn2_w"), h);
+                cur = ggml_layernorm_affine(g2_ctx, cur, fo, W("ffn2_b"), t_ln2_wb[li], LN_EPS);
+                if (dbg) fprintf(stderr, "  g2 L%d: cur=[%lld,%lld] attn=[%lld,%lld] h=[%lld,%lld] (diet)\n",
+                                 li, cur->ne[0], cur->ne[1], attn->ne[0], attn->ne[1], h->ne[0], h->ne[1]);
+                continue;
+            }
             ggml_tensor * q = ggml_add(g2_ctx, ggml_mul_mat(g2_ctx, W("q_w"), cur), W("q_b"));
-            if (getenv("GSV_HUBERT_DEBUG")) fprintf(stderr, "  [g2] L%d q ok\n", li);
             ggml_tensor * k = ggml_add(g2_ctx, ggml_mul_mat(g2_ctx, W("k_w"), cur), W("k_b"));
             ggml_tensor * v = ggml_add(g2_ctx, ggml_mul_mat(g2_ctx, W("v_w"), cur), W("v_b"));
             ggml_tensor * qh = ggml_cont(g2_ctx, ggml_permute(g2_ctx, ggml_reshape_4d(g2_ctx, q, HD, NH, T, 1), 0, 2, 1, 3));
             ggml_tensor * kh = ggml_cont(g2_ctx, ggml_permute(g2_ctx, ggml_reshape_4d(g2_ctx, k, HD, NH, T, 1), 0, 2, 1, 3));
             ggml_tensor * vh = ggml_cont(g2_ctx, ggml_permute(g2_ctx, ggml_reshape_4d(g2_ctx, v, HD, NH, T, 1), 0, 2, 1, 3));
-            if (getenv("GSV_HUBERT_DEBUG")) fprintf(stderr, "  [g2] L%d fa prep\n", li);
-            ggml_tensor * attn = ggml_flash_attn_ext(g2_ctx, qh, kh, vh, msk, scale, 0.0f, 0.0f);
-            if (getenv("GSV_HUBERT_DEBUG")) fprintf(stderr, "  [g2] L%d fa ok\n", li);
+            attn = ggml_flash_attn_ext(g2_ctx, qh, kh, vh, msk, scale, 0.0f, 0.0f);
             // (HD, NH, T, 1) -> [D, T]: 数据序 = hd + h*HD (h*HD+hd, torch concat 语义), 折叠前两维即可
             attn = ggml_reshape_2d(g2_ctx, ggml_reshape_4d(g2_ctx, attn, D, T, 1, 1), D, T);
             ggml_tensor * ao = ggml_add(g2_ctx, ggml_mul_mat(g2_ctx, W("out_w"), attn), W("out_b"));
@@ -230,6 +286,9 @@ gsv_hubert * gsv_hubert::load(const std::string & gguf_path, const gsv_hubert_cf
                 if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_CPU) dev = d;
             }
         if (!dev) { fprintf(stderr, "[gsv_hubert] no usable backend device\n"); delete m; return nullptr; }
+        const bool is_gpu = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                            ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU;
+        s.pos_gpu = getenv("GSV_HUBERT_POS_GPU") ? atoi(getenv("GSV_HUBERT_POS_GPU")) != 0 : is_gpu;
         if (cfg.verbose) printf("[gsv_hubert] device: %s\n", ggml_backend_dev_name(dev));
     }
     if (getenv("GSV_HUBERT_DEBUG")) fprintf(stderr, "  [load] dev=%s\n", ggml_backend_dev_name(dev));
@@ -238,11 +297,30 @@ gsv_hubert * gsv_hubert::load(const std::string & gguf_path, const gsv_hubert_cf
     if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && cfg.n_threads > 0)
         ggml_backend_cpu_set_n_threads(s.backend, cfg.n_threads);
     s.s_back = s.backend;
+    s.diet = getenv("GSV_HUBERT_DIET") ? atoi(getenv("GSV_HUBERT_DIET")) != 0 : true;
 
     gguf_init_params gip = { /*no_alloc*/ true, &s.wctx };
     if (getenv("GSV_HUBERT_DEBUG")) fprintf(stderr, "  [load] gguf open...\n");
     s.gf = gguf_init_from_file(gguf_path.c_str(), gip);
     if (!s.gf) { fprintf(stderr, "[gsv_hubert] failed to open %s\n", gguf_path.c_str()); delete m; return nullptr; }
+    // g2 瘦身用的 LN (w|b) 打包张量: 放独立 ctx (wctx 的内存池按 GGUF 张量数分配, 无余量)
+    if (s.diet || s.pos_gpu) {
+        ggml_init_params dip = { ggml_tensor_overhead() * (2 * NL + 16), NULL, true };
+        s.dctx = ggml_init(dip);
+        if (s.diet) {
+            for (int li = 0; li < NL; li++) {
+                s.t_ln1_wb.push_back(ggml_new_tensor_1d(s.dctx, GGML_TYPE_F32, 2 * D_HID));
+                s.t_ln2_wb.push_back(ggml_new_tensor_1d(s.dctx, GGML_TYPE_F32, 2 * D_HID));
+            }
+        }
+        if (s.pos_gpu) {
+            s.t_pos_w = ggml_new_tensor_3d(s.dctx, GGML_TYPE_F32, 128, 48, D_HID);   // [K, IC_g, OC]
+            s.t_enc_wb = ggml_new_tensor_1d(s.dctx, GGML_TYPE_F32, 2 * D_HID);
+        }
+        // (CPU 路径仍走 host pos_conv, 不需要以上两个张量)
+        s.dbuf = ggml_backend_alloc_ctx_tensors(s.dctx, s.backend);
+        if (!s.dbuf) { fprintf(stderr, "[gsv_hubert] diet buffer alloc failed\n"); delete m; return nullptr; }
+    }
     if (getenv("GSV_HUBERT_DEBUG")) fprintf(stderr, "  [load] alloc wbuf...\n");
     s.wbuf = ggml_backend_alloc_ctx_tensors(s.wctx, s.backend);
     if (!s.wbuf) { fprintf(stderr, "[gsv_hubert] weight buffer alloc failed\n"); delete m; return nullptr; }
@@ -253,6 +331,7 @@ gsv_hubert * gsv_hubert::load(const std::string & gguf_path, const gsv_hubert_cf
         const int64_t n_tensors = gguf_get_n_tensors(s.gf);
         for (int64_t ti = 0; ti < n_tensors; ti++) {
             const char * tname = gguf_get_tensor_name(s.gf, ti);
+            if (s.pos_gpu && strcmp(tname, "hubert.pos_conv.w") == 0) continue;   // 图内用 t_pos_w
             ggml_tensor * tt = ggml_get_tensor(s.wctx, tname);
             if (!tt) continue;
             const size_t nbytes = ggml_nbytes(tt);
@@ -267,6 +346,32 @@ gsv_hubert * gsv_hubert::load(const std::string & gguf_path, const gsv_hubert_cf
         fclose(fp);
     }
     if (getenv("GSV_HUBERT_DEBUG")) fprintf(stderr, "  [load] upload done, transpose conv w...\n");
+    // 填充 g2 瘦身的融合张量 (从已上传的 GGUF 张量取数拼接)
+    if (s.diet) {
+        auto getv = [&](const char * n, std::vector<float> & dst) {
+            ggml_tensor * t = ggml_get_tensor(s.wctx, n);
+            dst.resize(ggml_nelements(t));
+            ggml_backend_tensor_get(t, dst.data(), 0, dst.size() * 4);
+        };
+        char nm[96];
+        for (int li = 0; li < NL; li++) {
+            std::vector<float> l1w, l1b, l2w, l2b;
+            snprintf(nm, sizeof(nm), "hubert.layer.%d.ln1_w", li); getv(nm, l1w);
+            snprintf(nm, sizeof(nm), "hubert.layer.%d.ln1_b", li); getv(nm, l1b);
+            snprintf(nm, sizeof(nm), "hubert.layer.%d.ln2_w", li); getv(nm, l2w);
+            snprintf(nm, sizeof(nm), "hubert.layer.%d.ln2_b", li); getv(nm, l2b);
+            std::vector<float> cat;
+            cat.reserve(2 * D_HID);
+            for (int k = 1; k <= 2; k++) {
+                const std::vector<float> & w = (k == 1) ? l1w : l2w;
+                const std::vector<float> & b = (k == 1) ? l1b : l2b;
+                cat.clear();
+                cat.insert(cat.end(), w.begin(), w.end());
+                cat.insert(cat.end(), b.begin(), b.end());
+                ggml_backend_tensor_set(k == 1 ? s.t_ln1_wb[li] : s.t_ln2_wb[li], cat.data(), 0, cat.size() * 4);
+            }
+        }
+    }
     // ggml im2col 的 conv 权重要求 k 最内; GGUF (host 语义) 是 k 最外 —— 一次性转置回写
     {
         const int ICs[7] = {1, 512, 512, 512, 512, 512, 512};
@@ -293,7 +398,23 @@ gsv_hubert * gsv_hubert::load(const std::string & gguf_path, const gsv_hubert_cf
             dst.resize(ggml_nelements(t));
             ggml_backend_tensor_get(t, dst.data(), 0, dst.size() * 4);
         };
-        fetch0("hubert.pos_conv.w", s.pos_w);
+        if (s.pos_gpu) {
+            // GPU 路径跳过了 pos_conv.w 的上传 (省 18.9MB VRAM) -> 直接从 GGUF 文件读原始字节
+            ggml_tensor * t = ggml_get_tensor(s.wctx, "hubert.pos_conv.w");
+            s.pos_w.resize(ggml_nelements(t));
+            FILE * fp = fopen(gguf_path.c_str(), "rb");
+            bool ok = false;
+            if (fp) {
+                const int64_t ti = gguf_find_tensor(s.gf, "hubert.pos_conv.w");
+                if (ti >= 0 &&
+                    fseek(fp, (long)(gguf_get_data_offset(s.gf) + gguf_get_tensor_offset(s.gf, ti)), SEEK_SET) == 0 &&
+                    fread(s.pos_w.data(), 4, s.pos_w.size(), fp) == s.pos_w.size()) ok = true;
+                fclose(fp);
+            }
+            if (!ok) { fprintf(stderr, "[gsv_hubert] read pos_conv.w from file failed\n"); delete m; return nullptr; }
+        } else {
+            fetch0("hubert.pos_conv.w", s.pos_w);
+        }
         // 重排为 [g][ocg][ic][k] (k 最内): 原布局 [k][ic][g*48+ocg] 下 w 访问跨 3KB 步长
         // (每 32B 用一条 line, 预取失效 —— 实测 10.5ms); 重排后每个输出通道的
         // (ic,k) 平面是一段连续 24KB, 内核可按顺序流广播读取, 每个 w 元素只读一遍
@@ -311,6 +432,24 @@ gsv_hubert * gsv_hubert::load(const std::string & gguf_path, const gsv_hubert_cf
         fetch0("hubert.enc_norm_w",  s.enc_nw);
         fetch0("hubert.enc_norm_b",  s.enc_nb);
     }
+    if (s.pos_gpu) {
+        // t_pos_w: 直接吃 pos_w_perm ([oc][ic][k] 行主 == ne=(K,IC,OC) 列主)
+        ggml_backend_tensor_set(s.t_pos_w, s.pos_w_perm.data(), 0, s.pos_w_perm.size() * 4);
+        // 图内路径不再需要 host 侧两份 (pos_w / pos_w_perm): 释放 ~38MB
+        {
+            std::vector<float>().swap(s.pos_w);
+            std::vector<float>().swap(s.pos_w_perm);
+        }
+        // enc LN 的 (w|b) 打包
+        {
+            std::vector<float> wb;
+            wb.reserve(2 * D_HID);
+            wb.insert(wb.end(), s.enc_nw.begin(), s.enc_nw.end());
+            wb.insert(wb.end(), s.enc_nb.begin(), s.enc_nb.end());
+            ggml_backend_tensor_set(s.t_enc_wb, wb.data(), 0, wb.size() * 4);
+        }
+    }
+
     if (getenv("GSV_HUBERT_DEBUG")) fprintf(stderr, "  [load] build_g1...\n");
     s.build_g1();
     s.build_g2();
@@ -322,19 +461,25 @@ gsv_hubert * gsv_hubert::load(const std::string & gguf_path, const gsv_hubert_cf
 // host: pos_conv (grouped conv k=128 same-pad + bias + gelu_erf) —— 沿用已验证的 host 实现
 // (groups=16 的 grouped conv1d 不适配 ggml_conv_1d; 49 帧 ~230M MAC, OpenMP 下 ~10ms)
 static void hubert_pos_conv(const std::vector<float> & x, int T,
-        const float * w, const float * bias, std::vector<float> & y) {
+        const float * w, const float * bias,
+        std::vector<float> & xt, std::vector<float> & y) {
     const int K = 128, G = 16, CG = D_HID / 16, C = D_HID;
-    y.assign((size_t)T * C, 0.0f);
+    y.resize((size_t)T * C);          // 内核完整覆写, 无需清零
     // 旧实现的瓶颈: 权重 18.9MB 被每帧重读一遍 (49 x 1.18MB/组 ≈ 923MB, 纯带宽受限 ~11ms)。
     // 新结构: 以 (组, 输出通道块 OB) 为任务; k/ic 外层 -> 权重块 (OB floats) 常驻 L1,
     // 输出帧全量累加在 acc[T][OB] (~T*OB*4B) 里, 内层跨 o 向量化。
     // 权重总读取降到一遍 (18.9MB), 累加顺序与旧实现一致 (k, ic 顺序不变) => 数值逐位相同。
     // xt 为通道主序 [C][Tpad]: 读 x 沿 t 连续 (帧主序时每 (k,ic) 要跳 49 条 cache line, 16x 放大)
     const int TPAD = T + K - 1 + 8;   // +8 供尾块 8 宽越界读 (读到零填充)
+    if ((int) xt.size() != C * TPAD) {
+        xt.assign((size_t) C * TPAD, 0.0f);   // 首次: 全零 (padding 区永远保持零)
+    }
+    (void) 0;
     const bool dbg_p = getenv("GSV_HUBERT_TIMING") != nullptr;
     const auto ppc = [] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
     const double p0 = dbg_p ? ppc() : 0;
-    std::vector<float> xt((size_t) C * TPAD, 0.0f);          // 上 64 / 下 63 补零
+    // 中间区每帧覆写; 上下各 64/63 帧的补零区首建时为零, 之后不再触碰
+#pragma omp parallel for schedule(static)
     for (int c = 0; c < C; c++)
         for (int t = 0; t < T; t++)
             xt[(size_t) c * TPAD + 64 + t] = x[(size_t) t * C + c];
@@ -403,6 +548,10 @@ bool gsv_hubert::encode(const float * audio_norm, int n_samples, std::vector<flo
         // host feat [T, D] 行主: feat[t*D + d] = F[d, t] —— 两者字节序恒等, 直接拷贝
         ggml_backend_tensor_get(s.g1_out, feat.data(), 0, feat.size() * 4);
     }
+    if (getenv("GSV_HUBERT_G1DUMP")) {
+        FILE * df = fopen("tests/golden/hubert.g1out.dbg.bin", "wb");
+        if (df) { fwrite(feat.data(), 4, feat.size(), df); fclose(df); }
+    }
     if (getenv("GSV_HUBERT_DEBUG")) {
         size_t bad = 0;
         for (float v : feat) if (!std::isfinite(v)) bad++;
@@ -410,11 +559,11 @@ bool gsv_hubert::encode(const float * audio_norm, int n_samples, std::vector<flo
     }
 
     if (dbg_t) { t_b = tpc(); }
-    // ---- host: pos_conv + 残差 + enc LN ----
-    {
-        std::vector<float> pos;
+    // ---- host: pos_conv + 残差 + enc LN (仅 CPU 路径; GPU 路径已在图内完成) ----
+    if (!s.pos_gpu) {
+        std::vector<float> & pos = s.pos_y;
         const double t_p0 = dbg_t ? tpc() : 0;
-        hubert_pos_conv(feat, T_FRAMES, s.pos_w_perm.data(), s.pos_b.data(), pos);
+        hubert_pos_conv(feat, T_FRAMES, s.pos_w_perm.data(), s.pos_b.data(), s.pos_xt, pos);
         if (dbg_t) fprintf(stderr, "    [pos_conv] %.2f ms\n", tpc() - t_p0);
         for (size_t i = 0; i < feat.size(); i++) feat[i] += pos[i];
         const float * wd = s.enc_nw.data();

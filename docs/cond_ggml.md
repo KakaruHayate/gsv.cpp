@@ -122,13 +122,15 @@ m->rvq_decode(codes, T, /*upsample_x2=*/true, out);   // out: [768, 2T], idx = d
 
 | 实现 | 后端 | avg | min | 相对 |
 |------|------|-----|-----|------|
-| host C++（ORCATERM，OpenMP 全核） | CPU | 288.8 ms | 273.4 | 基线 |
-| **ggml（本实现）** | **CPU 24T** | **105.4 ms** | **99.5** | **2.7× 快于 host** |
-| ggml（本实现） | CPU 16T | 118.0 ms | 108.5 | |
-| *torch 参考* | *CPU* | *84.2 ms* | *74.1* | *torch CPU 仍快 1.25×* |
-| **ggml（本实现）** | **Vulkan** | **12.0 ms** | **10.5** | **2.1× 快于 torch CUDA** |
-| torch（transformers，F32） | CUDA | 25.7 ms | 23.9 | |
-| torch（transformers，F16） | CUDA | 28.1 ms | 26.0 | F16 无收益 |
+| host C++（ORCATERM，OpenMP 全核） | CPU | 413.0 ms | 332.1 | 基线 |
+| **ggml（本实现）** | **CPU 24T** | **125.3 ms** | **103.6** | **3.2× 快于 host** |
+| *torch 参考* | *CPU* | *95.4 ms* | *84.1* | *torch CPU 仍快 ~1.2×* |
+| **ggml（本实现）** | **Vulkan** | **9.1 ms** | **8.0** | **3.1× 快于 torch CUDA** |
+| torch（transformers，F32） | CUDA | 28.4 ms | 25.6 | |
+| torch（transformers，F16） | CUDA | 27.8 ms | 26.5 | F16 无收益 |
+
+> 本表为同一会话（机器有其它负载，avg 偏高；min 更能代表能力）。
+> 空载时实测：Vulkan 7.8 ms / CPU 24T 105 ms / host C++ 289 ms。
 
 **CPU 对 CPU**：ggml 图 139 ms vs host C++ 289 ms（2.1×）。host 版瓶颈在 cnn 137 / tr 141 ms，
 ggml 版把 transformer 压到 ~51 ms 的同时 CNN 也从 137 → ~78 ms。
@@ -143,23 +145,39 @@ ggml 版把 transformer 压到 ~51 ms 的同时 CNN 也从 137 → ~78 ms。
 | pos_conv + enc LN（**host**） | ~3.5 ms | 见下方 GEMM 结构说明 |
 | g2 12 层 transformer（GPU） | ~5.7 ms | 每层 ~0.48 ms，现在最大的单项 |
 
-### 优化历程（36.2 ms → 12.0 ms）
+### 优化历程（36.2 ms → 7.8 ms，4.6×）
 
-两个**非算法性**的瓶颈，合计占原本 ~25 ms：
+前两轮（非算法性瓶颈，-25 ms）：
 
 1. **每帧从 GPU 回传 18.9 MB pos_conv 权重**：为 Vulkan 正确性引入的 `tensor_get` 被放在
-   `encode()` 里（每次调用执行）。改为 load() 时拷回一份 host 常驻副本。
-   仅此一项即 Vulkan −20 ms（PCIe）。
-2. **pos_conv 的权重访问跨 3 KB 步长**（旧布局 `[k][ic][g*48+oc]`，内核每次只用 32 B/64 B line，
-   硬件预取完全失效）：load() 时重排为 `[g][ocg][ic][k]`（k 最内），内核按
+   `encode()` 里（每次调用执行）。改为 load() 时拷回一份 host 常驻副本。Vulkan −20 ms。
+2. **pos_conv 权重访问跨 3 KB 步长**（旧布局 `[k][ic][g*48+oc]`，每次只用 32 B/64 B line，
+   预取失效）：load() 时重排为 `[g][ocg][ic][k]`（k 最内），内核按
    「任务 = (组, 8 个输出通道)，o 外层、`(ic,k)` 内层，累加器 = 全部 49 帧（7 个 YMM）」实现
-   —— 每个 w 元素只读一遍、纯顺序流。OMP=24 时 10.5 ms → 3.1 ms。
+   —— 每个 w 元素只读一遍、纯顺序流。OMP=24：10.5 → 3.1 ms。
 
-（另外修掉一个自伤：`std::vector<float> acc[64][16]` 动态下标版本让 MSVC 把累加器放到栈上，
-比寄存器版慢 3×；显式命名 8 个 `__m256` 才拿到预期吞吐。）
+第三轮（-4 ms）：
 
-CPU 侧现况：g1 ≈ 43 ms、g2 ≈ 49 ms、host ≈ 3 ms（合计 105 ms）——已无"送分"项，
-两端都跑在 ~80–90 GMAC/s 的 F32/F16 GEMM 吞吐上；再快需要 BF16/FP16 权重或 AVX-512。
+3. **pos_conv 工作区常驻**：`xt`(540 KB) 与输出缓冲原本每次 encode 分配+清零；
+   改为成员缓冲、padding 区只建一次、输出零清零（内核完整覆写）。
+   transpose 段 0.91 → 0.02 ms。
+4. **CPU 路径的 host 段仍在串行等待**（GPU 全闲）：把 pos_conv 整体搬进 g1 图（仅 GPU 后端，
+   `GSV_HUBERT_POS_GPU=1`，默认按设备自动）：
+   - `layernorm_affine` 直接输出 post-LN 的 encoder 输入，host 段归零
+   - 16 个分组 `conv_1d`（`pos_w_perm` 的 `[oc][ic][k]` 布局 == conv_1d 需要的 `ne=(K,IC,OC)`
+     列主，且每组的权重/输入切片都是连续 slab）、对称 padding 64 + 裁掉末帧、`cont+concat`
+     链组装出 `[768, 49]`、bias+gelu 在图内
+   - 省掉 GGUF 里 pos_conv.w 的 18.9 MB 上传（直接从文件读字节到 host 构建重排表）
+   - 精度不变：CPU 图内路径 1.785e-3，Vulkan 1.487e-2（仍由 FA 的 F16 K/V 主导）
+5. **g2 图瘦身**（`GSV_HUBERT_DIET`，默认开）：FA 的三个 q/k/v `cont` 去掉（视图直送，FA 两端
+   都按步长寻址）；两处 post-LN 的 `norm+mul+add`（3 op）换成 `layernorm_affine`（1 op，bias
+   吸收进残差）；ffn1 的 bias+gelu 用 `add_act` 合一。每层 24 → 12 次 dispatch。
+   实测收益 ~0.2 ms（g2 已不是 dispatch 受限，而是 GEMM 吞吐限制：4.2 GMAC / 4.3 ms ≈ 1.0 TFLOP/s，
+   对 2070（无 coopmat、F32 权重）已接近其 Vulkan 后端上限）。
+
+CPU 侧现况：g1 ≈ 43 ms、g2 ≈ 49 ms、host ≈ 3 ms（合计 ~105 ms，空载）——已无"送分"项，
+两端都跑在 ~80–90 GMAC/s 的 GEMM 吞吐上；再快需要 BF16/FP16 权重或 AVX-512。
+Vulkan 侧：g1（含图内 pos_conv）≈ 3.7 ms、g2 ≈ 4.3 ms、host ≈ 0。
 
 测试：`tests/test_hubert_ggml.cpp`（`GSV_HUBERT_DEVICE=vulkan` 切后端，`GSV_HUBERT_NTHREADS=N` 调线程、
 `GSV_HUBERT_BENCH=N` 基准，`GSV_HUBERT_ENCIN=<file>` 可用 golden enc_in 单测 g2）；
