@@ -41,7 +41,8 @@ def pick(name):
     # 分组: conv / attn(q/k/v/out) / ffn / bias|ln 一律 f32
     low = name.lower()
     if low.endswith('_b') or '.norm' in low or '.b_' in low or '_wb' in low: return 'f32'
-    if 'conv' in low: return SPEC.get('conv', 'f32')
+    if 'pos_conv' in low: return 'f32'   # pos_conv 的 host/GPU 处理路径假设 F32
+    if 'feat_conv' in low: return SPEC.get('conv', 'f32')
     if any(t in low for t in ('.q_w', '.k_w', '.v_w', '.out_w')): return SPEC.get('attn', 'f32')
     if 'ffn' in low: return SPEC.get('ffn', 'f32')
     return 'f32'   # 其余 (emb 等) 一律 f32

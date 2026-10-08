@@ -398,14 +398,33 @@ gsv_hubert * gsv_hubert::load(const std::string & gguf_path, const gsv_hubert_cf
             snprintf(nm, sizeof(nm), "hubert.feat_conv.%d.w", i);
             ggml_tensor * t = ggml_get_tensor(s.wctx, nm);
             const int OC = (int) t->ne[0], IC = ICs[i], K = (int) t->ne[2];
+            // 权重可能是 F16 (量化档) — 转置在 F32 域进行再按类型写回
+            const size_t tsz = ggml_type_size(t->type);
             std::vector<float> src((size_t) OC * IC * K), dst((size_t) OC * IC * K);
-            ggml_backend_tensor_get(t, src.data(), 0, src.size() * 4);
+            {
+                std::vector<char> raw((size_t) OC * IC * K * tsz);
+                ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+                if (t->type == GGML_TYPE_F32) {
+                    memcpy(src.data(), raw.data(), raw.size());
+                } else if (t->type == GGML_TYPE_F16) {
+                    for (size_t i = 0; i < src.size(); i++) src[i] = ggml_fp16_to_fp32(((ggml_fp16_t *) raw.data())[i]);
+                } else { fprintf(stderr, "[gsv_hubert] conv weight type %d not supported\n", (int) t->type); abort(); }
+            }
             // src 字节: [K][IC][OC] 行主 (k 最外) -> dst: [OC][IC][K] 行主 (k 最内)
             for (int k = 0; k < K; k++)
                 for (int ic = 0; ic < IC; ic++)
                     for (int oc = 0; oc < OC; oc++)
                         dst[(size_t) oc * IC * K + ic * K + k] = src[(size_t) k * IC * OC + ic * OC + oc];
-            ggml_backend_tensor_set(t, dst.data(), 0, dst.size() * 4);
+            {
+                // 写回时保持原类型: F16 需要逐元素转换
+                std::vector<char> raw((size_t) OC * IC * K * tsz);
+                if (t->type == GGML_TYPE_F32) {
+                    memcpy(raw.data(), dst.data(), raw.size());
+                } else {
+                    for (size_t i = 0; i < dst.size(); i++) ((ggml_fp16_t *) raw.data())[i] = ggml_fp32_to_fp16(dst[i]);
+                }
+                ggml_backend_tensor_set(t, raw.data(), 0, raw.size());
+            }
         }
         if (cfg.verbose) printf("[gsv_hubert] conv weights transposed to k-inner layout\n");
     }

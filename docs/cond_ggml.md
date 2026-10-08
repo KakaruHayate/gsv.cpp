@@ -272,25 +272,34 @@ convert 脚本已支持按组分档：`tools/convert_hubert.py --spec "attn=f16,
 `tools/convert_cond.py --spec "wns1=f16,bridge=f16"`（bias/LN/RVQ codebook 恒 F32；
 add_act/layernorm_affine 融合算子要求 F32 输入，故 bias 不可降档）。
 
-| 模型 | 档位 | 体积 | CPU max\|d\| | Vulkan max\|d\| | CPU 耗时 | Vulkan 耗时 |
+| 模型 | 档位 | 体积 | CPU max\|d\| | Vulkan max\|d\| | CPU 耗时 (24T avg/min) | Vulkan 耗时 (avg/min) |
 |------|------|------|--------------|----------------|----------|-------------|
-| HuBERT | F32（基线） | 377 MB | 6.7e-6 | 1.49e-2 | 126/116 ms | 7.7/7.2 ms |
-| HuBERT | **attn+ffn F16, conv/pos F32** | **208 MB（1.8×↓）** | **1.0e-3** | **1.5e-2（不变）** | 123/110 ms | 8.6/6.7 ms |
+| HuBERT | F32（基线） | 377 MB | 6.7e-6 | 1.49e-2 | 117/108 ms | 7.7/7.2 ms |
+| HuBERT | attn F16 | 321 MB | 4.0e-4 | 1.49e-2 | — | — |
+| HuBERT | ffn F16 | 264 MB | 8.1e-4 | 1.49e-2 | — | — |
+| HuBERT | conv F16（+attn F16） | 312 MB | 4.0e-4 | 1.49e-2 | — | — |
+| HuBERT | conv F16（+ffn F16） | 256 MB | 8.1e-4 | 1.49e-2 | — | — |
+| **HuBERT** | **全 F16（conv+attn+ffn）** | **199 MB（1.9×↓）** | **1.0e-3** | **1.49e-2（不变）** | **110/102 ms（还快 6%）** | **8.1/6.4 ms（快 10%）** |
 | wns1+bridge | F32（基线） | 186 MB | 9.5e-7 | 2.9e-3 | 92/72 ms (wns1) | 2.30/2.00 ms |
 | wns1+bridge | **wns1 F16** | 127 MB（1.5×↓） | 9.5e-7（不变） | 2.9e-3（不变） | 92/72 ms（不变） | 2.30 ms（不变） |
 | bridge | bridge F16（附加） | 126 MB | 1.8e-3 | 1.2e-2（不变） | 0.72/0.70 ms | 0.38/0.36 ms |
 
-结论：
-- **HuBERT attn+ffn F16 全档 PASS**（CPU 1.0e-3、Vulkan 不变）——与 BERT 的"拒绝量化"
-  相反，HuBERT 对 F16 权重不敏感（query/key 量级更大，FFN 精度不直接影响 token 判定）。
-  体积 377→208 MB，速度持平（CPU 略快，Vulkan 持平）。
-- **wns1 全部权重 F16 零精度损失**（CPU 9.5e-7 与 F32 完全相同）——体量 186→127 MB。
-- **bridge F16**：CPU 1.8e-3（F32 时 4.3e-6，仍在阈值内）、Vulkan 不变；收益仅 1 MB，
-  意义不大但无代价。
-- Q8_0 未测（ggml conv/FFN 的 Q8 需逐块反量化，conv 路径收益待查）；F16 已满足
-  "1.5~1.8×↓ 且近无损"。
-- 工具链坑：gguf-py 的 `raw_dtype=F16` **不会**转换数据——必须同时把 numpy 数组
-  `astype(float16)`，否则 header 声明 F16 而数据仍按 F32 落盘（体积不变且图内误读）。
+**最终档位**：
+- **HuBERT 全 F16（199 MB）**——conv/attn/ffn 全部 F16 后 CPU 1.0e-3、Vulkan 1.49e-2
+  （Vulkan 项一直由 FA 的 F16 K/V 主导，与权重无关），且**两个后端都更快**
+  （CPU F16 行主数据对 cache 更友好；Vulkan F16 权重少一半搬运）。已定为默认档。
+- **wns1 全 F16（127 MB）**——CPU 精度与 F32 逐位一致。
+- bridge F16 可选（+1MB 收益，CPU 4.3e-6→1.8e-3 仍在阈内）。
+- pos_conv 权重保持 F32（其 host/GPU 处理路径假设 4 字节元素，且 conv 组的
+  `pick()` 已显式排除）。
+
+分档结论（凹档过程）：attn=F16 单独贡献 4.0e-4，ffn=F16 贡献 8.1e-4，两者叠加 1.0e-3，
+conv=F16 不叠加误差（conv 后接 GroupNorm 归一化了 F16 噪声）。Vulkan 侧所有档位都是
+1.49e-2 —— FA 的 F16 K/V 是主导项，权重档位不影响。
+
+工具链坑：gguf-py 的 `raw_dtype=F16` **不会**转换数据——必须同时把 numpy 数组
+`astype(float16)`，否则 header 声明 F16 而数据仍按 F32 落盘（体积不变且图内误读）。
+另：conv 权重转置回写（load 时）已支持 F16（`gsv_hubert.cpp` 按类型大小 get/set）。
 
 ## 9. WNS1（VITS WN Encoder）—— 已落地（ORCATERM 实现 + conv 内核优化）
 
