@@ -8,6 +8,7 @@
 # conv1d weight torch [OC,IC,K] -> permute to [K,IC,OC] (ggml_conv_1d: ne0=K, ne1=IC, ne2=OC).
 import argparse
 import os
+import numpy as np
 import torch
 import gguf
 
@@ -21,21 +22,57 @@ POS_CONV_GROUPS = 16
 POS_CONV_KERNEL = 128
 
 
+def parse_spec(spec):
+    # "attn=f16,ffn=f16" → dict; 支持 f16/f32/q8_0
+    out = {}
+    if spec:
+        for kv in spec.split(','):
+            k, v = kv.split('=')
+            out[k.strip()] = v.strip().lower()
+    return out
+
+QT = {'f32': gguf.GGMLQuantizationType.F32,
+      'f16': gguf.GGMLQuantizationType.F16,
+      'q8_0': gguf.GGMLQuantizationType.Q8_0}
+
+SPEC = {}
+
+def pick(name):
+    # 分组: conv / attn(q/k/v/out) / ffn / bias|ln 一律 f32
+    low = name.lower()
+    if low.endswith('_b') or '.norm' in low or '.b_' in low or '_wb' in low: return 'f32'
+    if 'conv' in low: return SPEC.get('conv', 'f32')
+    if any(t in low for t in ('.q_w', '.k_w', '.v_w', '.out_w')): return SPEC.get('attn', 'f32')
+    if 'ffn' in low: return SPEC.get('ffn', 'f32')
+    return 'f32'   # 其余 (emb 等) 一律 f32
+
 def add_tensor(writer, name, tensor):
+    qt = QT[pick(name)]
     t = tensor.detach().float().contiguous()
-    writer.add_tensor(name, t.numpy(), raw_dtype=gguf.GGMLQuantizationType.F32)
+    arr = t.numpy()
+    if qt == gguf.GGMLQuantizationType.F16:
+        arr = arr.astype(np.float16)   # gguf-py 按数组 dtype 落盘; raw_dtype=F16 但数组 F32 会写 4B
+    elif qt != gguf.GGMLQuantizationType.F32:
+        raise NotImplementedError('use dequantize for ' + str(qt))
+    writer.add_tensor(name, arr, raw_dtype=qt)
 
 
 def add_conv1d(writer, name, weight):
     w = weight.detach().float().permute(2, 1, 0).contiguous()
-    writer.add_tensor(name, w.numpy(), raw_dtype=gguf.GGMLQuantizationType.F32)
+    arr = w.numpy()
+    if QT[pick(name)] == gguf.GGMLQuantizationType.F16:
+        arr = arr.astype(np.float16)
+    writer.add_tensor(name, arr, raw_dtype=QT[pick(name)])
 
 
 def main():
+    global SPEC
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="models/chinese-hubert-base/pytorch_model.bin")
     ap.add_argument("--out", default="models/gsv-hubert-f32.gguf")
+    ap.add_argument("--spec", default="", help="e.g. conv=f16,attn=f16,ffn=f16")
     args = ap.parse_args()
+    SPEC = parse_spec(args.spec)
     sd = torch.load(args.ckpt, map_location="cpu", weights_only=False)
 
     writer = gguf.GGUFWriter(args.out, "gsv.hubert")

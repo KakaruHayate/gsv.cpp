@@ -266,7 +266,33 @@ CPU 的 avg 高于 min 是因为每次调用都新建图（`ggml_init` + graph +
 - 中期：Vulkan FA + F32 K/V 精度调查（fa_kv_ok 接受 F32，但实现疑似内部转 F16）；
 - 备选：per-head 路径换非 llamafile 的 mul_mat（`GGML_LLAMAFILE=OFF` 重编验证）。
 
-## 8. WNS1（VITS WN Encoder）—— 已落地（ORCATERM 实现 + conv 内核优化）
+## 8. 量化扫描（HuBERT / wns1 / bridge）
+
+convert 脚本已支持按组分档：`tools/convert_hubert.py --spec "attn=f16,ffn=f16"`、
+`tools/convert_cond.py --spec "wns1=f16,bridge=f16"`（bias/LN/RVQ codebook 恒 F32；
+add_act/layernorm_affine 融合算子要求 F32 输入，故 bias 不可降档）。
+
+| 模型 | 档位 | 体积 | CPU max\|d\| | Vulkan max\|d\| | CPU 耗时 | Vulkan 耗时 |
+|------|------|------|--------------|----------------|----------|-------------|
+| HuBERT | F32（基线） | 377 MB | 6.7e-6 | 1.49e-2 | 126/116 ms | 7.7/7.2 ms |
+| HuBERT | **attn+ffn F16, conv/pos F32** | **208 MB（1.8×↓）** | **1.0e-3** | **1.5e-2（不变）** | 123/110 ms | 8.6/6.7 ms |
+| wns1+bridge | F32（基线） | 186 MB | 9.5e-7 | 2.9e-3 | 92/72 ms (wns1) | 2.30/2.00 ms |
+| wns1+bridge | **wns1 F16** | 127 MB（1.5×↓） | 9.5e-7（不变） | 2.9e-3（不变） | 92/72 ms（不变） | 2.30 ms（不变） |
+| bridge | bridge F16（附加） | 126 MB | 1.8e-3 | 1.2e-2（不变） | 0.72/0.70 ms | 0.38/0.36 ms |
+
+结论：
+- **HuBERT attn+ffn F16 全档 PASS**（CPU 1.0e-3、Vulkan 不变）——与 BERT 的"拒绝量化"
+  相反，HuBERT 对 F16 权重不敏感（query/key 量级更大，FFN 精度不直接影响 token 判定）。
+  体积 377→208 MB，速度持平（CPU 略快，Vulkan 持平）。
+- **wns1 全部权重 F16 零精度损失**（CPU 9.5e-7 与 F32 完全相同）——体量 186→127 MB。
+- **bridge F16**：CPU 1.8e-3（F32 时 4.3e-6，仍在阈值内）、Vulkan 不变；收益仅 1 MB，
+  意义不大但无代价。
+- Q8_0 未测（ggml conv/FFN 的 Q8 需逐块反量化，conv 路径收益待查）；F16 已满足
+  "1.5~1.8×↓ 且近无损"。
+- 工具链坑：gguf-py 的 `raw_dtype=F16` **不会**转换数据——必须同时把 numpy 数组
+  `astype(float16)`，否则 header 声明 F16 而数据仍按 F32 落盘（体积不变且图内误读）。
+
+## 9. WNS1（VITS WN Encoder）—— 已落地（ORCATERM 实现 + conv 内核优化）
 
 结构：pre Conv1d(512→512,k=1) ×mask → 8 层 WaveNet（in_layers k=5 pad=2、cond_layer k=1 的
 gin=512 全局条件、`tanh⊙sigmoid` 门控、res_skip 双输出；每层 `(x+res)×mask`）→ skip 求和 ×mask →

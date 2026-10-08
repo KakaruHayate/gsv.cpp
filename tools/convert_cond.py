@@ -14,6 +14,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="models/s2Gv5turbo.pth")
     ap.add_argument("--out", default="models/gsv-cond-f32.gguf")
+    ap.add_argument("--spec", default="", help="e.g. wns1=f16")
     args = ap.parse_args()
 
     import gguf
@@ -31,9 +32,31 @@ def main():
     w.add_uint32("cond.bridge_out", 512)
     w.add_uint32("cond.semantic_frame_rate_hz", 25)
 
+    spec = {}
+    for kv in (args.spec or "").split(','):
+        if kv:
+            k, v = kv.split('=')
+            spec[k.strip()] = v.strip().lower()
+
+    def pick(name):
+        # wns1: in_layers/res_skip/conv 权重可 f16; bias/rvq/bridge 一律 f32
+        low = name.lower()
+        if low.endswith('.bias') or low.endswith('_b') or 'codebook' in low:
+            return 'f32'
+        if 'bridge' in low:
+            return spec.get('bridge', 'f32')
+        if name.startswith('wns1.') and ('weight_w' in low or '.conv.weight' in low or '.weight' in low):
+            return spec.get('wns1', 'f32')
+        return 'f32'
+
     def add(name, t):
         arr = t.detach().float().numpy()
-        w.add_tensor(name, np.ascontiguousarray(arr), raw_dtype=gguf.GGMLQuantizationType.F32)
+        dt = pick(name)
+        if dt == 'f16':
+            arr = arr.astype(np.float16)
+        w.add_tensor(name, np.ascontiguousarray(arr),
+                     raw_dtype=gguf.GGMLQuantizationType.F32 if dt == 'f32'
+                     else gguf.GGMLQuantizationType.F16)
 
     # ---- RVQ (n_q=1: 只有 codebook) ----
     add("rvq.codebook", sd["quantizer.vq.layers.0._codebook.embed"])          # [1024, 768] -> ggml [768, 1024]
