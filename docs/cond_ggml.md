@@ -110,12 +110,44 @@ m->rvq_decode(codes, T, /*upsample_x2=*/true, out);   // out: [768, 2T], idx = d
 
 ### 对拍与性能
 
-| 后端 | max\|d\| vs torch golden | 耗时 |
-|------|---------------------------|------|
-| host C++（ORCATERM 基线） | 8.2e-6 | 401 ms |
-| ggml CPU (16T) | 1.77e-3 | 155 ms |
-| **ggml Vulkan** | **1.43e-2** | **38.9 ms** |
+精度（vs torch golden）：
 
-CPU 精度好（全 F32）；Vulkan 的 1.4e-2 来自 FA 的 F16 K/V（与 BERT 一致，实测不影响下游）。
-测试：`tests/test_hubert_ggml.cpp`（`GSV_HUBERT_DEVICE=vulkan` 切后端，`GSV_HUBERT_BENCH=N` 基准，
-`GSV_HUBERT_ENCIN=<file>` 可用 golden enc_in 单测 g2）。
+| 后端 | max\|d\| |
+|------|-----------|
+| host C++（ORCATERM） | 8.6e-6 |
+| ggml CPU（全 F32） | 1.77e-3 |
+| ggml Vulkan（FA 走 F16 K/V） | 1.43e-2 |
+
+耗时（同一会话、同一输入、warmup 后 30 次迭代取平均；RTX 2070 + i9 32 逻辑核）：
+
+| 实现 | 后端 | avg | min | 相对 |
+|------|------|-----|-----|------|
+| host C++（ORCATERM，OpenMP 全核） | CPU | 288.8 ms | 273.4 | 基线 |
+| **ggml（本实现）** | **CPU 24T** | **139.3 ms** | **124.6** | **2.1× 快于 host** |
+| ggml（本实现） | CPU 16T | 142.7 ms | 129.8 | |
+| *torch 参考* | *CPU* | *84.2 ms* | *74.1* | *torch CPU 仍最快* |
+| **ggml（本实现）** | **Vulkan** | **36.2 ms** | **32.7** | — |
+| torch（transformers，F32） | CUDA | 25.7 ms | 23.9 | 1.41× 快于 Vulkan |
+| torch（transformers，F16） | CUDA | 28.1 ms | 26.0 | F16 无收益 |
+
+**CPU 对 CPU**：ggml 图 139 ms vs host C++ 289 ms（2.1×）。host 版瓶颈在 cnn 137 / tr 141 ms，
+ggml 版把 transformer 压到 ~51 ms 的同时 CNN 也从 137 → ~78 ms。
+
+**CUDA 对 Vulkan**：torch CUDA 25.7 ms vs ggml Vulkan 36.2 ms（Vulkan 慢 1.41×）。
+与 AR 解码（ggml Vulkan 反超 torch CUDA 5.7×）相反——HuBERT 是**单次大前向**，
+正好落在 cuDNN/cuBLAS 的舒适区，没有 launch 开销可省。拆解 Vulkan 的 36.2 ms：
+
+| 段 | 耗时 | 说明 |
+|----|------|------|
+| g1 CNN 前端（GPU） | ~20 ms | 7 层 conv 走 im2col(F16)+mul_mat，通用 kernel，是 GPU 侧最大头 |
+| pos_conv + enc LN（**host**） | ~11 ms | groups=16 分组卷积的 host 实现；权重 18.9 MB 被 49 帧重复读 ≈923 MB，带宽受限 |
+| g2 12 层 transformer（GPU） | ~5 ms | 每层 ~0.45 ms |
+
+即 Vulkan 路径里 **~11 ms 是固定的 host 串行成本**（torch 侧由 cuDNN 在 GPU 上完成）。
+后续若继续优化，两个目标：(1) pos_conv 重写为 im2col+GEMM（权重只读一遍，预计 -9 ms，
+CPU/Vulkan 通吃）；(2) g1 的 k∈{2,3} conv 用「移位 GEMM 累加」替代 im2col（省掉 F16 转换与
+通用 kernel，两边都能受益）。
+
+测试：`tests/test_hubert_ggml.cpp`（`GSV_HUBERT_DEVICE=vulkan` 切后端，`GSV_HUBERT_THREADS`/`GSV_HUBERT_NTHREADS`、
+`GSV_HUBERT_BENCH=N` 基准，`GSV_HUBERT_ENCIN=<file>` 可用 golden enc_in 单测 g2）；
+torch 侧基准：`tools/bench_hubert_torch.py`（`python tools/bench_hubert_torch.py`，diffsinger env）。
