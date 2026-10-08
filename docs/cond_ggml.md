@@ -114,22 +114,25 @@ m->rvq_decode(codes, T, /*upsample_x2=*/true, out);   // out: [768, 2T], idx = d
 
 | 后端 | max\|d\| |
 |------|-----------|
-| host C++（ORCATERM） | 8.6e-6 |
 | **ggml CPU（全 F32，含 F32 im2col）** | **6.68e-6** |
 | ggml Vulkan（FA 走 F16 K/V） | 1.49e-2 |
 
+> 对拍基准一律是 **torch**（CPU/CUDA 同源 golden），与 host C++ 参考实现无关。
+
 耗时（同一会话、同一输入、warmup 后 30 次迭代取平均；RTX 2070 + i9 32 逻辑核）：
+
+对拍/性能基准一律取 torch（transformers HubertModel）CPU 与 CUDA：
 
 | 实现 | 后端 | avg | min | 相对 |
 |------|------|-----|-----|------|
 | **ggml（本实现）** | **Vulkan** | **7.1 ms** | **6.9** | **4.0× 快于 torch CUDA** |
-| torch（transformers，F32） | CUDA | 28.4 ms | 25.6 | |
-| torch（transformers，F16） | CUDA | 27.8 ms | 26.5 | F16 无收益 |
+| torch（F32） | CUDA | 28.4 ms | 25.6 | |
+| torch（F16） | CUDA | 27.8 ms | 26.5 | F16 无收益 |
 | **ggml（本实现）** | **CPU 24T** | **106 ms** | **101** | — |
-| *torch 参考（同机）* | *CPU* | *87 ms* | *76* | *torch 快 ~1.2×* |
-| host C++（ORCATERM，OpenMP 全核） | CPU | 289 ms | 273 | ggml 快 2.7× |
+| torch（F32） | CPU | 87 ms | 76 | torch 快 ~1.2× |
 
 > 数值取自机器空载时段；测量期间机器常有外部负载（avg 可高出 30-50%），故以 min 为准。
+> torch 侧分段脚本：`tools/bench_hubert_torch_seg.py`；端到端：`tools/bench_hubert_torch.py`。
 
 **CPU 对 CPU 的分段对比**（这是唯一还有差距的地方）：
 
@@ -203,6 +206,31 @@ conv 系列 kernel，本轮直接复用（不新增 op）：
 
 （`conv_direct_1d` 的 Vulkan shader 注释里写明是按 RTX 2070 级硬件调优的，选型启发式按 OC 挑 tile
 变体；我们的 OC=48 属于最小档，固定开销占主导。）
+
+## 6. WNS1（VITS WN Encoder）复核 —— ORCATERM 实现，待落地
+
+结构：pre Conv1d(512→512,k=1) ×mask → 8 层 WaveNet（in_layers k=5 pad=2、cond_layer k=1 的
+gin=512 全局条件、`tanh⊙sigmoid` 门控、res_skip 双输出；每层 `(x+res)×mask`）→ skip 求和 ×mask →
+proj k=1 ×mask。权重来自 `models/gsv-cond-f32.gguf`（38 个张量，weight_norm 已在转换时物化）。
+
+复核（独立重跑，T=120 / len=100）：
+
+| 实现 | max\|d\| vs torch golden | avg | min |
+|------|--------------------------|-----|-----|
+| ggml CPU 24T | 6.53e-4 | 100.9 ms | 90.3 |
+| **ggml Vulkan** | 3.57e-3 | **2.65 ms** | **2.36** |
+| torch F32 | — | 42.2 ms (CPU) / 9.50 ms (CUDA) | 35.2 / 8.88 |
+| torch F16 | — | — | 10.10 ms (CUDA，无收益) |
+
+结论：**GPU 侧 ggml Vulkan 比 torch CUDA 快 3.6×**；**CPU 侧慢 2.4×**（同 HuBERT 的 CNN：
+通用 `ggml_conv_1d` im2col 路径 vs oneDNN 直卷积）。CPU 若要加强，先换 patch 的
+`ggml_conv_1d_fast_1d_im2col`（+ F32 im2col），这里的 in_layers 是 stride-1 k=5、[T,512]→1024 的
+较大形状，`conv_direct_1d` 也值得一试（HuBERT 那边不适合是 16 个 49×48 小分组摊不开固定开销）。
+
+> 该实现的图语义已逐条核对（mask 时机、门控切分、cond 分层切片、res/skip 分支）与 VITS 一致；
+> 落地前待办：T 目前固定 120（集成需按 T 重建图）、`src/gsv_cond.h` 工作副本的中文注释被写入
+> 工具转成了乱码需修复、两个文件带 BOM、测试的 maxdiff 为 NaN 盲。
+> torch 侧基准脚本：`tools/bench_wns1_torch.py`。
 
 测试：`tests/test_hubert_ggml.cpp`（`GSV_HUBERT_DEVICE=vulkan` 切后端，`GSV_HUBERT_NTHREADS=N` 调线程、
 `GSV_HUBERT_BENCH=N` 基准，`GSV_HUBERT_ENCIN=<file>` 可用 golden enc_in 单测 g2）；
