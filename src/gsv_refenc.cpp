@@ -262,11 +262,20 @@ gsv_refenc * gsv_refenc::load(const std::string & gguf_path, const gsv_refenc_cf
                 ggml_tensor * src = ggml_get_tensor(s.wctx, names[wi]);   // ne=(in=128, out=128)
                 // 每头块 = src 的 out 行 [h*64, h*64+64): 行主数据天然连续,
                 // 块起点 = flat[h*64*in]; 拷到独立稠密块后 reshape (in, OH)
-                const size_t nbytes = (size_t) D_KV * H_HID * 4;
-                std::vector<char> bufc(nbytes);
-                ggml_backend_tensor_get(src, bufc.data(),
-                                        (size_t) h * D_KV * H_HID * 4, nbytes);
-                ggml_backend_tensor_set(dsts[wi], bufc.data(), 0, nbytes);
+                // 每头 64 行 (out 维) 稠密块: 源可能是 F32/F16/Q8_0 (量化后), 统一转 F32 拷出。
+                // 行字节数按类型算 (Q8_0 = 128/32*34 = 136 B/行), 否则 F16/量化会越界。
+                const size_t src_row_bytes = ggml_row_size(src->type, H_HID);
+                std::vector<char> raw((size_t) D_KV * src_row_bytes);
+                ggml_backend_tensor_get(src, raw.data(), (size_t) h * D_KV * src_row_bytes, raw.size());
+                std::vector<float> head((size_t) D_KV * H_HID);
+                if (src->type == GGML_TYPE_F32) {
+                    memcpy(head.data(), raw.data(), head.size() * 4);
+                } else if (src->type == GGML_TYPE_F16) {
+                    ggml_fp16_to_fp32_row((const ggml_fp16_t *) raw.data(), head.data(), (int64_t) head.size());
+                } else {
+                    ggml_get_type_traits(src->type)->to_float(raw.data(), head.data(), (int64_t) head.size());
+                }
+                ggml_backend_tensor_set(dsts[wi], head.data(), 0, head.size() * 4);
             }
         }
     }

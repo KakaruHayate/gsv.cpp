@@ -168,10 +168,14 @@ gsv_cond * gsv_cond::load(const std::string & gguf_path, const gsv_cond_cfg & cf
     if (!s.bridge_w || !s.bridge_b) {
         fprintf(stderr, "[gsv_cond] missing bridge.weight/bias\n"); delete m; return nullptr;
     }
-    if (s.bridge_w->ne[1] != s.BRIDGE_IN || s.bridge_w->ne[2] != s.BRIDGE_OUT) {
-        fprintf(stderr, "[gsv_cond] bridge.weight ne=[%d,%d,%d], 期望 [1,%d,%d]\n",
-                (int) s.bridge_w->ne[0], (int) s.bridge_w->ne[1], (int) s.bridge_w->ne[2],
-                s.BRIDGE_IN, s.BRIDGE_OUT);
+    // bridge 权重: 未量化时为 3D [1, in, out]; 量化后 (quantize_gguf 压形) 为 2D [in, out]
+    const bool bw_3d = s.bridge_w->ne[1] == s.BRIDGE_IN && s.bridge_w->ne[2] == s.BRIDGE_OUT;
+    const bool bw_2d = s.bridge_w->ne[0] == s.BRIDGE_IN && s.bridge_w->ne[1] == s.BRIDGE_OUT &&
+                       s.bridge_w->ne[2] == 1 && s.bridge_w->ne[3] == 1;
+    if (!bw_3d && !bw_2d) {
+        fprintf(stderr, "[gsv_cond] bridge.weight ne=[%d,%d,%d,%d], 期望 [1,%d,%d] 或 [%d,%d]\n",
+                (int) s.bridge_w->ne[0], (int) s.bridge_w->ne[1], (int) s.bridge_w->ne[2], (int) s.bridge_w->ne[3],
+                s.BRIDGE_IN, s.BRIDGE_OUT, s.BRIDGE_IN, s.BRIDGE_OUT);
         delete m; return nullptr;
     }
     if (cfg.verbose)

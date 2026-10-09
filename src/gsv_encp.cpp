@@ -133,7 +133,8 @@ struct gsv_encp::impl {
                 ggml_set_output(A);  ggml_set_name(A, "dbg_A");
             }
             // rel_v: rw = _abs_to_rel(p), out += rw @ rel_v_pad — 见文件头注释
-            ggml_tensor * ev = W1("emb_rel_v");                                  // ne=(DK, WIN2)
+            // emb_rel_v 可能被量化为 F16/Q8_0, 这里 cast 回 F32 再 concat (拼接要求同类型)
+            ggml_tensor * ev = ggml_cast(c, W1("emb_rel_v"), GGML_TYPE_F32);     // [DK, WIN2] F32
             // rel_v_pad: 两侧 pad (T-WIN-1) 行零 → evp ne=[2T-1, DK]:
             // mul_mat(a=evp, b=rw): a[i=d, l=w'] = flat[l + i*(2T-1)] = flat[w' + d*(2T-1)]
             // → evp[e0=w', e1=d]?? a ne=[K=2T-1, M=DK]: flat[l + i*K]: i=d, l=w' → flat[w' + d*(2T-1)]

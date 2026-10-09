@@ -316,25 +316,53 @@ conv=F16 不叠加误差（conv 后接 GroupNorm 归一化了 F16 噪声）。Vu
 `astype(float16)`，否则 header 声明 F16 而数据仍按 F32 落盘（体积不变且图内误读）。
 另：conv 权重转置回写（load 时）已支持 F16（`gsv_hubert.cpp` 按类型大小 get/set）。
 
-### Q8_0 档（`quantize_gguf` 组扩展后）
+### Q8_0 档（`quantize_gguf` 修复后重测）
 
-`tools/quantize_gguf.cpp` 已扩展 hubert/wns1/bridge 分组（feat_conv=conv 组、
-transformer q/k/v/out=attn、ffn=ffn 组、ln_w/norm/bias/codebook/pos_conv 强制 F32/F16 fixed）。
+> **重要更正（2026-10-09）**：旧扫描里的 `gsv-hubert-q8.gguf`（198MB）与
+> `gsv-cond-q8w.gguf`（93MB）**实际不含任何 Q8_0 张量**（前者全 F16/F32、后者全 F16）——
+> 当时 `quantize_gguf` 的量化分支只接受 `ne0 % 32 == 0` 的 2D 张量，而 hubert 的 conv
+> `[K,1,512]`（ne0=K=2/3/10）与 enc_p 的 1×1 conv `[1,in,out]`（ne0=1）全都静默回退 F16，
+> 且旧的 wns1 张量是 3D → 同样回退。下表数字是**修好工具后**重测的真实 Q8_0。
 
-| 模型 | 档位 | 体积 | CPU max\|d\| | Vulkan max\|d\| | CPU 耗时 | Vulkan 耗时 |
-|------|------|------|--------------|----------------|----------|-------------|
-| HuBERT | **attn+ffn+conv Q8_0** | **189 MB（F16 199MB 再 ↓5%）** | **5.2e-3** | 待测 | 129/119 ms（慢 15%） | — |
-| wns1 | wns1 权重 Q8_0（k=1 的 1×512 条回退 F16） | **93 MB（w16 127MB 再 ↓27%）** | **9.5e-7（不变！）** | 2.9e-3（不变） | 91/79 ms | 2.10/2.01 ms |
-| bridge | 3D 张量不量化（回退 F16），收益 0 | — | — | — | — | — |
+`quantize_gguf.cpp` 本次修复（两处）：
 
-结论：
-- **wns1 Q8_0 是意外赢家**：CPU 精度逐位不变（9.5e-7）、体积再 ↓27%、速度还略快。
-  in_layers k=5 的 [512,1024] 大块 Q8 对称量化恰好适配。
-- **HuBERT Q8_0 不划算**：CPU 误差 1.0e-3→5.2e-3（涨 5×）、速度慢 15%（Q8 去量化开销），
-  体积只比 F16 小 9MB。**维持 F16 档**。
-- 修复：quantizer 的 fixed 判定补了 `.b`/`.bias` 结尾（此前 `feat_proj.b` 等 bias 被
-  误量化为 F16，binary-op 直接断言拒绝 F16 输入）；`ln1_w/ln2_w` 归 fixed
-  （layernorm_affine 要求 F32）；`pos_conv.w` 归 fixed（host 端按 float* 读，F16 越界）。
+1. **分组**：enc_p / ref_enc 前缀分组（`enc_p.attn/ffn/mrte/emb/rel/sslproj/proj`、
+   `ref_enc.spectral/temporal/attn/fc`）移到通用规则之前——否则 enc_p 的 ffn/emb 被误分类成
+   AR 的同名组，spec 不生效。
+2. **1×1 conv 压形**：`ne0==1` 的 F32 权重（`[1,in,out]`，quantize 时）纯元数据压成 2D
+   `[in,out]`（flat 布局不变），量化块沿 in 维排布。加载端 `reshape_2d` 对两种形状都成立；
+   **2D 量化权重只能作 `mul_mat` 的 src0**——该 ggml 的量化 compute 路径不支持 src1 量化
+   （CPU 直接断言 `widen`），所以 wns1 的 k=1 conv 改成「权重 src0 + 激活转置」
+   （`conv1d_pick` 的 2D 分支），enc_p 的注意力本来就以权重为 src0；`emb_rel_v` 在 concat 前
+   `ggml_cast` 回 F32（concat 要求同类型）。
+
+| 模型/模块 | 档位 | 体积 | CPU max\|d\| | Vulkan max\|d\| | 判定 |
+|-----------|------|------|--------------|----------------|------|
+| HuBERT | attn+ffn Q8_0（conv 3D→F16） | 114 MiB | **3.5e-2** | — | **FAIL**（阈值 2e-2；旧文档 5.2e-3 系误报） |
+| wns1 | 权重 Q8_0（k=5 的 in_layers 回退 F16） | 48.9 MiB（F32 113→F16 56.6） | **1.60e-2** | **1.16e-2** | PASS（旧的 9.5e-7「逐位不变」同样系误报） |
+| wns1 | Q5_0 / Q4_0 | — | 1.02e-1 / 1.99e-1 | — | FAIL |
+| enc_p | 全部权重 Q8_0（ffn 3D→F16） | ~17 MiB（F32 54→F16 27） | 2.25e-2（y 3.1e-2） | 1.58e-2 | **FAIL**（临界） |
+| enc_p | 仅 attn Q8_0 | — | y 1.60e-2 | — | 可用备选（省 ~6MB，y 误差 ×23） |
+| enc_p | Q5_0 / Q4_0 | — | y 1.10e-1 / 3.86e-1 | — | FAIL |
+| ref_enc | Q8_0（temporal 3D→F16） | — | rel 2.25e-2 | — | FAIL |
+| bridge | Q8_0 | — | rel 2.03e-2（链上 bridge 段超线） | — | FAIL（卡线，回退 F16） |
+| rvq codebook | Q8_0 | 0.8 MiB（F32 3.0） | 链上 fea rel 6.6e-3 | 2.8e-3 | PASS |
+
+**Q8_0 误差为什么比"教科书 0.1%"大**：ggml 量化权重的 mul_mat 会把**激活也量化到
+Q8_0**（`vec_dot_type`），误差是权重+激活双份；enc_p 的 attention（值域 ±1000 + softmax 放大）
+与 ref_enc 的 attention 同因（§7 的 Vulkan 分析同理）。HuBERT/wns1 的误差集中在逐点门控
+与 conv 累加，量级温和但仍到 1e-2。
+
+### 条件段最小档（本次结论）
+
+| 档位 | 组成 | 体积 | 链 fea CPU | 链 fea Vulkan |
+|------|------|------|-----------|---------------|
+| F32（基线） | — | 177.3 MiB | — | — |
+| **全 F16** | 所有可 F16 的权重 | **91.1 MiB**（1.95×↓） | 5.0e-4 (rel 2.5e-4) | 3.0e-3 (rel 1.5e-3) |
+| **最小档 `gsv-cond-min.gguf`** | enc_p/ref_enc/bridge F16 + **wns1 Q8_0（k=1）+ rvq Q8_0** | **82.7 MiB**（2.14×↓） | 1.31e-2 (rel 6.6e-3) | 5.6e-3 (rel 2.8e-3) |
+
+整链（Tc=40→T=80→160）耗时：F32 86ms（CPU 16T）/ 12.7ms（VK）→ 最小档 93ms / 10.9ms
+（Vulkan 快 ~15%，CPU 因激活量化的去量化开销略慢；CPU 不是该段目标）。
 
 ## 9. WNS1（VITS WN Encoder）—— 已落地（ORCATERM 实现 + conv 内核优化）
 
@@ -483,3 +511,6 @@ enc_p 为此新增可选输出 `out_y`（proj 之前的 encoder2 输出；`tests
 （`GSV_CHAIN_DEVICE=vulkan` 统一切三个模块的后端、`GSV_CHAIN_THREADS=N`、`GSV_CHAIN_BENCH=N`）；
 golden：`tools/dump_golden_chain.py`；构建：`scripts/build-chain.bat`
 （CPU Release → `tests/relcpu/`，Vulkan → `tests/rel/`）；torch 基准：`tools/bench_chain_torch.py`。
+
+> 量化档位（§8 表）：`gsv-cond-f16.gguf`（91.1 MiB）与 `gsv-cond-min.gguf`（82.7 MiB）
+> 的整链 fea 在 CPU/Vulkan 都已在 `tests/test_cond_chain.cpp` 下验证 PASS。

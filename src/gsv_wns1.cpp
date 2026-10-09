@@ -52,7 +52,23 @@ static int wns1_conv_mode(){
     const char * e = getenv("GSV_WNS1_CONV");
     return e ? atoi(e) : 2;
 }
+// 3D 视图助手: 量化后的 k=1 权重是 2D ([in, out], 见 quantize_gguf 的压形), 不能 reshape;
+// 这里对 2D 原样返回, 由 conv1d_pick 的 2D 分支处理 (直接 mul_mat, 等价 k=1 im2col)。
+static ggml_tensor * as3d(ggml_context * c, ggml_tensor * t, int K, int IC, int OC){
+    if(t->ne[2] == 1 && t->ne[3] == 1) return t;
+    return ggml_reshape_3d(c, t, K, IC, OC);
+}
 static ggml_tensor * conv1d_pick(ggml_context * c, ggml_tensor * w, ggml_tensor * x, int pad, int mode){
+    // 2D 权重 (k=1, 含量化): out[t, oc] = sum_ic x[t, ic]*w[ic, oc]
+    // 权重必须作 mul_mat 的 src0 (该 ggml 的量化路径只支持 src0 量化);
+    // x [T, IC, 1] → [IC, T]; mul_mat(w [IC, OC], xt) → [OC, T] → 转回 [T, OC, 1]
+    if(w->ne[2] == 1 && w->ne[3] == 1){
+        GGML_ASSERT(pad == 0);
+        ggml_tensor * xt = ggml_cont(c, ggml_permute(c, x, 1, 0, 2, 3));    // [IC, T]
+        ggml_tensor * mm = ggml_mul_mat(c, w, xt);                          // [OC, T]
+        ggml_tensor * yt = ggml_cont(c, ggml_permute(c, mm, 1, 0, 2, 3));   // [T, OC]
+        return ggml_reshape_3d(c, yt, yt->ne[0], yt->ne[1], 1);
+    }
     if(mode == 3){
         // conv_direct_1d 需要 2D contiguous x [T, IC] 与 2D 输出
         ggml_tensor * x2 = ggml_view_2d(c, x, x->ne[0], x->ne[1], x->nb[1], 0);
@@ -95,7 +111,7 @@ static void build_graph(gsv_wns1::impl & s){
 
     // pre: Conv1d 512->512 k=1, then * mask
     {
-        ggml_tensor * w = ggml_reshape_3d(c, s.need("wns1.pre.weight"), 1, C, C);
+        ggml_tensor * w = as3d(c, s.need("wns1.pre.weight"), 1, C, C);
         ggml_tensor * y = conv1d_pick(c, w, x, 0, wns1_conv_mode());
         ggml_tensor * b = ggml_reshape_3d(c, s.need("wns1.pre.bias"), 1, C, 1);
         y = ggml_add(c, y, b);
@@ -117,8 +133,9 @@ static void build_graph(gsv_wns1::impl & s){
         ggml_tensor * xin = conv1d_pick(c, iw, x, PAD, wns1_conv_mode());
         xin = ggml_add(c, xin, ib);
         const int off = li * 2 * C;
-        ggml_tensor * cw = ggml_view_2d(c, cw_full, C, 2*C, cw_full->nb[2], (size_t)off * cw_full->nb[2]);
-        ggml_tensor * cw3 = ggml_reshape_3d(c, cw, 1, C, 2*C);
+        const size_t cw_stride = (cw_full->ne[2] == 1 && cw_full->ne[3] == 1) ? cw_full->nb[1] : cw_full->nb[2];
+        ggml_tensor * cw = ggml_view_2d(c, cw_full, C, 2*C, cw_stride, (size_t)off * cw_stride);
+        ggml_tensor * cw3 = as3d(c, cw, 1, C, 2*C);
         xin = ggml_add(c, xin, conv1d_pick(c, cw3, ge3, 0, wns1_conv_mode()));
         ggml_tensor * cbv = ggml_view_1d(c, cb_full, 2*C, (size_t)off * 4);
         xin = ggml_add(c, xin, ggml_reshape_3d(c, cbv, 1, 2*C, 1));
@@ -129,7 +146,7 @@ static void build_graph(gsv_wns1::impl & s){
         acts = ggml_reshape_3d(c, acts, T, C, 1);
         snprintf(nm,160,"wns1.enc.res_skip_layers.%d.weight_w",li);
         int rc = li < NL-1 ? 2*C : C;
-        ggml_tensor * rw = ggml_reshape_3d(c, s.need(nm), 1, C, rc);
+        ggml_tensor * rw = as3d(c, s.need(nm), 1, C, rc);
         snprintf(nm,160,"wns1.enc.res_skip_layers.%d.bias",li);
         ggml_tensor * rb = ggml_reshape_3d(c, s.need(nm), 1, rc, 1);
         ggml_tensor * rs = conv1d_pick(c, rw, acts, 0, wns1_conv_mode());
@@ -148,7 +165,7 @@ static void build_graph(gsv_wns1::impl & s){
     // sk [T, C, 1] -> *mask -> proj k=1 -> *mask
     sk = ggml_mul(c, sk, mask);
     {
-        ggml_tensor * w = ggml_reshape_3d(c, s.need("wns1.proj.weight"), 1, C, C);
+        ggml_tensor * w = as3d(c, s.need("wns1.proj.weight"), 1, C, C);
         ggml_tensor * y = conv1d_pick(c, w, sk, 0, wns1_conv_mode());
         ggml_tensor * b = ggml_reshape_3d(c, s.need("wns1.proj.bias"), 1, C, 1);
         y = ggml_mul(c, ggml_add(c, y, b), mask);

@@ -80,8 +80,10 @@ int main(int argc, char ** argv) {
     std::vector<float> q, y_tc, xb, m, logs, yenc, br, fea;
 
     auto run = [&]() {
+        if (getenv("GSV_CHAIN_VERBOSE")) { fprintf(stderr, "[chain] rvq...\n"); fflush(stderr); }
         // 1. RVQ decode + ×2 nearest -> [768, T] (idx = d + t*768)
         cond->rvq_decode(codes.data(), Tc, true, q);
+        if (getenv("GSV_CHAIN_VERBOSE")) { fprintf(stderr, "[chain] encp...\n"); fflush(stderr); }
         // 2. -> enc_p 的 torch 布局 [768, T] (idx = c*T + t)
         y_tc.assign((size_t) 768 * T, 0.0f);
         for (int t = 0; t < T; t++)
@@ -89,6 +91,7 @@ int main(int argc, char ** argv) {
                 y_tc[(size_t) c * T + t] = q[(size_t) c + (size_t) t * 768];
         // 3. enc_p (y = proj 前的 encoder2 输出)
         encp->encode(y_tc.data(), T, text.data(), NT, ge.data(), m, logs, &yenc);
+        if (getenv("GSV_CHAIN_VERBOSE")) { fprintf(stderr, "[chain] bridge...\n"); fflush(stderr); }
         // 4. -> bridge ggml 布局 [192, T] (idx = c + t*192)
         xb.assign((size_t) 192 * T, 0.0f);
         for (int t = 0; t < T; t++)
@@ -96,6 +99,7 @@ int main(int argc, char ** argv) {
                 xb[(size_t) c + (size_t) t * 192] = yenc[(size_t) c * T + t];
         // 5. bridge + ×2 -> [T2, 512] (idx = c*T2 + t == wns1 fea 布局)
         cond->bridge_run(xb.data(), T, true, br);
+        if (getenv("GSV_CHAIN_VERBOSE")) { fprintf(stderr, "[chain] wns1...\n"); fflush(stderr); }
         // 6. wns1 (len = 全长, mask 全 1) -> fea [T2, 512] (idx = c*T2 + t)
         wns1->encode(br.data(), ge.data(), T2, T2, fea);
     };

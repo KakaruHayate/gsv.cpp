@@ -34,6 +34,26 @@ static std::string group_of(const std::string & name) {
         name.find(".bias") != std::string::npos ||
         name.find("alpha") != std::string::npos || name.find("bert_proj") != std::string::npos)
         return "fixed";                        // 强制 F32
+    // enc_p / ref_enc 前缀分组要在通用规则 (ffn/emb/attn) 之前, 否则被误分类
+    // enc_p (TextEncoder+MRTE): 组供 cond 段扫描用 (bias/gamma/beta 已被 fixed 截获)
+    if (name.rfind("enc_p.", 0) == 0) {
+        if (name.find("emb_rel") != std::string::npos) return "enc_p.rel";
+        if (name.find(".attn_layers.") != std::string::npos) return "enc_p.attn";
+        if (name.find(".ffn_layers.") != std::string::npos) return "enc_p.ffn";
+        if (name.find("mrte.") != std::string::npos) return "enc_p.mrte";
+        if (name.find("text_embedding") != std::string::npos) return "enc_p.emb";
+        if (name.find("ssl_proj") != std::string::npos) return "enc_p.sslproj";
+        if (name.find("proj.") != std::string::npos) return "enc_p.proj";
+        return "enc_p.other";
+    }
+    // ref_enc (MelStyleEncoder)
+    if (name.rfind("ref_enc.", 0) == 0) {
+        if (name.find("spectral") != std::string::npos) return "ref_enc.spectral";
+        if (name.find("temporal") != std::string::npos) return "ref_enc.temporal";
+        if (name.find("slf_attn") != std::string::npos) return "ref_enc.attn";
+        if (name.find("fc.fc") != std::string::npos) return "ref_enc.fc";
+        return "ref_enc.other";
+    }
     if (name.find("text_emb") != std::string::npos || name.find("audio_emb") != std::string::npos) return "emb";
     if (name.find("predict") != std::string::npos) return "predict";
     if (is_bert) {
@@ -63,6 +83,26 @@ static std::string group_of(const std::string & name) {
         if (name.find(".ffn1_w") != std::string::npos || name.find(".ffn2_w") != std::string::npos) return "ffn";
     }
     if (name.rfind("hubert.", 0) == 0) return "other";
+    // enc_p (TextEncoder+MRTE): 组供 cond 段扫描用 (bias/gamma/beta 已被 fixed 截获)
+    if (name.rfind("enc_p.", 0) == 0) {
+        if (name.find("emb_rel") != std::string::npos) return "enc_p.rel";
+        if (name.find(".attn_layers.") != std::string::npos) return "enc_p.attn";
+        if (name.find(".ffn_layers.") != std::string::npos) return "enc_p.ffn";
+        if (name.find("mrte.") != std::string::npos) return "enc_p.mrte";
+        if (name.find("text_embedding") != std::string::npos) return "enc_p.emb";
+        if (name.find("ssl_proj") != std::string::npos) return "enc_p.sslproj";
+        if (name.find("proj.") != std::string::npos) return "enc_p.proj";
+        return "enc_p.other";
+    }
+    // ref_enc (MelStyleEncoder)
+    if (name.rfind("ref_enc.", 0) == 0) {
+        if (name.find("spectral") != std::string::npos) return "ref_enc.spectral";
+        if (name.find("temporal") != std::string::npos) return "ref_enc.temporal";
+        if (name.find("slf_attn") != std::string::npos) return "ref_enc.attn";
+        if (name.find("fc.fc") != std::string::npos) return "ref_enc.fc";
+        return "ref_enc.other";
+    }
+    if (name.find("rvq.codebook") != std::string::npos) return "rvq";
     // wns1 / cond 段: 权重类 → wns1 组 (bias/codebook 已被 fixed 截获)
     if (name.rfind("wns1.", 0) == 0) return "wns1";
     if (name.rfind("bridge", 0) == 0) return "bridge";
@@ -137,29 +177,40 @@ int main(int argc, char ** argv) {
         const std::string grp = group_of(name);
         std::string target_name = (grp == "fixed") ? "f32" : (spec.count(grp) ? spec[grp] : def);
         ggml_type tt = parse_type(target_name);
-        const int64_t ne0 = t->ne[0], ne1 = t->ne[1];
-        const int64_t nrows = ggml_nrows(t);
+        int64_t ne0 = t->ne[0], ne1 = t->ne[1];
+        int64_t nrows = ggml_nrows(t);
+
+        // ne0==1 的 1x1 conv / Conv1d 权重 ([1, in, out]): 纯元数据压成 2D [in, out]
+        // (flat 布局不变), 使量化块能沿 in 维排布。加载端 reshape_2d 对两种形状都成立。
+        bool squeeze = false;
+        if (t->type == GGML_TYPE_F32 && t->ne[0] == 1 && t->ne[3] == 1 && t->ne[2] > 1) {
+            squeeze = true;
+            ne0 = t->ne[1]; ne1 = t->ne[2]; nrows = t->ne[2] * t->ne[3];
+        }
 
         // 目标类型不可用时的回退 (K-quant 需要 ne0 % 256 == 0; 量化只支持 2D 权重)
         if (tt != GGML_TYPE_F32 && tt != GGML_TYPE_F16) {
             const int blk = ggml_blck_size(tt);
-            if (t->type != GGML_TYPE_F32 || t->ne[2] != 1 || t->ne[3] != 1 || (ne0 % blk) != 0) {
-                fprintf(stderr, "  [warn] %s: 类型不适用 (ne=[%lld,%lld], blk=%d) → 回退 f16\n",
-                        name, (long long) ne0, (long long) ne1, blk);
+            if (!squeeze && (t->ne[2] != 1 || t->ne[3] != 1)) {
+                fprintf(stderr, "  [warn] %s: 3D 无法量化 (ne=[%lld,%lld,%lld]) → 回退 f16\n",
+                        name, (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2]);
+                tt = GGML_TYPE_F16;
+            } else if ((ne0 % blk) != 0) {
+                fprintf(stderr, "  [warn] %s: ne0=%lld 不是 %d 的倍数 → 回退 f16\n", name, (long long) ne0, blk);
                 tt = GGML_TYPE_F16;
             }
         }
-        if (tt == t->type) tt = t->type;   // 同类型直接复制
-
-        ggml_tensor * meta = ggml_new_tensor(meta_ctx, tt, ggml_n_dims(t), t->ne);
+        ggml_tensor * meta = squeeze && (tt != GGML_TYPE_F32 && tt != GGML_TYPE_F16)
+            ? ggml_new_tensor_2d(meta_ctx, tt, ne0, ne1)
+            : ggml_new_tensor(meta_ctx, tt, ggml_n_dims(t), t->ne);
         ggml_set_name(meta, name);
         gguf_add_tensor(out, meta);
 
         const void * src = t->data;
-        if (tt == t->type) {
+        if (tt == t->type) {   // 同类型直接复制 (squeeze 只改变量化目标的元数据形状)
             keep.emplace_back((const uint8_t *) src, (const uint8_t *) src + ggml_nbytes(t));
             gguf_set_tensor_data(out, name, keep.back().data());
-            printf("  %-34s %s (copy)\n", name, ggml_type_name(tt));
+            printf("  %-40s %s (copy)\n", name, ggml_type_name(tt));
             continue;
         }
         if (tt == GGML_TYPE_F16) {
@@ -167,17 +218,17 @@ int main(int argc, char ** argv) {
             ggml_fp32_to_fp16_row((const float *) src, buf.data(), (int64_t) ggml_nelements(t));
             keep.emplace_back((const uint8_t *) buf.data(), (const uint8_t *) buf.data() + buf.size() * 2);
             gguf_set_tensor_data(out, name, keep.back().data());
-            printf("  %-34s f16 (from %s)\n", name, ggml_type_name(t->type));
+            printf("  %-40s f16 (from %s)\n", name, ggml_type_name(t->type));
             continue;
         }
-        // 量化: 逐行块
+        // 量化: 逐行块 (squeeze 时按 [ne1, ne2] 行)
         const size_t dst_size = ggml_row_size(tt, ne0) * nrows;
         std::vector<uint8_t> buf(dst_size);
         const size_t written = ggml_quantize_chunk(tt, (const float *) src, buf.data(), 0, nrows, ne0, nullptr);
         if (written != dst_size) { fprintf(stderr, "  [error] %s: quantize size %zu != %zu\n", name, written, dst_size); return 1; }
         keep.push_back(std::move(buf));
         gguf_set_tensor_data(out, name, keep.back().data());
-        printf("  %-34s %s (from %s)\n", name, ggml_type_name(tt), ggml_type_name(t->type));
+        printf("  %-40s %s (from %s, ne0=%lld)\n", name, ggml_type_name(tt), ggml_type_name(t->type), (long long) ne0);
     }
 
     if (!gguf_write_to_file(out, out_path.c_str(), false)) { fprintf(stderr, "write failed\n"); return 1; }
