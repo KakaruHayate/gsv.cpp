@@ -439,3 +439,47 @@ ssl 三层 attention 输出 5.5e-7、temb/text/mrte/enc2/stats 各段 1e-6 量�
 测试：`tests/test_encp.cpp [gguf] [golden_dir]`（`GSV_ENCP_DEVICE=vulkan` 切后端、
 `GSV_ENCP_THREADS=N` 调线程、`GSV_ENCP_BENCH=N` 基准、`GSV_ENCP_DEBUG=1` 转储中间张量）；
 Vulkan 构建：`scripts/build-encp-vk.bat`；CPU Release 构建：`scripts/build-encp.bat`。
+
+## 11. 链路串联（codes → fea 端到端）✅
+
+`SynthesizerTrnV3.decode_encp`（v5turbo 走**非 v3 分支**；注意 `SynthesizerTrnV3b` 的
+1.875/3.75 是另一条分支，别混）：
+
+```
+codes[Tc] → quantizer.decode (codebook gather) → ×2 nearest → [768, 2Tc]
+  → enc_p → y (proj 前, [192, 2Tc])  → bridge (k=1 + LeakyReLU 0.01) → ×2 nearest → [512, 4Tc]
+  → wns1 (ge 条件, sizee = int(Tc*4), 与 ×2 后长度一致 → mask 全 1) → fea [512, 4Tc]
+```
+
+布局转换点（各模块内部布局沿用各自对拍时的约定，只在链上转 3 次）：
+
+| 段 | 布局 | 链上动作 |
+|----|------|---------|
+| RVQ 输出 | `[768, T]` (idx = d + t*768) | → enc_p 前转 torch `[768, T]` (idx = c*T + t) |
+| enc_p 的 y | torch `[192, T]` (c*T + t) | → bridge 前转 ggml `[192, T]` (c + t*192) |
+| bridge 输出 | `[T2, 512]` (idx = c*T2 + t) | **与 wns1 的 fea 布局相同，直送** |
+| wns1 输出 | `[T2, 512]` (c*T2 + t) | 与 golden `[1,512,T2]` 同构，直接比 |
+
+enc_p 为此新增可选输出 `out_y`（proj 之前的 encoder2 输出；`tests/test_encp.cpp`
+顺带与 golden `encp.y_enc` 对拍：CPU 1.8e-6 / Vulkan 4.7e-3）。
+
+### 端到端对拍（Tc=40 → 80 → 160，`tests/test_cond_chain.cpp`）
+
+| 后端 | y | bridge | fea | 判定 |
+|------|---|--------|-----|------|
+| CPU（Release, 16T） | 9.5e-7 | 3.0e-7 | **7.2e-7** | PASS |
+| Vulkan | 5.1e-3 | 1.3e-3 | **3.0e-3**（rel 1.5e-3） | PASS |
+
+### 性能（vs torch 整链，同机同输入）
+
+| | torch | ggml | 相对 |
+|---|---|---|---|
+| GPU | CUDA F32 avg 80.9 / **min 77.4** ms（F16 更慢 90.6/83.9） | **Vulkan avg 12.6 / min 11.6** ms | **快 ~6.7×** |
+| CPU | CPU F32 16T avg 129 / **min 109** ms | CPU 16T avg 99.8 / **min 84.0** ms | 快 ~1.3× |
+
+（CPU 侧整链大头是 wns1 的 conv + 门控，见 §9；Vulkan 12ms 里 enc_p ~8 + wns1 ~2.3 + RVQ/bridge ~1.4。）
+
+测试：`tests/test_cond_chain.cpp [cond_gguf] [encp_gguf] [golden_dir]`
+（`GSV_CHAIN_DEVICE=vulkan` 统一切三个模块的后端、`GSV_CHAIN_THREADS=N`、`GSV_CHAIN_BENCH=N`）；
+golden：`tools/dump_golden_chain.py`；构建：`scripts/build-chain.bat`
+（CPU Release → `tests/relcpu/`，Vulkan → `tests/rel/`）；torch 基准：`tools/bench_chain_torch.py`。

@@ -57,6 +57,7 @@ struct gsv_encp::impl {
     ggml_tensor * t_ge = nullptr;    // [512]
     ggml_tensor * t_m = nullptr;     // [192, T]
     ggml_tensor * t_logs = nullptr;  // [192, T]
+    ggml_tensor * t_ym = nullptr;    // [192, T] proj 之前的 encoder2 输出 (喂 bridge)
 
     int n_threads = 0;
     bool verbose = false;
@@ -295,6 +296,10 @@ struct gsv_encp::impl {
         ggml_tensor * projw2 = ggml_reshape_2d(c, projw, 192, 384);
         ggml_tensor * stats = ggml_add(c, ggml_mul_mat(c, projw2, ym), need("enc_p.proj.bias"));   // [384, T]
         if (getenv("GSV_ENCP_DEBUG")) { ggml_set_output(stats); ggml_set_name(stats, "dbg_stage_stats"); }
+        // y (proj 前) 条件链里喂 bridge
+        t_ym = ym;
+        ggml_set_output(t_ym);
+        ggml_set_name(t_ym, "encp_y");
         // split: m = stats[:192], logs = stats[192:]
         // cont: view 是非连续的 (nb1=384*4), 取回时必须稠密
         t_m = ggml_cont(c, ggml_view_2d(c, stats, 192, T, stats->nb[1], 0));
@@ -389,12 +394,14 @@ gsv_encp * gsv_encp::load(const std::string & gguf_path, const gsv_encp_cfg & cf
 }
 
 bool gsv_encp::encode(const float * y, int T, const int32_t * text, int n_text,
-                      const float * ge, std::vector<float> & out_m, std::vector<float> & out_logs) {    impl & s = *p;
+                      const float * ge, std::vector<float> & out_m, std::vector<float> & out_logs,
+                      std::vector<float> * out_y) {
+    impl & s = *p;
     if (T <= 0 || n_text <= 0) { fprintf(stderr, "[gsv_encp] bad T/NT\n"); return false; }
     if (T != s.T || n_text != s.NT) {
         if (s.galloc) { ggml_gallocr_free(s.galloc); s.galloc = nullptr; }
         if (s.gctx) { ggml_free(s.gctx); s.gctx = nullptr; }
-        s.g = nullptr; s.t_y = s.t_text = s.t_ge = s.t_m = s.t_logs = nullptr;
+        s.g = nullptr; s.t_y = s.t_text = s.t_ge = s.t_m = s.t_logs = s.t_ym = nullptr;
         s.build_graph(T, n_text);
         if (!s.g) { fprintf(stderr, "[gsv_encp] build_graph failed\n"); return false; }
         if (s.verbose) printf("[gsv_encp] graph rebuilt for T=%d NT=%d\n", T, n_text);
@@ -448,6 +455,13 @@ bool gsv_encp::encode(const float * y, int T, const int32_t * text, int n_text,
         for (int t = 0; t < T; t++)
             for (int c = 0; c < 192; c++)
                 out_logs[(size_t) c * T + t] = tmp[(size_t) t * 192 + c];
+        if (out_y) {
+            out_y->assign((size_t) 192 * T, 0.0f);
+            ggml_backend_tensor_get(s.t_ym, tmp.data(), 0, tmp.size() * 4);
+            for (int t = 0; t < T; t++)
+                for (int c = 0; c < 192; c++)
+                    (*out_y)[(size_t) c * T + t] = tmp[(size_t) t * 192 + c];
+        }
     }
     return true;
 }

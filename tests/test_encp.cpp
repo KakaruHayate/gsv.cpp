@@ -56,13 +56,21 @@ int main(int argc, char ** argv) {
 
     if (y.empty() || ref_m.empty() || ref_logs.empty() || ge.empty()) { fprintf(stderr, "missing golden\n"); delete m; return 1; }
 
-    std::vector<float> om, ologs;
-    if (!m->encode(y.data(), T, text.data(), NT, ge.data(), om, ologs)) { delete m; return 1; }
+    std::vector<float> om, ologs, oy;
+    if (!m->encode(y.data(), T, text.data(), NT, ge.data(), om, ologs, &oy)) { delete m; return 1; }
     size_t n1 = 0, n2 = 0;
     double dm = maxdiff_nan(om, ref_m, n1);
     double dl = maxdiff_nan(ologs, ref_logs, n2);
     printf("  encp_m    max|d|=%.3e %s%s\n", dm, dm < 2e-2 ? "PASS" : "FAIL", n1 ? " (nan!)" : "");
     printf("  encp_logs max|d|=%.3e %s%s\n", dl, dl < 2e-2 ? "PASS" : "FAIL", n2 ? " (nan!)" : "");
+    // y (proj 前, 条件链里喂 bridge) 与 golden y_enc 对拍
+    size_t n3 = 0;
+    double dy = 0;
+    std::vector<float> ref_y = read_bin(std::string(gdir) + "/encp.y_enc.bin");
+    if (!ref_y.empty()) {
+        dy = maxdiff_nan(oy, ref_y, n3);
+        printf("  encp_y    max|d|=%.3e %s%s\n", dy, dy < 2e-2 ? "PASS" : "FAIL", n3 ? " (nan!)" : "");
+    }
 
     const char * be = getenv("GSV_ENCP_BENCH");
     const int bn = be ? atoi(be) : 0;
@@ -80,7 +88,8 @@ int main(int argc, char ** argv) {
                cfg.device.empty() ? "cpu" : "vulkan", sum / ts.size(), ts.front(), (int) ts.size());
     }
 
-    const bool ok = (dm < 2e-2 && dl < 2e-2 && n1 == 0 && n2 == 0);
+    const bool ok = (dm < 2e-2 && dl < 2e-2 && n1 == 0 && n2 == 0) &&
+                    (ref_y.empty() || (dy < 2e-2 && n3 == 0));
     printf("\n%s\n", ok ? "ENCP PARITY PASS" : "ENCP PARITY FAIL");
     delete m;
     return ok ? 0 : 1;
