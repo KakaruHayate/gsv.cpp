@@ -1,8 +1,11 @@
 // =====================================================================
-// 状态: WIP —— spectral / temporal 段已对拍 PASS (3.8e-5 / 2.6e-3),
-//       attention 段 CPU+Vulkan 双后端一致地 FAIL (max|d|~87, 与后端无关),
-//       FA 路径 CPU PASS (3.8e-4) / Vulkan FAIL (0.53, F16 K/V 被大值域 z 放大).
-//       卡点分析见 docs/cond_ggml.md 第 7 节. ge 可先由 torch 预计算替代.
+// ref_enc (MelStyleEncoder): spectral → temporal(Conv1dGLU×2) → 2 头自注意力
+//   (d_k=d_v=64, 温度 √128, 加性 mask) → fc 128→512 → 有效帧均值池化 → ge
+// 注意力修复要点 (原"双后端 FAIL 87"的真正原因, 非后端问题):
+//   oh = mul_mat(vhT, pm) —— 原代码 operands 反了 ([T,64] 而非 [64,T], concat 轴也错);
+//   MHA 输出 = fc(cat) + 残差 z —— 原来是断链 (fc 直接吃 z, attn 成死代码).
+//   权重按头预切稠密块 (load 时) → mul_mat src0 全稠密, 避开 llamafile 步进假设.
+//   mask: ggml sc 布局 [ki, tq], 无效 ki 处加 -1e30; padding query 只 attend key0.
 // =====================================================================
 #include "gsv_refenc.h"
 
@@ -16,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <chrono>
 
 static const int  C_IN   = 704;    // refer[:, :704]
 static const int  H_HID  = 128;    // style_hidden
@@ -118,41 +122,38 @@ struct gsv_refenc::impl {
         // 转回 [128, T] 后按帧 mask 置零 (参考的 masked_fill)
         ggml_tensor * z = ggml_mul(c, ggml_cont(c, ggml_permute(c, y, 1, 0, 2, 3)), m1);   // [128, T]
 
-        // 自注意力 (2 头, d=64) + fc + 残差
-        // 权重按头预切成稠密块 (load 时完成), 每头独立 mul_mat — 全链无 strided src0,
-        // 不触发 llamafile sgemm 的稠密假设问题 (CPU) 且无需 FA (值域大, F16 K/V 误差被放大).
-        {
-            ggml_tensor * q = linear(c, "ref_enc.slf_attn.w_qs.weight", "ref_enc.slf_attn.w_qs.bias", z);   // [128, T]
-            ggml_tensor * k = linear(c, "ref_enc.slf_attn.w_ks.weight", "ref_enc.slf_attn.w_ks.bias", z);
-            ggml_tensor * v = linear(c, "ref_enc.slf_attn.w_vs.weight", "ref_enc.slf_attn.w_vs.bias", z);
-            ggml_tensor * attn = nullptr;
-            for (int h = 0; h < N_HEAD; h++) {
-                // 每头投影: mul_mat(wh [in=128, oh=64], z [128, T]) → [64, T] (行=oh 稠密)
-                ggml_tensor * qh = ggml_add(c, ggml_mul_mat(c, t_wq[h], z),
-                                            ggml_view_1d(c, need("ref_enc.slf_attn.w_qs.bias"), D_KV, h * D_KV * 4));
-                ggml_tensor * kh = ggml_add(c, ggml_mul_mat(c, t_wk[h], z),
-                                            ggml_view_1d(c, need("ref_enc.slf_attn.w_ks.bias"), D_KV, h * D_KV * 4));
-                ggml_tensor * vh = ggml_add(c, ggml_mul_mat(c, t_wv[h], z),
-                                            ggml_view_1d(c, need("ref_enc.slf_attn.w_vs.bias"), D_KV, h * D_KV * 4));
-                ggml_tensor * vhT = ggml_cont(c, ggml_permute(c, vh, 1, 0, 2, 3));   // [T_kv, 64] 稠密
-                ggml_tensor * sc = ggml_mul_mat(c, kh, qh);                          // [T_kv, T_q]
-                ggml_tensor * pm = ggml_soft_max_ext(c, sc, am, 1.0f / TEMP, 0.0f);
-                ggml_tensor * oh = ggml_mul_mat(c, pm, vhT);                         // [64, T] 稠密
-                attn = attn ? ggml_concat(c, attn, oh, 0) : oh;
-            }
+        // 自注意力 (2 头, d=64): 每头投影 mul_mat 用 load 时预切的稠密块
+        // sc [T_ki, T_q] → soft_max_ext(加性 mask, 1/√128) → oh = vhT·p → [64, T]
+        // MHA 输出 = fc(cat_heads) + 残差 z; 之后 fc.fc 128→512
+        ggml_tensor * attn_cat = nullptr;
+        for (int h = 0; h < N_HEAD; h++) {
+            ggml_tensor * qh = ggml_add(c, ggml_mul_mat(c, t_wq[h], z),
+                                        ggml_view_1d(c, need("ref_enc.slf_attn.w_qs.bias"), D_KV, (size_t) h * D_KV * 4));
+            ggml_tensor * kh = ggml_add(c, ggml_mul_mat(c, t_wk[h], z),
+                                        ggml_view_1d(c, need("ref_enc.slf_attn.w_ks.bias"), D_KV, (size_t) h * D_KV * 4));
+            ggml_tensor * vh = ggml_add(c, ggml_mul_mat(c, t_wv[h], z),
+                                        ggml_view_1d(c, need("ref_enc.slf_attn.w_vs.bias"), D_KV, (size_t) h * D_KV * 4));
+            ggml_tensor * vhT = ggml_cont(c, ggml_permute(c, vh, 1, 0, 2, 3));   // [T_ki, 64] 稠密
+            ggml_tensor * sc = ggml_mul_mat(c, kh, qh);                          // [T_ki, T_q]
+            ggml_tensor * pm = ggml_soft_max_ext(c, sc, am, 1.0f / TEMP, 0.0f);
+            ggml_tensor * oh = ggml_mul_mat(c, vhT, pm);                         // [64, T_q]
+            attn_cat = attn_cat ? ggml_concat(c, attn_cat, oh, 0) : oh;
         }
+        ggml_tensor * o = ggml_add(c,
+                ggml_mul_mat(c, need("ref_enc.slf_attn.fc.weight"), attn_cat),
+                need("ref_enc.slf_attn.fc.bias"));                               // [128, T]
+        ggml_tensor * aout = ggml_add(c, o, z);                                  // MHA 输出 (fc+残差)
 
-        fprintf(stderr, "[shapes2] z=%lldx%lld\n", z->ne[0], z->ne[1]); fflush(stderr);
         // fc 128->512, 转 t 主序后按有效帧池化 (sum/len)
-        ggml_tensor * f = linear(c, "ref_enc.fc.fc.weight", "ref_enc.fc.fc.bias", z);           // [512, T]
+        ggml_tensor * f = linear(c, "ref_enc.fc.fc.weight", "ref_enc.fc.fc.bias", aout);       // [512, T]
         ggml_tensor * ft = ggml_cont(c, ggml_permute(c, f, 1, 0, 2, 3));                        // [T, 512]
-        fprintf(stderr, "[shapes3] pw=%lldx%lld ft=%lldx%lld\n", pw->ne[0], pw->ne[1], ft->ne[0], ft->ne[1]); fflush(stderr);
         t_out = ggml_mul_mat(c, pw, ft);                                                        // [1, 512]
         ggml_set_output(t_out);
         if (getenv("GSV_REFENC_DEBUG")) {
             ggml_set_output(x);   ggml_set_name(x, "dbg_spectral");   // [128, T]
             ggml_set_output(y);   ggml_set_name(y, "dbg_temporal");   // [T, 128]
-            ggml_set_output(z);   ggml_set_name(z, "dbg_attn");       // [128, T]
+            ggml_set_output(aout); ggml_set_name(aout, "dbg_attn");   // [128, T] MHA 输出
+            ggml_set_output(z);   ggml_set_name(z, "dbg_z");          // [128, T] attention 输入
             ggml_set_output(f);   ggml_set_name(f, "dbg_fc");         // [512, T]
         }
 
@@ -285,6 +286,7 @@ gsv_refenc * gsv_refenc::load(const std::string & gguf_path, const gsv_refenc_cf
 
 bool gsv_refenc::encode(const float * spec, const float * frame_mask, int T, std::vector<float> & ge) {
     impl & s = *p;
+    auto _te0 = std::chrono::steady_clock::now();
     if (T <= 0) { fprintf(stderr, "[gsv_refenc] bad T=%d\n", T); return false; }
     if (T != s.T) {
         if (s.galloc) { ggml_gallocr_free(s.galloc); s.galloc = nullptr; }
@@ -302,30 +304,42 @@ bool gsv_refenc::encode(const float * spec, const float * frame_mask, int T, std
     std::vector<float> pw((size_t) T, 0.0f);
     for (int t = 0; t < T; t++) if (m1[t] != 0.0f) pw[t] = 1.0f;
     const bool nomask = getenv("GSV_REFENC_NOMASK") != nullptr;
+    const char * mv = getenv("GSV_REFENC_MASKVAL");
+    const float maskval = mv ? (float) atof(mv) : -1e30f;
     for (int qi = 0; qi < T && !nomask; qi++) {
         for (int ki = 0; ki < T; ki++) {
             // 有效 query: 只 attend 有效 key; padding query: 只 attend key 0 (避免整行 -inf 出 NaN,
             // 其结果不参与池化);
             const bool attend = (m1[qi] != 0.0f) ? (m1[ki] != 0.0f) : (ki == 0);
-            am[(size_t) ki + (size_t) qi * T] = ggml_fp32_to_fp16(attend ? 0.0f : (getenv("GSV_REFENC_NOMASK") ? 0.0f : (getenv("GSV_REFENC_MASKVAL") ? (float)atof(getenv("GSV_REFENC_MASKVAL")) : -1e30f)));
+            am[(size_t) ki + (size_t) qi * T] = ggml_fp32_to_fp16(attend ? 0.0f : maskval);
         }
     }
-    if (getenv("GSV_REFENC_DEBUG")) { fprintf(stderr, "[set] t_in buf=%d\n", s.t_in->buffer != NULL); fflush(stderr); }
     ggml_backend_tensor_set(s.t_in, spec, 0, (size_t) C_IN * T * 4);
-    if (getenv("GSV_REFENC_DEBUG")) { fprintf(stderr, "[set] t_mask buf=%d\n", s.t_mask->buffer != NULL); fflush(stderr); }
     ggml_backend_tensor_set(s.t_mask, m1.data(), 0, m1.size() * 4);
-    if (getenv("GSV_REFENC_DEBUG")) { fprintf(stderr, "[set] t_amask buf=%d\n", s.t_amask->buffer != NULL); fflush(stderr); }
-    ggml_backend_tensor_set(s.t_amask, am.data(), 0, am.size() * 2);
-    if (getenv("GSV_REFENC_DEBUG")) { fprintf(stderr, "[set] t_pool buf=%d\n", s.t_pool->buffer != NULL); fflush(stderr); }
+    if (s.t_amask->buffer) ggml_backend_tensor_set(s.t_amask, am.data(), 0, am.size() * 2);
     ggml_backend_tensor_set(s.t_pool, pw.data(), 0, pw.size() * 4);
-    if (getenv("GSV_REFENC_DEBUG")) {
-        fprintf(stderr, "[sets] t_in=%p t_mask=%p t_amask=%p t_pool=%p t_out=%p bufs: %d %d %d %d %d\n",
-                (void *) s.t_in, (void *) s.t_mask, (void *) s.t_amask, (void *) s.t_pool, (void *) s.t_out,
-                s.t_in->buffer != NULL, s.t_mask->buffer != NULL, s.t_amask->buffer != NULL,
-                s.t_pool->buffer != NULL, s.t_out->buffer != NULL);
-        fflush(stderr);
+    auto _tt0 = std::chrono::steady_clock::now();
+    if (getenv("GSV_REFENC_TIMING")) {
+        fprintf(stderr, "[refenc timing] host %.3f ms\n",
+                std::chrono::duration<double, std::milli>(_tt0 - _te0).count());
     }
     ggml_backend_graph_compute(s.backend, s.g);
+    if (getenv("GSV_REFENC_TIMING")) {
+        auto _tt1 = std::chrono::steady_clock::now();
+        fprintf(stderr, "[refenc timing] compute %.3f ms\n",
+                std::chrono::duration<double, std::milli>(_tt1 - _tt0).count());
+    }
+    if (getenv("GSV_REFENC_DEBUG")) {
+        const char * dumps[] = { "dbg_spectral", "dbg_temporal", "dbg_z", "dbg_attn", "dbg_fc" };
+        for (const char * nm : dumps) {
+            ggml_tensor * t = ggml_get_tensor(s.gctx, nm);
+            if (!t) continue;
+            std::vector<float> buf(ggml_nelements(t));
+            ggml_backend_tensor_get(t, buf.data(), 0, buf.size() * 4);
+            std::string fn = std::string("tests/golden/_mine_") + (nm + 4) + ".bin";
+            FILE * fp = fopen(fn.c_str(), "wb");
+            if (fp) { fwrite(buf.data(), 4, buf.size(), fp); fclose(fp); }
+        }
     }
     ggml_tensor * out = s.t_out;   // [1, 512] 池化和 / len
     std::vector<float> raw(ggml_nelements(out));

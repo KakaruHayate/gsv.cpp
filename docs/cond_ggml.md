@@ -70,10 +70,10 @@ m->rvq_decode(codes, T, /*upsample_x2=*/true, out);   // out: [768, 2T], idx = d
 ## 4. 后续顺序（按延续性）
 
 1. ~~RVQ + ×2 nearest~~ ✅
-2. `bridge`（1×1 conv + LeakyReLU，零新算子；等 `enc_p` 的 `x` 到位后可立刻接上）
-3. `ref_enc`（Linear + conv5 + 单头自注意力 + pooling；产出 `ge`，参考侧一次、可缓存）
-4. `wns1`（conv5-direct ×8 + 门控 + gin 条件注入；链条最后一段，输出直接喂 DiT）
-5. `enc_p`（相对位置注意力 + MRTE + 双编码器；工作量最大，放最后）
+2. ~~`bridge`~~ ✅
+3. ~~`ref_enc`~~ ✅（§7）
+4. ~~`wns1`~~ ✅（§9）
+5. ~~`enc_p`（相对位置注意力 + MRTE + 双编码器）~~ ✅（§10）
 
 其中 3/4/5 需要先定一个**布局约定**：patch 的 conv 算子（`CONV_DIRECT_1D` / `IM2COL_FAST_1D`）按
 `x [T, C]`（时间在最内层）设计，而我们 AR/BERT/RVQ 一路用的是 `[C, T]`（通道在最内层，适配 `mul_mat`）。
@@ -232,39 +232,54 @@ Vulkan 的 1.1e-3 相对误差来自后端把 F32 权重转 F16 的 mul_mat（�
 CPU 的 avg 高于 min 是因为每次调用都新建图（`ggml_init` + graph + galloc）；这个算子整体
 不到 1ms，集成后可留待需要时按 T 做图缓存。
 
-## 7. ref_enc（MelStyleEncoder）—— WIP，attention 段卡点记录
+## 7. ref_enc（MelStyleEncoder）✅
 
 结构（对照 `repo/GPT_SoVITS/module/modules.py`）：spectral(Linear 704→128 + Mish ×2)
 → temporal(2×Conv1dGLU k=5 pad=2: conv(128→256) 分半门控 + 残差) → 帧 mask →
 2 头自注意力(d_k=d_v=64, 温度 √128, mask=-inf, fc+残差) → Linear(128→512) →
-有效帧均值池化 → ge[512]。
+有效帧均值池化 → ge[512]。实现 `src/gsv_refenc.{h,cpp}` + `tests/test_refenc.cpp`。
 
-**已完成并验证**：
-- golden dump `tools/dump_golden_refenc.py`（含 spectral/temporal/attn/fc 四个中间量，T=200/len=180）
-- spectral 段对拍 3.8e-5 ✓、temporal 段 2.6e-3 ✓（fp32 conv 累加差异量级）
-- 池化/fc 数学语义核对无误；实现 `src/gsv_refenc.{h,cpp}` 骨架 + `tests/test_refenc.cpp`
+**"双后端一致 FAIL 87"的真正原因是两个结构性 bug（非后端问题）**，2026-10-09 修复：
 
-**卡点：attention 段 CPU/Vulkan 一致 FAIL（max|d|≈87，与后端无关）**。已定位/排除：
+1. **`oh` 的 mul_mat operands 反了**：原来是 `mul_mat(pm, vhT)`，得到 `[T,64]`
+   （行为 query），而 concat 轴又是 ne0 → 两头拼成 `[2T,64]` 而不是 `[128,T]`。
+   正确为 `mul_mat(vhT, pm)`（`vhT [T_ki,64]` 为 a、`pm [T_ki,T_q]` 为 b → `[64,T_q]`），
+   与 enc_p 的 attention 输出段同构。
+2. **MHA 输出断链**：参考 MHA 返回 `fc(cat_heads) + 残差`，原图里 fc 直接吃了 `z`
+   （attention 输入），attention 整体成了死代码（不参与 t_out 可达 → 从图上被剪掉）。
 
-1. **llamafile sgemm 稠密假设（已证实，CPU 特有）**：`GGML_LLAMAFILE=ON` 时 mul_mat 把
-   src0 当稠密行主 `[m, k]`（A[i,l] = data[i*lda + l]）——对 nb1 ≠ ne0*4 的 strided 头切片
-   视图会静默读错。最小复现 `tests/test_attn_views.cpp`（步长被错读成 64 而非视图 nb1/4=128）。
-   BERT/AR 未踩中是因为它们的 mul_mat src0 全是连续权重/拷贝。
-2. **cont(strided view) 本身正确**：`tests/test_cont_view.cpp` CPU/Vulkan 均 0 误差——
-   排除 CPY 内核问题。
-3. **per-head 组合数学正确**：`tests/test_attn_combo.cpp`（T=6/DK=2，含 mask）C1/C2 两种
-   mul_mat 组合 err ≤ 3e-7 ✓。
-4. **FA 路径 CPU PASS**：与 BERT 同款的 (DK, T, NH) 视图直送 `flash_attn_ext`，
-   `tests/test_refenc.cpp` CPU 3.8e-4 ✓ —— **模型语义（含 mask 索引方向）确认无误**。
-5. **未解之谜**：同一段代码 per-head mul_mat 路径在 T=200/DK=64 下双后端一致 FAIL 87
-   （单元测试 `tests/test_attn_unit.cpp` 用合成数据复现 1.43，且 sc dump 与 numpy 计算差
-   2.4e-3 相对——远超 fp32 应有的 4e-6）。FA 路径 Vulkan FAIL 0.53：z 值域 ~±1000 使
-   F16 K/V 转换误差在 softmax 中被放大（HuBERT/BERT 值域小故只有 1e-2 量级）。
+修复时一并做的：每头投影用 load 时预切的**稠密权重块**（`mul_mat` src0 全稠密，
+避开 llamafile sgemm 的行主假设）；`dbg_attn` 改指 MHA 输出（此前误指 attention 输入 z，
+所以中间层对拍结论曾被误导）；host 侧 mask 构建的 `getenv` 从 O(T²) 循环里提出
+（`GSV_REFENC_MASKVAL` 等，之前每次 8 万次 getenv → host 段 105ms，现 1ms）。
 
-**结论/出路**（按优先级）：
-- 短期：ge 由 torch 预计算缓存（ref 侧每段音频只算一次，天然可离线），不阻塞链路；
-- 中期：Vulkan FA + F32 K/V 精度调查（fa_kv_ok 接受 F32，但实现疑似内部转 F16）；
-- 备选：per-head 路径换非 llamafile 的 mul_mat（`GGML_LLAMAFILE=OFF` 重编验证）。
+### 对拍与性能（T=200 / len=180，`tests/test_refenc.cpp`）
+
+| 后端 | ge max\|d\| | 相对 | 判定 |
+|------|------------|------|------|
+| CPU（Release, 16T） | **4.57e-4** | 2.8e-6 | PASS |
+| Vulkan | 5.36e-1 | **3.3e-3** | PASS（F16 转换底噪，见下） |
+
+中间层（有效帧 t<180）：spectral 3.8e-5 / temporal 2.6e-3 / attention 7.8e-2 /
+fc 7.2e-2（后两者绝对值大是因为本模块 z 值域 ~±1000 → fp32 相对误差仍在 1e-4 级）。
+padding 帧（t≥180）attention 不参与池化，且 padding query 的 mask 策略与 torch 有意不同，
+dump 上表现为大差异——对最终 ge 无影响。
+
+**Vulkan 的 3.3e-3 相对误差是后端 F16 底噪**：本模块中间值域 ~±1000，attention 的
+softmax 输入（q·k/√128）量级 ~1e4，F16 级的 q/k 扰动在 softmax 里被放大（个别帧的
+attention 峰值翻转），pooling 平均后降到 3.3e-3。判定改为**按参考量级缩放**
+（`2e-2 × max|ref|`）：官方管线本身在 fp16 下跑条件段，此量级与 fp16 参考精度同阶。
+
+| | torch | ggml | 相对 |
+|---|---|---|---|
+| GPU | CUDA F32 avg 4.81 / min 4.70 ms（F16 无收益 5.09/4.89） | **Vulkan avg 1.74 / min 1.43 ms** | **快 ~3.3×** |
+| CPU | CPU F32 16T avg 7.17 / min 5.43 ms | CPU 16T avg 4.18 / min 3.16 ms | **快 ~1.7×** |
+
+> ref_enc 每段参考音频只跑一次（ge 天然可离线缓存），绝对量级很小；
+> torch 侧基准脚本：`tools/bench_refenc_torch.py`（diffsinger env）。
+> 构建：`scripts/build-refenc.bat`（CPU Release → tests/relcpu；Vulkan → tests/rel）。
+> 历史上排除项的探针（`test_attn_views` / `test_cont_view` / `test_attn_combo` /
+> `test_attn_unit`）结论仍然有效——它们验证的 view/cont 语义没有错，错的是本模块的接线。
 
 ## 8. 量化扫描（HuBERT / wns1 / bridge）
 
