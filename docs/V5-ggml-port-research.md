@@ -3,6 +3,8 @@
 > 调研范围：仅 V5 推理链路（`v5dev` / `v5turbo`）。
 > 代码基线：`RVC-Boss/GPT-SoVITS@cuda_graph_accel_v5`（a303508；本地 clone 到工作区外的 `./repo`，路径可用环境变量 `GSV_REPO` 指定）。
 > **状态更新（2026-10-06 第二轮）**：§6 选型问题已确认（见 §6 决策记录）；G2PW 版本核实与 v5turbo 机制核实结论已并入正文；v3/v4 condition 缓存 / DiffSinger 对照 / cache-dit 调研见 §3.5。
+>
+> **状态更新（2026-10-09）**：DiT/CFM 段已实现并对拍通过（[dit_ggml.md](dit_ggml.md)）；cache-dit 已按 §3.5.3 落地为可选特性——**32 步档有效（CPU −30~35%、Vulkan e2e −3~7%），4 步 turbo 无效**（v5turbo 确认为 **DMD（Distribution Matching Distillation）** 训练的 shortcut 模型，开发者证实；命中即劣化，与 §3.5.4 判断一致）。量化最小档 = 全 F16 651 MiB（Q8/Q6 FAIL）。
 
 ---
 
@@ -167,7 +169,7 @@ CFM 采样循环全部留 host（audio.cpp `synthesize_chunk` 同款）：timest
 
 - **结构上与 v5dev 完全同构**：完整 22 块 `transformer_blocks`、`time_embed` 有而 `d_embed` **不存在**、无 `long_skip`、enc_p 三段 encoder 层数（ssl 3 + text 6 + encoder2 3）与 MRTE/quantizer/ssl_proj 全部在位——**不是更小的 student 网络，也没有 shortcut 分支**。
 - ckpt 内嵌 config 与 v4 口径一致（sampling_rate 32000、semantic_frame_rate 25hz 等），`info` 显示由 `final_G_20018400_60_G_207000_40.pth` fp16 化并对齐 v4 keys 而来；训练代码（s2_train*.py）中无任何 turbo/distill 专用路径。
-- 结合仓库 `head2version`（b"08"→v5turbo）与 commit（ac846f5/3b95794 均只加推理端支持）判断：**v5turbo = 同一架构的独立训练 checkpoint，靠 shortcut 自蒸馏类训练目标把 32 步 Euler 的教师行为压进少步推理（4 步、cfg=0）**。训练细节未随分支发布（开源训练脚本无对应实现），但推理端没有隐藏分支——ggml 侧 v5turbo 与 v5dev 共用同一张图，只是 `steps=4, cfg=0` 的调度参数不同，且 cfg=0 可整体跳过 null 分支。**结论：它不是"单纯降低推理质量"的后处理，但也与 cache-dit 无关**——cache 是否要做的判据是"32 步档是否作为长尾质量档保留"：若 ggml 版把 v5dev 32 步作为质量档、v5turbo 4 步作为速度档，两者已构成质量-速度阶梯，cache-dit 优先级维持"首版不做、32 步档 parity 后作可选实验"（§3.5.3）。
+- 结合仓库 `head2version`（b"08"→v5turbo）与 commit（ac846f5/3b95794 均只加推理端支持）判断：**v5turbo = 同一架构的独立训练 checkpoint，靠 shortcut 自蒸馏类训练目标把 32 步 Euler 的教师行为压进少步推理（4 步、cfg=0）**；2026-10-09 经开发者确认具体为 **DMD（Distribution Matching Distillation）**。训练细节未随分支发布（开源训练脚本无对应实现），但推理端没有隐藏分支——ggml 侧 v5turbo 与 v5dev 共用同一张图，只是 `steps=4, cfg=0` 的调度参数不同，且 cfg=0 可整体跳过 null 分支。**结论：它不是"单纯降低推理质量"的后处理，但也与 cache-dit 无关**——cache 是否要做的判据是"32 步档是否作为长尾质量档保留"：若 ggml 版把 v5dev 32 步作为质量档、v5turbo 4 步作为速度档，两者已构成质量-速度阶梯，cache-dit 优先级维持"首版不做、32 步档 parity 后作可选实验"（§3.5.3）。
 
 ### 3.5 Condition 缓存 / shortcut 时间步 / cache-dit（第二轮补充调研）
 

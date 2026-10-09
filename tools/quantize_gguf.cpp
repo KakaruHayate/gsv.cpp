@@ -27,6 +27,29 @@ static ggml_type parse_type(const std::string & s) {
 
 // 与 tools/convert_ar.py / tools/convert_bert.py 的 ft() 保持一致的组划分
 static std::string group_of(const std::string & name) {
+    // dit. (DiT/CFM): 必须整体先于通用 fixed 规则——AdaLN 的 *.linear.weight 名字含 "norm"
+    // 会被通用规则误判为 per-channel norm; 而这些 linear 是 mul_mat 权重, 可量化。
+    if (name.rfind("dit.", 0) == 0) {
+        if (name.find(".bias") != std::string::npos) return "fixed";            // ggml_add 要求 F32
+        if (name.find("grn.") != std::string::npos) return "fixed";             // gamma/beta: mul/add 用
+        if (name.find(".norm.weight") != std::string::npos) return "fixed";     // ConvNeXtV2 LN (mul 用)
+        if (name.find("dwconv.weight") != std::string::npos) return "fixed";    // 手工 tap 循环用 ggml_mul (同类型)
+        if (name.find("inv_freq") != std::string::npos ||
+            name.find("freqs_cis") != std::string::npos) return "fixed";        // host 读取 / add 用
+        if (name.find(".transformer_blocks.") != std::string::npos) {
+            if (name.find(".attn.") != std::string::npos) return "dit.attn";
+            if (name.find(".ff.") != std::string::npos) return "dit.ffn";
+            if (name.find(".attn_norm.") != std::string::npos) return "dit.adaln";
+            return "dit.other";
+        }
+        if (name.find("norm_out.") != std::string::npos) return "dit.adaln";
+        if (name.find("proj_out.") != std::string::npos) return "dit.proj";
+        if (name.find("input_embed.proj.") != std::string::npos) return "dit.proj";
+        if (name.find("conv_pos_embed") != std::string::npos) return "dit.conv";
+        if (name.find("text_embed.") != std::string::npos) return "dit.text";
+        if (name.find("time_embed.") != std::string::npos) return "dit.time";
+        return "dit.other";
+    }
     const bool is_bert = name.rfind("bert.", 0) == 0;   // BERT encoder 张量 (bert.xxx)
     if (name.find("norm") != std::string::npos || name.find("_ln_") != std::string::npos ||
         (name.size() > 2 && name.compare(name.size() - 2, 2, "_b") == 0) ||
@@ -221,10 +244,26 @@ int main(int argc, char ** argv) {
             printf("  %-40s f16 (from %s)\n", name, ggml_type_name(t->type));
             continue;
         }
-        // 量化: 逐行块 (squeeze 时按 [ne1, ne2] 行)
+        if (tt == GGML_TYPE_F32) {   // F16 源 → F32 (固定组; F32 源已被上面的 copy 分支截获)
+            std::vector<float> b((size_t) ggml_nelements(t));
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) src, b.data(), (int64_t) ggml_nelements(t));
+            keep.emplace_back((const uint8_t *) b.data(), (const uint8_t *) b.data() + b.size() * sizeof(float));
+            gguf_set_tensor_data(out, name, keep.back().data());
+            printf("  %-40s f32 (from %s)\n", name, ggml_type_name(t->type));
+            continue;
+        }
+        // 量化: 逐行块 (squeeze 时按 [ne1, ne2] 行); F16 源先反量化成 F32 再量化
+        // (旧版直接把 F16 数据按 float* 读 → 2 倍越界且数值错乱)
+        std::vector<float> f32buf;
+        const float * src_f32 = (const float *) src;
+        if (t->type == GGML_TYPE_F16) {
+            f32buf.resize((size_t) ggml_nelements(t));
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) src, f32buf.data(), (int64_t) ggml_nelements(t));
+            src_f32 = f32buf.data();
+        }
         const size_t dst_size = ggml_row_size(tt, ne0) * nrows;
         std::vector<uint8_t> buf(dst_size);
-        const size_t written = ggml_quantize_chunk(tt, (const float *) src, buf.data(), 0, nrows, ne0, nullptr);
+        const size_t written = ggml_quantize_chunk(tt, src_f32, buf.data(), 0, nrows, ne0, nullptr);
         if (written != dst_size) { fprintf(stderr, "  [error] %s: quantize size %zu != %zu\n", name, written, dst_size); return 1; }
         keep.push_back(std::move(buf));
         gguf_set_tensor_data(out, name, keep.back().data());

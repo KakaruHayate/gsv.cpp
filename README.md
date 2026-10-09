@@ -14,10 +14,10 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
 | AR 引擎（`src/gsv_ar`：GGUF 加载 + 前端 + 生成循环 + 常驻 KV cache） | ✅ 引擎端到端对拍 5.7e-6 / token 一致；**性能 2.1×（bs=1）/ 1.7×（bs=3）于 torch eager**，见 [docs/benchmark_ar.md](docs/benchmark_ar.md) |
 | AR 单流延迟优化（bs=1） | ✅ Vulkan 5.08 → **2.40~2.45 ms/step（408~417 tok/s，-52%）**；bs=3 6.84 → 4.11~4.14（-40%）、bs=8 9.07 → 7.00（-23%）。TTFT（56 token 前缀）42 → **15.5 ms（-63%，bert 投影挪进图）**；三轮: strided 视图/去冗余建图 → 融合算子（LN 连残差/bias 一起吃，`wb=[w;b]` 加载时打包）→ 解码图缓存（`set_rows` 追加 KV，仅 GPU）；CPU 换 q8_attn_ffn 近无损档 19.6 → **9.1 ms（-54%）**；见 [docs/ar_latency.md](docs/ar_latency.md) |
 | AR 量化（最小近无损档） | ✅ **F16 158MB（TV 0.0002）/ attn+ffn Q8_0 89MB（TV 0.0035）**；低于此档 TV 翻倍，见 [docs/quant_ar.md](docs/quant_ar.md) |
-| BERT 前端（chinese-roberta-wwm-ext-large，22 层 encoder） | ✅ CPU 对拍 max\|Δ\| = 1.0e-5（逐层 23 个隐藏状态全部 cos=1.0）；Vulkan f16 **8.5 ms** / f32 10.6 ms（≈ torch 最快路径 5.9×），CPU **108~116 ms**（16 线程，已含融合算子）；**量化下限 F16 662MB**（Q8 及以下越 token 稳定阈值）；见 [docs/bert_ggml.md](docs/bert_ggml.md) |
+| BERT 前端（chinese-roberta-wwm-ext-large，22 层 encoder） | ✅ CPU 对拍 max\|Δ\| = 1.0e-5（逐层 23 个隐藏状态全部 cos=1.0）；Vulkan f16 **8.5 ms** / f32 10.6 ms（≈ torch 最快路径 5.9×），CPU **108~116 ms**（16 线程，已含融合算子）；量化：**F16 662MiB 为默认近无损档**，**Q8_0（emb F16）349.5MiB 经 token 稳定阈值标定 CPU 侧可用（+1.45× 提速）**（2026-10-09 改判），Q6_K 及以下拒绝；见 [docs/bert_ggml.md](docs/bert_ggml.md) |
 | HuBERT 音频前端（wav2vec2 CNN + 12 层 transformer） | ✅ ggml 图实现；对拍 CPU 6.7e-6 / Vulkan 1.5e-2；**Vulkan 7~9 ms vs torch CUDA 26 ms（约 3~4×）**，CPU ~105 ms vs torch CPU 84 ms；复用 audio-patch 的 fast-1D im2col（含 F32 im2col 档），见 [docs/cond_ggml.md](docs/cond_ggml.md) 第 5 节 |
-| 条件段（decode_encp 链: RVQ → ×2 → enc_p → bridge → ×2 → wns1） | 🚧 **RVQ ✅**（bit-exact）、**bridge ✅**（CPU 4.3e-6 / Vulkan 1.2e-2，≈ torch 速度，见 docs/cond_ggml.md 第 6 节）、**wns1 ✅**（CPU 6.5e-4 / Vulkan 3.6e-3；Vulkan 2.7 ms vs torch CUDA 9.5 ms = 3.6×，per-head conv 已换 audio-patch F32 im2col，CPU −32%）、**ref_enc 🚧 WIP**（spectral/temporal 已对拍 PASS；attention 段卡点已定位，见 docs/cond_ggml.md 第 7 节）、**enc_p ⬜**（权重已在 GGUF，235 张量） |
-| DiT（CFM + static cache，v5turbo 4 步） | ⬜ |
+| 条件段（decode_encp 链: RVQ → ×2 → enc_p → bridge → ×2 → wns1） | ✅ **全链完成**：RVQ（bit-exact）、bridge（CPU 4.3e-6 / Vulkan 1.2e-2，≈ torch 速度）、wns1（CPU 6.5e-4 / Vulkan 3.6e-3；Vulkan 2.7 ms vs torch CUDA 9.5 ms = 3.6×）、**ref_enc ✅**（attention 接线修复后 parity PASS，CPU+Vulkan，commit 73a35eb）、**enc_p ✅**（TextEncoder+MRTE，parity PASS CPU+Vulkan，commit 0c3070b）；**链式 e2e（RVQ→enc_p→bridge→wns1）parity PASS**（commit 8088bf9）；量化最小档见 docs/cond_ggml.md |
+| DiT（CFM + static cache，v5turbo 4 步） | ✅ 单步(t96/pad/t0)/4步/8步cfg(正负交替)/32步(v5dev)/分块 rolling 全对拍 PASS（CPU vel ≤1.2e-3、Vulkan ≤2.5e-2；te_pos 逐位一致）；**Vulkan 110.8 ms/步 @T=1000 ≈ torch CUDA（113.3）**，CPU f32 16 线程 1.44× 于 torch CPU；**量化最小档全 F16 = 651 MiB（1.98×↓，Q8 FAIL）**；**cache-dit（DBCache）可选：32 步档 CPU −30~35%、Vulkan e2e −3~7%（命中步 −40%），4 步 turbo（DMD 蒸馏）无效**；见 [docs/dit_ggml.md](docs/dit_ggml.md) |
 | vocoder（ONNX，fp32 严格不量化） | ✅ 导出 57.8MB / sha256 `13f95a88…`；对拍 max\|Δ\| ≤1.1e-4、corr 1.0；ORT-DML ≈ torch CUDA，ORT-CPU 快 torch 1.85×，见 [docs/vocoder_onnx.md](docs/vocoder_onnx.md) |
 
 ## 目录
@@ -31,6 +31,7 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
 - `docs/vocoder_onnx.md` — vocoder ONNX 导出（fp32 严格不量化、DML 动态形状陷阱）
 - `docs/bert_ggml.md` — BERT 前端（切层依据、逐层对拍、Vulkan 精度容限探针、量化扫描）
 - `docs/cond_ggml.md` — 条件段（V5 decode_encp 链）侦察 + RVQ 实现（链条入口，bit-exact）
+- `docs/dit_ggml.md` — DiT/CFM（cache/step 图、head0-only RoPE、分组 conv、GRN/mask 语义、对拍与基准）
 - `models/` — 权重（不入库）：s1v3.ckpt(AR) / s2Gv5turbo.pth / vocoder.pth / chinese-hubert-base / chinese-roberta-wwm-ext-large
 - `src/` — 引擎代码
   - `gsv_sampler.{h,cpp}`：AR 采样链（严格复刻 `AR/models/utils.py::logits_to_probs` 的顺序与语义）+ exp-trick 采样
@@ -40,9 +41,11 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
   - `gsv_wns1.{h,cpp}`：VITS WN Encoder（8 层 WaveNet + gin 条件；conv 内核可选 audio-patch 档，`GSV_WNS1_CONV`）
   - `gsv_refenc.{h,cpp}`：MelStyleEncoder（**WIP**：spectral/temporal PASS，attention 卡点见 docs/cond_ggml.md 第 7 节）
   - `gsv_hubert.{h,cpp}`：HuBERT 音频前端（CNN 前端 + 12 层 post-LN transformer；`GSV_HUBERT_DEVICE`/`BENCH`/`TIMING` 等）
+  - `gsv_dit.{h,cpp}`：DiT/CFM 生成器（cache 图 + pos/neg step 图三 gallocr、CFM host 循环、分块 rolling prompt；`GSV_DIT_DEVICE`/`GSV_DIT_DEBUG` 逐层探针）
 - `scripts/build-tests.bat` — 一键构建 ggml + 全部对拍可执行文件（VS2019 BuildTools，含 `/utf-8`；脚本须保持纯 ASCII）
 - `scripts/build-bert-vk.bat` — BERT Release+Vulkan 构建（用 `llama.cpp/build-vk-rel`，产物 `tests/rel/`）
 - `scripts/build-ar-vk.bat` — AR 基准/对拍 Release+Vulkan 构建（`tests/rel/bench_ar_rel.exe`、`test_ar_engine_rel.exe`）
+- `scripts/build-dit.bat` / `scripts/build-dit-vk.bat` — DiT 对拍/基准构建（`tests/relcpu/test_dit.exe` / `tests/rel/test_dit_rel.exe`）
 - `tools/` — 权重转换与 golden 导出（Python，diffsinger env）
   - `convert_ar.py`：s1v3.ckpt → `models/gsv-ar-f32.gguf`
   - `dump_golden_ar.py`：torch 侧 golden（step0 各段 + K/V cache + decode 步）
@@ -52,6 +55,9 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
   - `dump_golden_bert.py`：BERT golden（ids / hidden[-3] / 管线特征 / 逐层 hs0..22）
   - `bench_bert.py`：torch 侧 BERT 基准（CPU fp32 / GPU fp32 / GPU fp16）
   - `quantize_gguf.cpp`：GGUF 量化器（含 K-quants；`--spec` 分组同转换脚本）
+  - `convert_dit.py`：s2Gv5turbo.pth 的 `cfm.estimator` → `models/gsv-dit-f32.gguf`（proj 拆分、conv 重排）
+  - `dump_golden_dit.py` / `dump_golden_cfm.py`：DiT 单步（t96/pad/t0，含逐层探针）与 CFM 采样（4步/8步cfg/分块）golden
+  - `bench_dit.py`：torch 侧 DiT 基准（与 test_dit.cpp 的 `GSV_DIT_BENCH` 同 workload）
 - `tests/` — C++ 对拍（MSVC 链接 `llama.cpp/build-cpu` 的 ggml）
   - `test_ar_step0.cpp`：全前向对拍（支持 GSV_AR_DEBUG_LAYERS / TOKEN / RECALC）
   - `test_ar_decode.cpp`：增量 decode 对拍（KV cache，单序列）
@@ -61,6 +67,7 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
   - `test_bert_ggml.cpp`：BERT 对拍/基准（`GSV_BERT_DEVICE`/`MODEL`/`THREADS`/`LAYERS`，`--bench`）
   - `bench_ar.cpp`：AR 基准（bs=1/3/8，见 docs/benchmark_ar.md）
   - `test_min_ffn.cpp`：最小 LN+FFN 对拍（排查用）
+  - `test_dit.cpp`：DiT/CFM 对拍 + 基准（`GSV_DIT_DEVICE`/`GSV_DIT_BENCH`/`GSV_DIT_THREADS`；失败时打印误差最大位置与有效区/pad 区占比）
   - `golden/`（不入库）由上述 dump 脚本生成
 
 ## 获取 ggml 基线
