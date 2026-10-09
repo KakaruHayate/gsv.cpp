@@ -51,6 +51,7 @@ def main():
 
     def add(name, t):
         arr = t.detach().float().numpy()
+
         dt = pick(name)
         if dt == 'f16':
             arr = arr.astype(np.float16)

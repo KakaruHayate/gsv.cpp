@@ -7,6 +7,9 @@
 #include <vector>
 #include <string>
 #include <crtdbg.h>
+#include <chrono>
+#include <algorithm>
+#include <immintrin.h>
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -27,20 +30,43 @@ static struct ggml_tensor * need(struct ggml_context * c, const char * n){
 }
 static float gelu_erf(float x){ return 0.5f * x * (1.0f + erff(x / sqrtf(2.0f))); }
 
+static inline float dot_f32(const float * a, const float * b, int n){
+    __m256 s0=_mm256_setzero_ps(),s1=s0,s2=s0,s3=s0;
+    int i=0;
+    for(; i+32<=n; i+=32){
+        s0=_mm256_fmadd_ps(_mm256_loadu_ps(a+i),_mm256_loadu_ps(b+i),s0);
+        s1=_mm256_fmadd_ps(_mm256_loadu_ps(a+i+8),_mm256_loadu_ps(b+i+8),s1);
+        s2=_mm256_fmadd_ps(_mm256_loadu_ps(a+i+16),_mm256_loadu_ps(b+i+16),s2);
+        s3=_mm256_fmadd_ps(_mm256_loadu_ps(a+i+24),_mm256_loadu_ps(b+i+24),s3);
+    }
+    s0=_mm256_add_ps(_mm256_add_ps(s0,s1),_mm256_add_ps(s2,s3));
+    float tmp[8]; _mm256_storeu_ps(tmp,s0);
+    float r=tmp[0]+tmp[1]+tmp[2]+tmp[3]+tmp[4]+tmp[5]+tmp[6]+tmp[7];
+    for(; i<n; i++) r+=a[i]*b[i];
+    return r;
+}
+
 // conv1d no-pad: x[L][Cin] -> y[OL][Cout], w stored [K][Cin][Cout]
 static void conv1d_host(const std::vector<float> & x, int L, int Cin,
         const float * w, int Cout, int K, int s, std::vector<float> & y, int OL){
     y.assign((size_t)OL * Cout, 0.0f);
-    for(int o = 0; o < OL; o++){
-        const float * xo = &x[(size_t)(o * s) * Cin];
+    const int OB = 16;
+    #pragma omp parallel for schedule(static)
+    for(int ob = 0; ob < OL; ob += OB){
+        int oe = ob + OB; if(oe > OL) oe = OL;
         for(int k = 0; k < K; k++){
-            const float * xk = xo + (size_t)k * Cin;
             const float * wk = w + (size_t)k * Cin * Cout;
             for(int c = 0; c < Cin; c++){
-                float xv = xk[c];
                 const float * wc = wk + (size_t)c * Cout;
-                float * yo = &y[(size_t)o * Cout];
-                for(int oc = 0; oc < Cout; oc++) yo[oc] += xv * wc[oc];
+                for(int o = ob; o < oe; o++){
+                    float xv = x[(size_t)(o * s + k) * Cin + c];
+                    float * yo = &y[(size_t)o * Cout];
+                    __m256 xvv = _mm256_set1_ps(xv);
+                    int oc = 0;
+                    for(; oc + 8 <= Cout; oc += 8)
+                        _mm256_storeu_ps(yo+oc, _mm256_fmadd_ps(xvv, _mm256_loadu_ps(wc+oc), _mm256_loadu_ps(yo+oc)));
+                    for(; oc < Cout; oc++) yo[oc] += xv * wc[oc];
+                }
             }
         }
     }
@@ -61,6 +87,7 @@ static void pos_conv_host(const std::vector<float> & x, int T,
         const float * w, const float * bias, std::vector<float> & y){
     const int K = 128, G = 16, CG = 48, C = 768;
     y.assign((size_t)T * C, 0.0f);
+    #pragma omp parallel for schedule(static)
     for(int t = 0; t < T; t++){
         for(int g = 0; g < G; g++){
             for(int k = 0; k < K; k++){
@@ -89,14 +116,17 @@ static void layernorm_host(std::vector<float> & x, int T, int C, const float * w
 }
 static void linear_host(const std::vector<float> & x, int T, int Cin, const float * w, const float * b, int Cout, std::vector<float> & y){
     y.assign((size_t)T * Cout, 0.0f);
-    for(int t = 0; t < T; t++) for(int oc = 0; oc < Cout; oc++){
+    std::vector<float> xc = x;
+    #pragma omp parallel for schedule(static)
+    for(int oc = 0; oc < Cout; oc++){
         const float * wr = w + (size_t)oc * Cin;
-        const float * xr = &x[(size_t)t * Cin];
-        double acc = b[oc];
-        for(int c = 0; c < Cin; c++) acc += (double)xr[c] * wr[c];
-        y[(size_t)t * Cout + oc] = (float)acc;
-   
- }
+        float bias = b[oc];
+        for(int t = 0; t < T; t++){
+            const float * xr = &xc[(size_t)t * Cin];
+            float acc = bias + dot_f32(xr, wr, Cin);
+            y[(size_t)t * Cout + oc] = acc;
+        }
+    }
 }
 
 int main(int argc, char ** argv){
@@ -122,6 +152,17 @@ int main(int argc, char ** argv){
     std::vector<float> x((size_t)TRAW);
     for(int i=0;i<TRAW;i++) x[i]=(float)((raw[i]-m)/(sd+1e-7));
 
+    const std::vector<float> x0 = x;
+    const char * benche = getenv("GSV_HUBERT_BENCH");
+    int bench_n = benche ? atoi(benche) : 0;
+    int total = bench_n > 0 ? bench_n + 3 : 1;
+    std::vector<double> bts, cnn_ts, mid_ts, tr_ts;
+    float worst = 0;
+    std::vector<float> fp;
+    for(int it = 0; it < total; it++){
+    x = x0;
+    fp.clear();
+    auto bt0 = std::chrono::steady_clock::now();
     // host CNN frontend
     int L = TRAW, C = 1;
     char nm[128];
@@ -135,23 +176,23 @@ int main(int argc, char ** argv){
             const float * gb = (const float *)need(wctx, "hubert.feat_conv.0.norm_b")->data;
             groupnorm_host(y, CLEN[i], 512, gw, gb);
         }
-        for(auto & v : y) v = gelu_erf(v);
+        #pragma omp parallel for schedule(static)
+        for(int gi = 0; gi < (int)y.size(); gi++) y[gi] = gelu_erf(y[gi]);
         x = std::move(y); L = CLEN[i]; C = 512;
     }
-    float worst = 0;
-    snprintf(pb,512,"%s/hubert.cnn_out.bin",gold);
+    if(it==0){     snprintf(pb,512,"%s/hubert.cnn_out.bin",gold);
     std::vector<float> rc = load_bin(pb, (size_t)512*T);
     { float md=0; for(int ch=0;ch<512;ch++)for(int t=0;t<T;t++){ float d=fabsf(x[(size_t)t*512+ch]-rc[(size_t)ch*T+t]); if(d>md)md=d; }
-      printf("  %-10s max|d|=%.3e\n","cnn_out",md); if(md>worst)worst=md; }
+      printf("  %-10s max|d|=%.3e\n","cnn_out",md); if(md>worst)worst=md; } }
 
+    auto bt_cnn = std::chrono::steady_clock::now();
     // host feat_proj: LN(512) + Linear(512->768)
     layernorm_host(x, T, 512, (const float *)need(wctx,"hubert.feat_proj.norm_w")->data, (const float *)need(wctx,"hubert.feat_proj.norm_b")->data);
-    std::vector<float> fp;
     linear_host(x, T, 512, (const float *)need(wctx,"hubert.feat_proj.w")->data, (const float *)need(wctx,"hubert.feat_proj.b")->data, 768, fp);
-    snprintf(pb,512,"%s/hubert.feat_proj.bin",gold);
+    if(it==0){     snprintf(pb,512,"%s/hubert.feat_proj.bin",gold);
     std::vector<float> rfp = load_bin(pb, (size_t)768*T);
     { float md=0; for(size_t i=0;i<fp.size();i++){ float d=fabsf(fp[i]-rfp[i]); if(d>md)md=d; }
-      printf("  %-10s max|d|=%.3e\n","feat_proj",md); if(md>worst)worst=md; }
+      printf("  %-10s max|d|=%.3e\n","feat_proj",md); if(md>worst)worst=md; } }
 
     // host pos_conv + residual add
     std::vector<float> pos;
@@ -159,12 +200,13 @@ int main(int argc, char ** argv){
     for(size_t i=0;i<fp.size();i++) fp[i] += pos[i];
     // enc_in = LN(feat_proj + pos)
     layernorm_host(fp, T, 768, (const float *)need(wctx,"hubert.enc_norm_w")->data, (const float *)need(wctx,"hubert.enc_norm_b")->data);
-    snprintf(pb,512,"%s/hubert.enc_in.bin",gold);
+    if(it==0){     snprintf(pb,512,"%s/hubert.enc_in.bin",gold);
     std::vector<float> rei = load_bin(pb, (size_t)768*T);
     { float md=0; for(size_t i=0;i<fp.size();i++){ float d=fabsf(fp[i]-rei[i]); if(d>md)md=d; }
-      printf("  %-10s max|d|=%.3e\n","enc_in",md); if(md>worst)worst=md; }
+      printf("  %-10s max|d|=%.3e\n","enc_in",md); if(md>worst)worst=md; } }
 
 
+    auto bt_tr0 = std::chrono::steady_clock::now();
     // host 12-layer post-norm transformer (fp32, T=49)
     for(int li = 0; li < NL; li++){
         char base[128]; snprintf(base, 128, "hubert.layer.%d", li);
@@ -175,13 +217,14 @@ int main(int argc, char ** argv){
         // attention: q/k/v [T, NH*HD], heads split
         std::vector<float> attn((size_t)T * D, 0.0f);
         const float scale = 1.0f / sqrtf((float)HD);
+        #pragma omp parallel for schedule(static)
         for(int h = 0; h < NH; h++){
             std::vector<float> sc((size_t)T * T, 0.0f);
             for(int tq = 0; tq < T; tq++){
                 const float * qr = &q[(size_t)tq * D + h * HD];
                 for(int tk = 0; tk < T; tk++){
                     const float * kr = &k[(size_t)tk * D + h * HD];
-                    double acc = 0; for(int d = 0; d < HD; d++) acc += (double)qr[d] * kr[d];
+                    float acc = dot_f32(qr, kr, HD);
                     sc[(size_t)tq * T + tk] = (float)(acc * scale);
                 }
                 // softmax over row
@@ -192,9 +235,9 @@ int main(int argc, char ** argv){
             }
             for(int tq = 0; tq < T; tq++){
                 for(int d = 0; d < HD; d++){
-                    double acc = 0;
-                    for(int tk = 0; tk < T; tk++) acc += (double)sc[(size_t)tq * T + tk] * v[(size_t)tk * D + h * HD + d];
-                    attn[(size_t)tq * D + h * HD + d] = (float)acc;
+                    float acc = 0;
+                    for(int tk = 0; tk < T; tk++) acc += sc[(size_t)tq * T + tk] * v[(size_t)tk * D + h * HD + d];
+                    attn[(size_t)tq * D + h * HD + d] = acc;
                 }
             }
         }
@@ -204,19 +247,36 @@ int main(int argc, char ** argv){
         layernorm_host(fp, T, D, (const float *)need(wctx, (std::string(base)+".ln1_w").c_str())->data, (const float *)need(wctx, (std::string(base)+".ln1_b").c_str())->data);
         std::vector<float> h;
         linear_host(fp, T, D, (const float *)need(wctx, (std::string(base)+".ffn1_w").c_str())->data, (const float *)need(wctx, (std::string(base)+".ffn1_b").c_str())->data, 4*D, h);
-        for(auto & x : h) x = gelu_erf(x);
+        #pragma omp parallel for schedule(static)
+        for(int gi = 0; gi < (int)h.size(); gi++) h[gi] = gelu_erf(h[gi]);
         std::vector<float> h2;
         linear_host(h, T, 4*D, (const float *)need(wctx, (std::string(base)+".ffn2_w").c_str())->data, (const float *)need(wctx, (std::string(base)+".ffn2_b").c_str())->data, D, h2);
         for(size_t i = 0; i < fp.size(); i++) fp[i] += h2[i];
         layernorm_host(fp, T, D, (const float *)need(wctx, (std::string(base)+".ln2_w").c_str())->data, (const float *)need(wctx, (std::string(base)+".ln2_b").c_str())->data);
     }
 
+    auto bt1 = std::chrono::steady_clock::now();
+    if(it >= 3){
+        bts.push_back(std::chrono::duration<double, std::milli>(bt1 - bt0).count());
+        cnn_ts.push_back(std::chrono::duration<double, std::milli>(bt_cnn - bt0).count());
+        mid_ts.push_back(std::chrono::duration<double, std::milli>(bt_tr0 - bt_cnn).count());
+        tr_ts.push_back(std::chrono::duration<double, std::milli>(bt1 - bt_tr0).count());
+    }
+    }
     snprintf(pb,512,"%s/hubert.out.bin",gold);
     std::vector<float> ro = load_bin(pb, (size_t)D*T);
     { float md=0; double sa=0,sb=0,sab=0; for(int d=0;d<D;d++)for(int t=0;t<T;t++){ float a=fp[(size_t)t*D+d], b=ro[(size_t)t*D+d]; float e=fabsf(a-b); if(e>md)md=e; sa+=(double)a*a; sb+=(double)b*b; sab+=(double)a*b; }
       printf("  %-10s max|d|=%.3e cos=%.6f\n","hub_out",md,sab/(sqrt(sa)*sqrt(sb)+1e-30)); if(md>worst)worst=md; }
 
     gguf_free(gctx); ggml_free(wctx);
+    if(bench_n > 0 && !bts.empty()){
+        std::sort(bts.begin(), bts.end());
+        double bsum = 0; for(double bv : bts) bsum += bv;
+        printf("cpp host: avg %.3f ms min %.3f max %.3f n=%d\n", bsum / bts.size(), bts.front(), bts.back(), (int)bts.size());
+        double cs=0, ms=0, ts2=0;
+        for(double v:cnn_ts) cs+=v; for(double v:mid_ts) ms+=v; for(double v:tr_ts) ts2+=v;
+        if(!cnn_ts.empty()) printf("  seg: cnn %.1f mid %.1f tr %.1f ms\n", cs/cnn_ts.size(), ms/mid_ts.size(), ts2/tr_ts.size());
+    }
     printf(worst < 2e-2f ? "HUBERT PARITY PASS\n" : "HUBERT PARITY FAIL\n");
     return worst < 2e-2f ? 0 : 2;
 }

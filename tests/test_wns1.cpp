@@ -7,6 +7,8 @@
 #include <vector>
 #include <string>
 #include <crtdbg.h>
+#include <chrono>
+#include <algorithm>
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -72,12 +74,18 @@ int main(int argc, char ** argv){
     snprintf(pb,512,"%s/wns1.out.bin",gold); std::vector<float> rout = load_bin(pb, (size_t)C*T);
     std::vector<float> mask((size_t)T);
     for(int t = 0; t < T; t++) mask[t] = t < LEN ? 1.0f : 0.0f;
+    const char * benche = getenv("GSV_WNS1_BENCH");
+    int bench_n = benche ? atoi(benche) : 0;
+    int total = bench_n > 0 ? bench_n + 3 : 1;
+    std::vector<double> bts;
     float worst = 0;
-    // pre: Conv1d(512->512, k=1) * mask
     std::vector<float> x;
+    for(int it = 0; it < total; it++){
+    auto bt0 = std::chrono::steady_clock::now();
+    // pre: Conv1d(512->512, k=1) * mask
     conv1d_cm(xin, T, C, (const float *)need(wctx,"wns1.pre.weight")->data, (const float *)need(wctx,"wns1.pre.bias")->data, C, 1, 0, x);
     for(int c = 0; c < C; c++) for(int t = 0; t < T; t++) x[(size_t)c*T+t] *= mask[t];
-    { float md = maxdiff(x, rpre); printf("  %-10s max|d|=%.3e\n","pre_out",md); if(md>worst)worst=md; }
+    if(it==0)    { float md = maxdiff(x, rpre); printf("  %-10s max|d|=%.3e\n","pre_out",md); if(md>worst)worst=md; }
     // cond: gfull[t] = cond_w @ ge + cond_b, 8192 ch, sliced per layer
     const float * cw = (const float *)need(wctx,"wns1.enc.cond_layer.weight_w")->data;
     const float * cb = (const float *)need(wctx,"wns1.enc.cond_layer.bias")->data;
@@ -130,12 +138,20 @@ int main(int argc, char ** argv){
     }
     // enc out = skip-sum * mask; proj: Conv1d(512->512, k=1) * mask
     for(int c = 0; c < C; c++) for(int t = 0; t < T; t++) sk[(size_t)c*T+t] *= mask[t];
-    { float md = maxdiff(sk, renc); printf("  %-10s max|d|=%.3e\n","enc_out",md); if(md>worst)worst=md; }
+    if(it==0)    { float md = maxdiff(sk, renc); printf("  %-10s max|d|=%.3e\n","enc_out",md); if(md>worst)worst=md; }
     std::vector<float> yout;
     conv1d_cm(sk, T, C, (const float *)need(wctx,"wns1.proj.weight")->data, (const float *)need(wctx,"wns1.proj.bias")->data, C, 1, 0, yout);
     for(int c = 0; c < C; c++) for(int t = 0; t < T; t++) yout[(size_t)c*T+t] *= mask[t];
-    { float md = maxdiff(yout, rout); printf("  %-10s max|d|=%.3e\n","wns1_out",md); if(md>worst)worst=md; }
+    if(it==0)    { float md = maxdiff(yout, rout); printf("  %-10s max|d|=%.3e\n","wns1_out",md); if(md>worst)worst=md; }
+    auto bt1 = std::chrono::steady_clock::now();
+    if(it >= 3) bts.push_back(std::chrono::duration<double, std::milli>(bt1 - bt0).count());
+    }
     gguf_free(gctx); ggml_free(wctx);
+    if(bench_n > 0 && !bts.empty()){
+        std::sort(bts.begin(), bts.end());
+        double bs = 0; for(double bv : bts) bs += bv;
+        printf("cpp host: avg %.3f ms min %.3f max %.3f n=%d\n", bs / bts.size(), bts.front(), bts.back(), (int)bts.size());
+    }
     printf(worst < 2e-2f ? "WNS1 PARITY PASS\n" : "WNS1 PARITY FAIL\n");
     return worst < 2e-2f ? 0 : 2;
 }
