@@ -366,3 +366,61 @@ CPU 仍落后 1.8×：剩下的是纯 GEMM 吞吐差（oneDNN 直卷积 + AVX-51
 测试：`tests/test_hubert_ggml.cpp`（`GSV_HUBERT_DEVICE=vulkan` 切后端，`GSV_HUBERT_NTHREADS=N` 调线程、
 `GSV_HUBERT_BENCH=N` 基准，`GSV_HUBERT_ENCIN=<file>` 可用 golden enc_in 单测 g2）；
 torch 侧基准：`tools/bench_hubert_torch.py`（`python tools/bench_hubert_torch.py`，diffsinger env）。
+
+## 10. enc_p（V5 TextEncoder + MRTE）✅
+
+结构（`src/gsv_encp.{h,cpp}`，235 张量全部 F32）：
+`ssl_proj(768→192 1×1) → Encoder_ssl×3 → text_embedding(732→192) → Encoder_text×6 →
+MRTE → Encoder2×3 → proj(192→384) → split m/logs`。
+Encoder 层 = rel-pos MHA（heads=2, dk=96, window=4）+ ConvFFN(k=3, pad=1, ReLU)，均为 post-LN
+（自定义 LayerNorm：归一在**通道维**、参数名 gamma/beta）。MRTE = c_pre 192→512 →
+cross-attn（heads=4 dk=128，**注意其内部还有一层 conv_q/k/v**）+ cpre 残差 + ge → c_post。
+
+**rel-pos 是本段唯一的新算子**（torch `_rel_to_abs`/`_abs_to_rel` 的 ggml 复刻，见文件头注释）：
+
+- 核心是「pad→flatten→pad→reshape→slice」的索引重排，用 `concat`+`reshape_1d`+`view`
+  在图上表达；`R = mul_mat(emb_k[d,w], qh)` 得 [w, tq]，两侧 concat 零行成 `x_g [2T-1, T]`
+  （ggml 元素序恰等于 torch 行主 `x[tq, w]`）。
+- `_rel_to_abs` 后与主 scores 相加：**实测 ggml view 元素 `[i0,i1] = flat[T-1+i0+i1*(2T-1)]`
+  与 torch `rel[tq=i0, ki=i1]` 逐位一致**，直接相加即可（不需要转置）。
+- `_abs_to_rel(p)` 走对偶流程；`rel_v_pad` 由 `cont(transpose(emb_v))` 两侧 concat 零得到，
+  `out_v = mul_mat(evp, rw) → [dk, T]` 加进 `oh`。
+- 曾尝试用 `ggml_acc` 逐 band 写到对角线：**CPU 与 Vulkan 都失败**（写入位置/语义与
+  view 步进不符，sc 差 1.44）。留了最小探针 `tests/test_acc_probe.cpp` 记录 acc 的对角
+  写入语义（nb1=(T+1)*4 可行但当时 view 组合路径不可靠）——最终用上面的 pad+reshape 方案。
+- 零常量张量（pad 用）因为 galloc 分配后内容不保证，**每次 encode 前清零**；名字带
+  seg+li 后缀（`zname()`），否则多层的同名零张量会互相踩（这个坑导致过 `dbg_ssl_attn`
+  输出乱码 3e19）。
+- `m/logs` 的 split：`stats [384, T]` 上的 view 是非连续的（nb1=384*4），**必须 `ggml_cont`
+  后取回**，否则 CPU `tensor_get` 把 strided 视图按连续读（错位 → m/logs 差 1.7）。
+
+### 对拍（T=120 / ntext=50，`tests/test_encp.cpp`）
+
+| 后端 | m max\|d\| | logs max\|d\| | 判定 |
+|------|-----------|---------------|------|
+| CPU（Release, 16T） | **1.07e-6** | **8.94e-7** | PASS |
+| Vulkan | 3.50e-3 | 1.74e-3 | PASS（F16 转换误差，与 HuBERT/wns1 同因） |
+
+中间层借助 golden hook 定位（`GSV_ENCP_DEBUG=1` 转储 `_mine_*.bin`，见
+`tools/dump_golden_encp.py` 里的 `encp.stage_*` / `encp.hook_ssl_attn*`）：
+ssl 三层 attention 输出 5.5e-7、temb/text/mrte/enc2/stats 各段 1e-6 量级，
+`m/logs` 全链 PASS。期间修掉三类真实 bug：**x 的 [T,C]/[C,T] 转置**（输入 y 与输出 m/logs 各一次）、
+**零张量名字冲突**、**strided view 直读**。
+
+### 性能（vs torch，同机同输入）
+
+| | torch | ggml | 相对 |
+|---|---|---|---|
+| GPU | CUDA F32 avg 78.9 / **min 66.3** ms（F16 无收益 79.2/73.2） | **Vulkan avg 8.7 / min 8.1** ms | **快 ~8×** |
+| CPU | CPU F32 16T avg 107 / **min 89** ms | CPU 16T avg 41.6 / **min 33.0** ms | **快 ~2.7×** |
+
+> **CPU 基准的 build 说明（重要）**：`tests/` 目录里预置的 `ggml-cpu.dll` 是 **Debug** build
+> （/Od /Ob0），上面所有 CPU 基准必须用 Release build。本模块用 `scripts/build-encp.bat`
+> （link `llama.cpp/build-rel`，GGML_LLAMAFILE=ON + AVX2）→ 输出 `tests/relcpu/` 连 DLL 一起跑；
+> 用 Debug DLL 同样代码是 313+ ms（差 ~8×），会得出"ggml CPU 落后"的错误结论
+> （`llama.cpp/build-vk-rel` 无 LLAMAFILE，也慢 ~2.5×，Vulkan 基准中不动 CPU 部分即可）。
+> torch 侧基准脚本：`tools/bench_encp_torch.py`（diffsinger env，`torch.set_num_threads(16)`）。
+
+测试：`tests/test_encp.cpp [gguf] [golden_dir]`（`GSV_ENCP_DEVICE=vulkan` 切后端、
+`GSV_ENCP_THREADS=N` 调线程、`GSV_ENCP_BENCH=N` 基准、`GSV_ENCP_DEBUG=1` 转储中间张量）；
+Vulkan 构建：`scripts/build-encp-vk.bat`；CPU Release 构建：`scripts/build-encp.bat`。
