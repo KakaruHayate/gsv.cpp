@@ -364,6 +364,18 @@ Q8_0**（`vec_dot_type`），误差是权重+激活双份；enc_p 的 attention�
 整链（Tc=40→T=80→160）耗时：F32 86ms（CPU 16T）/ 12.7ms（VK）→ 最小档 93ms / 10.9ms
 （Vulkan 快 ~15%，CPU 因激活量化的去量化开销略慢；CPU 不是该段目标）。
 
+复现命令（基线 `models/gsv-cond-f32.gguf`）：
+
+```
+# 全 F16 档 (91.1 MiB)
+./tools/quantize_gguf.exe models/gsv-cond-f32.gguf models/gsv-cond-f16.gguf --default f32 \
+  --spec "enc_p.rel=f16,enc_p.attn=f16,enc_p.ffn=f16,enc_p.mrte=f16,enc_p.emb=f16,enc_p.sslproj=f16,enc_p.proj=f16,ref_enc.spectral=f16,ref_enc.temporal=f16,ref_enc.attn=f16,ref_enc.fc=f16,wns1=f16,bridge=f16,rvq=f16"
+# 最小档 (82.7 MiB): 同上前缀 + wns1=q8_0, bridge=f16, rvq=q8_0
+./tools/quantize_gguf.exe models/gsv-cond-f32.gguf models/gsv-cond-min.gguf --default f32 \
+  --spec "(同上前缀),wns1=q8_0,bridge=f16,rvq=q8_0"
+# 对拍: tests/*/test_cond_chain <cond_gguf> <encp_gguf> tests/golden（两个参数可同传一份文件）
+```
+
 ## 9. WNS1（VITS WN Encoder）—— 已落地（ORCATERM 实现 + conv 内核优化）
 
 结构：pre Conv1d(512→512,k=1) ×mask → 8 层 WaveNet（in_layers k=5 pad=2、cond_layer k=1 的
