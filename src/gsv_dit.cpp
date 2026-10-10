@@ -87,9 +87,7 @@ struct gsv_dit::impl {
         ggml_tensor * in_x = nullptr, * in_t = nullptr, * out = nullptr;
     };
     struct db_branch {
-        db_graph front, mid, head;
-        ggml_cgraph * g_add = nullptr;
-        ggml_gallocr_t gal_add = nullptr;
+        db_graph front, mid, head, head_hit;   // head_hit 把命中步的 add 融进来 (省一次 submit + x_mid 往返)
         ggml_tensor * fd_t = nullptr;      // front 图的 fd 标量 (device, 读回 1 float)
         int   cached_steps = 0, cont = 0, hits = 0, misses = 0;
         bool  valid = false;               // 首次全算 (miss) 前不可命中
@@ -375,7 +373,7 @@ struct gsv_dit::impl {
     bool run_step(step_graph & sg, const float * x_mel, float t, float * vel);
 
     // ---------------- cache-dit (DBCache 三段式; vipshop/cache-dit 语义) ----------------
-    bool db_ensure();                       // 按当前 T 建 device 张量 + 每分支 front/add/mid/head 图
+    bool db_ensure();                       // 按当前 T 建 device 张量 + 每分支 front/mid/head/head_hit 图
     void db_release();                      // 释放 db 图 + 张量 (+ 状态复位)
     void db_reset_state();                  // 只复位计数/门控状态 (每次采样开始时调用)
     bool run_step_cached(int bi, const float * x_mel, float t, float * vel);
@@ -789,7 +787,7 @@ bool gsv_dit::impl::run_step(step_graph & sg, const float * x_mel, float t, floa
 // 段结构 (vipshop/cache-dit 语义, 参考 CachedBlocks_Pattern_Base.forward):
 //   front 图:  trunk(x_in) -> 前 Fn 块 -> x_F; 存档 x_F、Fn 残差 R = x_F - trunk;
 //              fd = mean|R - R_prev| / mean|R_prev| (device 侧归约, 回读 1 float)
-//   add 图 (命中): x_mid = x_F + Mn残差_prev   [apply_cache: hidden = Bn_buffer + hidden]
+//   head_hit 图 (命中): x_mid = x_F + Mn残差_prev 后直接 norm_out/proj_out [add 融合, 省一次 submit]
 //   mid 图 (未命中): x_F -> 第 Fn..DEPTH 块 -> x_M; 存档 Mn残差 = x_M - x_F、R -> R_prev
 //   head 图:  x_mid -> norm_out -> proj_out -> vel (每步都算)
 // 命中前提 (can_cache): 非 warmup、fd < threshold、max_cached/max_cont/max_accum 三道闸。
@@ -801,9 +799,9 @@ void gsv_dit::impl::db_release() {
         if (d.front.galloc) { ggml_gallocr_free(d.front.galloc); d.front.galloc = nullptr; }
         if (d.mid.galloc)   { ggml_gallocr_free(d.mid.galloc);   d.mid.galloc   = nullptr; }
         if (d.head.galloc)  { ggml_gallocr_free(d.head.galloc);  d.head.galloc  = nullptr; }
-        if (d.gal_add)      { ggml_gallocr_free(d.gal_add);      d.gal_add      = nullptr; }
-        d.front = db_graph(); d.mid = db_graph(); d.head = db_graph();
-        d.g_add = nullptr; d.fd_t = nullptr;
+        if (d.head_hit.galloc) { ggml_gallocr_free(d.head_hit.galloc); d.head_hit.galloc = nullptr; }
+        d.front = db_graph(); d.mid = db_graph(); d.head = db_graph(); d.head_hit = db_graph();
+        d.fd_t = nullptr;
     }
     if (dbbuf) { ggml_backend_buffer_free(dbbuf); dbbuf = nullptr; }
     if (dbctx) { ggml_free(dbctx); dbctx = nullptr; }
@@ -884,17 +882,6 @@ bool gsv_dit::impl::db_ensure() {
             d.front.in_x = x_in; d.front.in_t = t_in;
             d.fd_t = fd;
         }
-        {   // add (命中): x_mid = x_F + Mn残差_prev
-            ggml_tensor * xm = ggml_add(c, db_x_front[b], db_mr_prev[b]);
-            ggml_tensor * c_xm = ggml_cpy(c, xm, db_x_mid[b]);
-            ggml_set_output(c_xm);
-            d.g_add = ggml_new_graph_custom(c, 64, false);
-            ggml_build_forward_expand(d.g_add, c_xm);
-            d.gal_add = ggml_gallocr_new(ggml_backend_get_default_buffer_type(s_back));
-            if (!ggml_gallocr_alloc_graph(d.gal_add, d.g_add)) {
-                fprintf(stderr, "[gsv_dit] db add graph alloc failed\n"); return false;
-            }
-        }
         {   // mid (未命中): x_F -> 第 Fn..DEPTH 块 -> x_M; 存档 Mn 残差与 R
             ggml_tensor * t_in = ggml_new_tensor_1d(c, GGML_TYPE_F32, 256);
             ggml_set_input(t_in); ggml_set_name(t_in, "db_in_t_mid");
@@ -930,6 +917,21 @@ bool gsv_dit::impl::db_ensure() {
             }
             d.head.in_t = t_in;
             d.head.out = out_t;
+        }
+        {   // head_hit: x_mid = x_F + Mn残差_prev (add 融合) -> norm_out/proj_out -> vel
+            ggml_tensor * t_in = ggml_new_tensor_1d(c, GGML_TYPE_F32, 256);
+            ggml_set_input(t_in); ggml_set_name(t_in, "db_in_t_head_hit");
+            ggml_tensor * t_emb = time_embed(c, t_in);
+            ggml_tensor * xm = ggml_add(c, db_x_front[b], db_mr_prev[b]);
+            ggml_tensor * out_t = build_head(c, xm, t_emb, negative);
+            d.head_hit.g = ggml_new_graph_custom(c, 4096, false);
+            ggml_build_forward_expand(d.head_hit.g, out_t);
+            d.head_hit.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(s_back));
+            if (!ggml_gallocr_alloc_graph(d.head_hit.galloc, d.head_hit.g)) {
+                fprintf(stderr, "[gsv_dit] db head_hit graph alloc failed\n"); return false;
+            }
+            d.head_hit.in_t = t_in;
+            d.head_hit.out = out_t;
         }
     }
     db_T = Tt;
@@ -978,12 +980,15 @@ bool gsv_dit::impl::run_step_cached(int bi, const float * x_mel, float t, float 
     if (fd > 0.0f) d.acc += fd;              // 累计残差 diff (仅正值; 对应 add_residual_diff)
 
     if (hit) {
-        // ---- add (命中): x_mid = x_F + Mn残差_prev; 跳过 middle ----
+        // ---- 命中: x_mid = x_F + Mn残差_prev 已融进 head_hit 图 (省一次 submit 与 4MB cpy) ----
+        ggml_backend_tensor_set(d.head_hit.in_t, ts.data(), 0, 256 * 4);
         t0 = now();
-        if (ggml_backend_graph_compute(s_back, d.g_add) != GGML_STATUS_SUCCESS) {
-            fprintf(stderr, "[gsv_dit] db add compute failed\n"); return false;
+        if (ggml_backend_graph_compute(s_back, d.head_hit.g) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "[gsv_dit] db head_hit compute failed\n"); return false;
         }
         ms_add = std::chrono::duration<double, std::milli>(now() - t0).count();
+        t0 = now();
+        ggml_backend_tensor_get(d.head_hit.out, vel, 0, (size_t) MEL * T * 4);
         d.hits++; d.cached_steps++; d.cont++;
     } else {
         // ---- mid (未命中): 全算 middle, 存档 Mn 残差 / R ----
@@ -994,17 +999,17 @@ bool gsv_dit::impl::run_step_cached(int bi, const float * x_mel, float t, float 
         }
         ms_mid = std::chrono::duration<double, std::milli>(now() - t0).count();
         d.misses++; d.valid = true; d.cont = 0;
-    }
 
-    // ---- head (每步) ----
-    ggml_backend_tensor_set(d.head.in_t, ts.data(), 0, 256 * 4);
-    t0 = now();
-    if (ggml_backend_graph_compute(s_back, d.head.g) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "[gsv_dit] db head compute failed\n"); return false;
+        // ---- head (经 x_mid) ----
+        ggml_backend_tensor_set(d.head.in_t, ts.data(), 0, 256 * 4);
+        t0 = now();
+        if (ggml_backend_graph_compute(s_back, d.head.g) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "[gsv_dit] db head compute failed\n"); return false;
+        }
+        ms_head = std::chrono::duration<double, std::milli>(now() - t0).count();
+        t0 = now();
+        ggml_backend_tensor_get(d.head.out, vel, 0, (size_t) MEL * T * 4);
     }
-    ms_head = std::chrono::duration<double, std::milli>(now() - t0).count();
-    t0 = now();
-    ggml_backend_tensor_get(d.head.out, vel, 0, (size_t) MEL * T * 4);
     const double ms_vel = std::chrono::duration<double, std::milli>(now() - t0).count();
     const double ms_all = std::chrono::duration<double, std::milli>(now() - t_all0).count();
 
@@ -1018,7 +1023,7 @@ bool gsv_dit::impl::run_step_cached(int bi, const float * x_mel, float t, float 
 
 bool gsv_dit::velocity(const float * x_mel, float t, bool negative, float * vel) {
     impl & s = *p;
-    if (s.dbc.fn > 0) {                       // cache-dit 路径 (front/add|mid/head 分段图)
+    if (s.dbc.fn > 0) {                       // cache-dit 路径 (front -> mid|head_hit -> head 分段图)
         if (s.T <= 0 || (!s.db_T && !s.db_ensure())) {
             fprintf(stderr, "[gsv_dit] velocity() before prepare()\n"); return false;
         }

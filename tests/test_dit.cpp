@@ -461,13 +461,14 @@ int main(int argc, char ** argv) {
             { "s4c0",   96, 32, 4,  0.0f, "fn=12,thr=0.15,warmup=1" },
             { "s4c0",   96, 32, 4,  0.0f, "fn=8,thr=0.25,warmup=0" },      // 激进档 (game.cpp 默认阈值)
             { "s32c13", 96, 32, 32, 1.3f, "" },                            // v5dev 32 步
+            { "s32c13", 96, 32, 32, 1.3f, "fn=4,thr=0.12,warmup=8" },
             { "s32c13", 96, 32, 32, 1.3f, "fn=8,thr=0.08,warmup=8" },
             { "s32c13", 96, 32, 32, 1.3f, "fn=8,thr=0.12,warmup=8" },
             { "s32c13", 96, 32, 32, 1.3f, "fn=12,thr=0.12,warmup=8" },
             { "s32c13", 96, 32, 32, 1.3f, "fn=16,thr=0.20,warmup=8" },
         };
         const char * names[] = { "s4c0 turbo", "s4c0 F8/.10", "s4c0 F12/.15", "s4c0 F8/.25-a",
-                                 "s32c13 参考", "s32c13 F8/.08", "s32c13 F8/.12",
+                                 "s32c13 参考", "s32c13 F4/.12", "s32c13 F8/.08", "s32c13 F8/.12",
                                  "s32c13 F12/.12", "s32c13 F16/.20" };
         for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
             std::vector<float> & rf = (std::string(cases[i].tag) == "s4c0") ? ref4 : ref32;
@@ -482,11 +483,12 @@ int main(int argc, char ** argv) {
             { "s4c0_big",   1000, 500, 4,  0.0f, "" },
             { "s4c0_big",   1000, 500, 4,  0.0f, "fn=8,thr=0.10,warmup=1" },
             { "s32c13_big", 1000, 500, 32, 1.3f, "" },
+            { "s32c13_big", 1000, 500, 32, 1.3f, "fn=4,thr=0.12,warmup=8" },
             { "s32c13_big", 1000, 500, 32, 1.3f, "fn=8,thr=0.08,warmup=8" },
             { "s32c13_big", 1000, 500, 32, 1.3f, "fn=8,thr=0.12,warmup=8" },
         };
         const char * bnames[] = { "big s4c0 参考", "big s4c0 F8/.10", "big s32c13 参考",
-                                  "big s32c13 F8/.08", "big s32c13 F8/.12" };
+                                  "big s32c13 F4/.12", "big s32c13 F8/.08", "big s32c13 F8/.12" };
         for (size_t i = 0; i < sizeof(bigs) / sizeof(bigs[0]); i++) {
             std::vector<float> & rf = (std::string(bigs[i].tag) == "s4c0_big") ? ref4b : ref32b;
             ab_run(mdl, gdir, bnames[i], bigs[i], rf);
