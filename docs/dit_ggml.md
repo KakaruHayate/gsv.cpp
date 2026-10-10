@@ -74,6 +74,11 @@ golden（`tools/dump_golden_dit.py` + `dump_golden_cfm.py`，torch 真实实现�
 > CPU 注意 ggml 默认 4 线程：不设 `GSV_DIT_THREADS` 时 ~6356 ms，16 线程 3039 ms，32 逻辑核反而回退（3564 ms）。
 > torch 侧脚本 `tools/bench_dit.py --device cpu --threads 16`（同 workload）。
 
+> **coopmat2**：本段从首测起就是默认口径（未设 `GGML_VK_DISABLE_COOPMAT2`）。受控 A/B（T=1000 单步）：
+> coopmat2 关（回退 KHR_coopmat）177.8 ms、连 KHR_coopmat 也关 346.8 ms、开 **107.7 ms** ——
+> 张量核已吃满 3.2×，且 110 项对拍在 coopmat2 开的条件下全 PASS。其他组件的 coopmat2 复评
+> （BERT/HuBERT/条件段，2026-10-10）以本段为先例，见各 doc 复评节；AR 是唯一必须关闭的（logits Δ 6×）。
+
 ## 4. 踩坑记录（本次定位的 4 个根因，值 O(1) 级别，全部由逐层探针定位）
 
 1. **gallocr 共享**：cache 图与 step 图、pos/neg step 图之间共享一个 `ggml_gallocr` 时，后一张图的

@@ -526,3 +526,19 @@ golden：`tools/dump_golden_chain.py`；构建：`scripts/build-chain.bat`
 
 > 量化档位（§8 表）：`gsv-cond-f16.gguf`（91.1 MiB）与 `gsv-cond-min.gguf`（82.7 MiB）
 > 的整链 fea 在 CPU/Vulkan 都已在 `tests/test_cond_chain.cpp` 下验证 PASS。
+
+## 12. coopmat2 复评（2026-10-10）：条件段与 HuBERT 默认开
+
+条件段各组件的 Vulkan 数字历史同为 AR 口径（`GGML_VK_DISABLE_COOPMAT2=1`）。同段配对复测：
+
+| 组件 | off（旧口径） | on（新默认） | 速度 | 精度 max\|d\|（off → on，全 PASS） |
+|---|---|---|---|---|
+| enc_p | 11.67 / 10.33 ms | 7.77 / 7.01 ms | **−33%** | m 9.0e-4→3.5e-3；logs 2.3e-4→1.7e-3；y 8.8e-4→4.7e-3 |
+| 整链（Tc=40） | 16.06 / 15.48 ms | 12.37 / 11.99 ms | **−23%** | fea 4.1e-4→3.0e-3（rel 2.0e-4→1.5e-3） |
+| HuBERT（§5） | 12.5 / 11.4 ms | 11.1 / 9.7 ms | −11~15% | 1.215e-2→1.487e-2（+22%） |
+| ref_enc（§7） | —（未测速度） | — | — | ge rel 2.83e-3→3.30e-3（+17%） |
+| wns1（§9） | 2.77 ms | 2.74 ms | 持平（conv 主导，不吃） | 5.7e-4→2.9e-3（~5×） |
+
+**结论：条件段与 HuBERT 默认开 coopmat2**：误差升 1.2~7× 但全部在各自验收阈值内（wns1 的升幅
+绝对值 2.9e-3 相对其量程可忽略）；首次吃满张量核的条件段整链 −23%。要复现旧口径时进程启动前设
+`GGML_VK_DISABLE_COOPMAT2=1`。

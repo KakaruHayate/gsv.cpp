@@ -202,9 +202,9 @@ gsv_bert * gsv_bert::load(const std::string & gguf_path, const gsv_bert_cfg & cf
             }
         if (!dev) { fprintf(stderr, "[gsv_bert] no usable backend device\n"); delete m; return nullptr; }
         if (cfg.verbose) printf("[gsv_bert] device: %s (%s)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
-        if (want_gpu && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
-            getenv("GGML_VK_DISABLE_COOPMAT2") == nullptr)
-            fprintf(stderr, "[gsv_bert] warning: Vulkan coopmat2 未禁用, 精度会下降; 请在进程启动前设置 GGML_VK_DISABLE_COOPMAT2=1\n");
+        // coopmat2 默认开 (2026-10-10 复评): T>=256 时快 21~27%、T=25 持平; 精度 max|Δ|
+        // 6.6e-3 -> 3.9e-2 (仍 < 5e-2 阈值, token 稳定余量 ~100x)。见 docs/bert_ggml.md §7。
+        // 需要逐位复现旧口径时进程启动前设 GGML_VK_DISABLE_COOPMAT2=1。
     }
     s.backend = ggml_backend_dev_init(dev, nullptr);
     if (!s.backend) { fprintf(stderr, "[gsv_bert] backend init failed\n"); delete m; return nullptr; }
