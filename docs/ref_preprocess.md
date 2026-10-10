@@ -107,20 +107,25 @@ w0/w1 两个 [IC,OC] + codebook）+ `tools/export_resampy_filter.py`（→ resam
 - **全链（wav→重采样→z-score→我们的 HuBERT→ssl_proj→argmin）**：codes 与 torch 的匹配率
   **83% / 89% / 80%** —— 差异全部来自我们 HuBERT 本身的输出偏差（下表），非 refcode 段。
 
-### 5.1 待查：HuBERT 变长在真实语音上的偏差（已暴露，未解决）
+### 5.1 "HuBERT 变长偏差" 已定位：测试输入口径不一致（非引擎问题）
 
-`gsv_hubert` 本次补了变长（按 T 重建两张图 + pos_conv host 内核按 56 帧分块；自一致性 ✓
-逐位可重复、跨长度重建无状态问题），但用 **真实语音** input 时与 torch 的 ssl 存在偏差：
+初测时全链 codes 匹配率只有 80~89%、ssl 差 0.09~6 —— 追查结论：**不是 HuBERT 的实现问题**，
+而是**测试与 golden 的输入口径不一致**：`dump_golden_refcode.py` 按 repo 生产路径
+（`cnnhuhbert_model.model(wav16k)`）喂**原始 16k 波形**，而测试当时先做了 z-score
+（Wav2Vec2FeatureExtractor 的口径）。统一口径后：
 
-| 素材 | T | 我们的 ssl vs torch max\|d\|（refmax≈4.8） |
-|---|---|---|
-| zhs 4.4s | 248 | 0.38（集中在首块，后段 0.07~0.2） |
-| en 5.6s | 307 | 0.087（较均匀） |
-| zh32 14.3s | 745 | **6.06（集中在前 112 帧），后段 0.1~1.2** |
+| 项 | zhs (T=248) | en (T=307) | zh32 (T=745, 14.3s) |
+|---|---|---|---|
+| 我们的 HuBERT ssl vs torch | **2.3e-5** | **1.8e-5** | **4.8e-4** |
+| 全链 codes vs torch | **124/124 (100%)** | **153/153 (100%)** | **372/372 (100%)** |
 
-对照：**T=49 的合成输入 golden 仍是 6.7e-6**（原对拍）→ 说明问题出在"变长 + 真实语音
-（含前导低能量段）"的组合，怀疑点按优先级：(1) pos_conv 左补零段在长 T 下的行为（56 帧分块
-边界/索引）；(2) 12 层 transformer 在长 T 下的 FA/数值；(3) z-score 口径的细微差异。
-定位手段已就绪：可对 pre-pos feat / post-pos feat 逐段 hook 对拍（torch 侧 hook
-`feature_projection` / `pos_conv` 即可）。**在此问题解决前，全链 codes 匹配率 ~80~90% 是上限；**
-refcode 段本身（golden ssl → codes）已逐帧一致，可独立使用。
+分段定位（`tests/probe_hubert_stages.cpp` + `tools/dump_golden_hubert_stages.py`，torch 侧逐段 dump
+feature_projection / pos_conv / LN / 逐层）：g1out(feature_projection) 7.2e-6、全链 ssl 7.7e-6、
+用 torch 的 LN 输出隔离 g2 为 0 —— 即 CNN 前端 / pos_conv / LN / 12 层 transformer 全部对齐。
+**结论：HuBERT 变长（按 T 重建图 + pos_conv 内核 56 帧分块）精度合格**，T=49 的合成输入 golden
+仍 6.0e-6；本节的 0.09~6 是口径问题。
+
+> 口径说明（管线要注意）：repo 的参考 token 路径**不做 z-score**（直接把 `torchaudio.load` 的
+> float 波形喂 HubertModel；归一化只在 Wav2Vec2FeatureExtractor 里，而那条路径绕过了它）。
+> 旧的 T=49 对拍 golden 用的是"手工 z-score 后喂模型"的口径（脚本自洽）——引擎本身与口径无关，
+> **是否 z-score 由调用方决定**，管线按 repo 走"原始波形"。

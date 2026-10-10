@@ -22,7 +22,9 @@ public:
     static gsv_hubert * load(const std::string & gguf_path, const gsv_hubert_cfg & cfg);
     ~gsv_hubert();
 
-    // audio_norm: z-score 后的 16kHz 音频 (变长; >= 720 采样, 帧数 = (n-400)/320+1)
+    // audio: 16kHz 单声道波形 (变长; >= 720 采样, 帧数 = (n-400)/320+1)。
+    //        是否 z-score 由调用方决定: repo 的参考 token 路径喂原始波形 (不做归一化);
+    //        旧 T=49 golden 用的是"手工 z-score 后喂模型"的口径。
     // out        : [768, T] 行主序 (idx = d + t*768), 即 encoder last_hidden_state^T
     //              帧数或采样数变化时自动重建图 (与 wns1 同款按需重建)
     bool encode(const float * audio_norm, int n_samples, std::vector<float> & out);

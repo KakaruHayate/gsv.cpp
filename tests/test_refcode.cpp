@@ -51,16 +51,13 @@ int main(int argc, char ** argv) {
     const std::string hubg = argc > 3 ? argv[3] : "models/gsv-hubert-f32.gguf";
     const std::string rcg  = argc > 4 ? argv[4] : "models/gsv-refcode.gguf";
 
-    fprintf(stderr, "[dbg] main enter\n");
     if (!gsv_refcode::load_filter_table("models/resampy_kaiser_best.bin")) {
         fprintf(stderr, "filter table 缺失 (先跑 tools/export_resampy_filter.py)\n"); return 1;
     }
     gsv_refcode_cfg rcfg;
     if (const char * dv = getenv("GSV_REFCODE_DEVICE")) rcfg.device = dv;
     if (const char * nt = getenv("GSV_REFCODE_THREADS")) rcfg.n_threads = atoi(nt);
-    fprintf(stderr, "[dbg] loading refcode...\n");
     gsv_refcode * rc = gsv_refcode::load(rcg, rcfg);
-    fprintf(stderr, "[dbg] refcode loaded\n");
     if (!rc) { fprintf(stderr, "load %s failed\n", rcg.c_str()); return 1; }
 
     gsv_hubert_cfg hcfg;
@@ -75,9 +72,7 @@ int main(int argc, char ** argv) {
         const char * tag = spec.first;
         std::vector<float> raw;
         int sr = 0;
-        fprintf(stderr, "[dbg] case %s, loading %s\n", tag, (adir + "/" + spec.second).c_str());
         if (!gsv_wav_load(adir + "/" + spec.second, raw, sr)) { printf("[%s] wav 缺失, skip\n", tag); continue; }
-        fprintf(stderr, "[dbg] case %s loaded %zu\n", tag, raw.size());
         const std::string p = gdir + "/ref." + tag + ".";
         printf("[%s] %zu samples @ %d Hz\n", tag, raw.size(), sr);
 
@@ -119,17 +114,10 @@ int main(int argc, char ** argv) {
         if (!fed.empty()) {
             if (!hub) hub = gsv_hubert::load(hubg, hcfg);
             if (!hub) { fprintf(stderr, "load %s failed\n", hubg.c_str()); return 1; }
-            // HF Wav2Vec2FeatureExtractor 的 zero_mean_unit_var_norm (总体方差, eps 1e-7) —— repo 的 CNHubert 内部做
-            std::vector<float> zin(fed.size());
-            {
-                double m = 0; for (float v : fed) m += v; m /= (double) fed.size();
-                double var = 0; for (float v : fed) { const double d = (double) v - m; var += d * d; }
-                var /= (double) fed.size();
-                const double inv = 1.0 / std::sqrt(var + 1e-7);
-                for (size_t i = 0; i < fed.size(); i++) zin[i] = (float) (((double) fed[i] - m) * inv);
-            }
+            // 输入口径 = 原始 16k 波形 (repo 的生产路径 `cnhuhbert_model.model(wav16k)` 直接喂波形,
+            // 不经过 Wav2Vec2FeatureExtractor 的 z-score; golden 也是这个口径)
             std::vector<float> hout;
-            if (!hub->encode(zin.data(), (int) zin.size(), hout)) { n_fail++; continue; }
+            if (!hub->encode(fed.data(), (int) fed.size(), hout)) { n_fail++; continue; }
             // hubert 布局 [d + 768*t] -> ssl 需要 [d*T + t]
             const int Th = (int) (hout.size() / 768);
             std::vector<float> ssl_ours((size_t) 768 * Th);
@@ -143,7 +131,9 @@ int main(int argc, char ** argv) {
                         md = std::max(md, std::fabs((double) ssl_ours[i] - sg[i]));
                         refmax = std::max(refmax, (double) std::fabs(sg[i]));
                     }
-                    printf("  %-18s max|d|=%.3e refmax=%.3g\n", "hubert_ssl(ours)", md, refmax);
+                    const bool okh = md < 1e-3 * refmax + 1e-4;
+                    if (!okh) n_fail++;
+                    printf("  %-18s max|d|=%.3e refmax=%.3g  %s\n", "hubert_ssl(ours)", md, refmax, okh ? "PASS" : "FAIL");
                     if (const char * ds = getenv("GSV_REFCODE_DUMP_Z")) {
                         FILE * fp = fopen((std::string(ds) + "/mine." + tag + ".ssl.bin").c_str(), "wb");
                         if (fp) { fwrite(ssl_ours.data(), 4, ssl_ours.size(), fp); fclose(fp); }
@@ -158,9 +148,11 @@ int main(int argc, char ** argv) {
                 size_t same = 0;
                 const size_t n = std::min(codes_c.size(), codes_g.size());
                 for (size_t i = 0; i < n; i++) if (codes_c[i] == codes_g[i]) same++;
+                const double rate = 100.0 * (double) same / (double) codes_g.size();
+                const bool okc = (n == codes_g.size()) && rate >= 99.0;
+                if (!okc) n_fail++;
                 printf("  %-18s %zu/%zu 一致 (%.2f%%)  %s\n", "codes(全链)",
-                       same, codes_g.size(), 100.0 * (double) same / (double) codes_g.size(),
-                       (n == codes_g.size() && same == n) ? "PASS" : "INFO");
+                       same, codes_g.size(), rate, okc ? "PASS" : "FAIL");
             }
         }
     }
