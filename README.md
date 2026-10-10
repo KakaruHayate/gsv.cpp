@@ -19,6 +19,7 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
 | 条件段（decode_encp 链: RVQ → ×2 → enc_p → bridge → ×2 → wns1） | ✅ **全链完成**：RVQ（bit-exact）、bridge（CPU 4.3e-6 / Vulkan 1.2e-2，≈ torch 速度）、wns1（CPU 6.5e-4 / Vulkan 3.6e-3；Vulkan 2.7 ms vs torch CUDA 9.5 ms = 3.6×）、**ref_enc ✅**（attention 接线修复后 parity PASS，CPU+Vulkan，commit 73a35eb）、**enc_p ✅**（TextEncoder+MRTE，parity PASS CPU+Vulkan，commit 0c3070b）；**链式 e2e（RVQ→enc_p→bridge→wns1）parity PASS**（commit 8088bf9）；量化最小档见 docs/cond_ggml.md；coopmat2 默认开：enc_p −33%、整链 −23%（§12） |
 | DiT（CFM + static cache，v5turbo 4 步） | ✅ 单步(t96/pad/t0)/4步/8步cfg(正负交替)/32步(v5dev)/分块 rolling 全对拍 PASS（CPU vel ≤1.2e-3、Vulkan ≤2.5e-2；te_pos 逐位一致）；**16 头注意力融合（QKV 整块 + head0 切片 RoPE + flash_attn_ext，节点 7783→1975）：Vulkan 62.9 ms/步 @T=1000（−41%，快 torch CUDA 1.8×）、CPU 1968 ms（−34%，反超 torch CPU）**；**量化最小档全 F16 = 651 MiB（1.98×↓，Q8 FAIL）**；**cache-dit（DBCache）可选：32 步档 CPU −31~35%、Vulkan e2e −25~29%（高命中步 −56%，融合后建议开），4 步 turbo（DMD 蒸馏）无效**；见 [docs/dit_ggml.md](docs/dit_ggml.md) |
 | vocoder（ONNX，fp32 严格不量化） | ✅ 导出 57.8MB / sha256 `13f95a88…`；对拍 max\|Δ\| ≤1.1e-4、corr 1.0；ORT-DML ≈ torch CUDA，ORT-CPU 快 torch 1.85×，见 [docs/vocoder_onnx.md](docs/vocoder_onnx.md) |
+| 参考音频预处理（wav → 重采样 → mel_fn_v4 → norm_spec） | ✅ `src/gsv_mel`（读 PCM16/24/32/float、torchaudio 等价 sinc 重采样、librosa Slaney mel、log(clamp 1e-5)）；对拍重采样 **≤2.4e-7**、mel（log 域）≤1.3e-3、帧数一致；素材 = 本地 TTS 合成的 speech（zh 32k / en 16k，`tests/audio/`），见 [docs/ref_preprocess.md](docs/ref_preprocess.md) |
 
 ## 目录
 
@@ -29,6 +30,7 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
 - `docs/ar_latency.md` — AR 单流（bs=1）延迟优化专项（剖析、已做项、精度档对延迟、剩余空间）
 - `docs/quant_ar.md` — AR 量化（验收协议：logits/greedy/TF 分布 TV；最小近无损档）
 - `docs/vocoder_onnx.md` — vocoder ONNX 导出（fp32 严格不量化、DML 动态形状陷阱）
+- `docs/ref_preprocess.md` — 参考音频预处理（wav/重采样等价式/mel_fn_v4 逐式对齐 + 测试素材来源）
 - `docs/bert_ggml.md` — BERT 前端（切层依据、逐层对拍、Vulkan 精度容限探针、量化扫描）
 - `docs/cond_ggml.md` — 条件段（V5 decode_encp 链）侦察 + RVQ 实现（链条入口，bit-exact）
 - `docs/dit_ggml.md` — DiT/CFM（cache/step 图、head0-only RoPE、分组 conv、GRN/mask 语义、对拍与基准）
@@ -41,9 +43,11 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
   - `gsv_wns1.{h,cpp}`：VITS WN Encoder（8 层 WaveNet + gin 条件；conv 内核可选 audio-patch 档，`GSV_WNS1_CONV`）
   - `gsv_refenc.{h,cpp}`：MelStyleEncoder（**WIP**：spectral/temporal PASS，attention 卡点见 docs/cond_ggml.md 第 7 节）
   - `gsv_hubert.{h,cpp}`：HuBERT 音频前端（CNN 前端 + 12 层 post-LN transformer；`GSV_HUBERT_DEVICE`/`BENCH`/`TIMING` 等）
+  - `gsv_mel.{h,cpp}`：参考音频预处理（wav 读取 / 带限 sinc 重采样 / mel_fn_v4 / norm_spec；依赖 vendored `third_party/pocketfft_hdronly.h`）
   - `gsv_dit.{h,cpp}`：DiT/CFM 生成器（cache 图 + pos/neg step 图三 gallocr、CFM host 循环、分块 rolling prompt；`GSV_DIT_DEVICE`/`GSV_DIT_DEBUG` 逐层探针）
 - `scripts/build-tests.bat` — 一键构建 ggml + 全部对拍可执行文件（VS2019 BuildTools，含 `/utf-8`；脚本须保持纯 ASCII）
 - `scripts/build-bert-vk.bat` — BERT Release+Vulkan 构建（用 `llama.cpp/build-vk-rel`，产物 `tests/rel/`）
+- `scripts/build-mel.bat` — mel/重采样对拍构建（`tests/relcpu/test_mel.exe`，纯 host 侧）
 - `scripts/build-ar-vk.bat` — AR 基准/对拍 Release+Vulkan 构建（`tests/rel/bench_ar_rel.exe`、`test_ar_engine_rel.exe`）
 - `scripts/build-dit.bat` / `scripts/build-dit-vk.bat` — DiT 对拍/基准构建（`tests/relcpu/test_dit.exe` / `tests/rel/test_dit_rel.exe`）
 - `tools/` — 权重转换与 golden 导出（Python，diffsinger env）
@@ -55,6 +59,7 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
   - `dump_golden_bert.py`：BERT golden（ids / hidden[-3] / 管线特征 / 逐层 hs0..22）
   - `bench_bert.py`：torch 侧 BERT 基准（CPU fp32 / GPU fp32 / GPU fp16）
   - `quantize_gguf.cpp`：GGUF 量化器（含 K-quants；`--spec` 分组同转换脚本）
+  - `dump_golden_ref.py`：参考音频预处理 golden（torchaudio 重采样 + repo mel_fn_v4/norm_spec）
   - `convert_dit.py`：s2Gv5turbo.pth 的 `cfm.estimator` → `models/gsv-dit-f32.gguf`（proj 拆分、conv 重排）
   - `dump_golden_dit.py` / `dump_golden_cfm.py`：DiT 单步（t96/pad/t0，含逐层探针）与 CFM 采样（4步/8步cfg/分块）golden
   - `bench_dit.py`：torch 侧 DiT 基准（与 test_dit.cpp 的 `GSV_DIT_BENCH` 同 workload）
@@ -67,6 +72,7 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
   - `test_bert_ggml.cpp`：BERT 对拍/基准（`GSV_BERT_DEVICE`/`MODEL`/`THREADS`/`LAYERS`，`--bench`）
   - `bench_ar.cpp`：AR 基准（bs=1/3/8，见 docs/benchmark_ar.md）
   - `test_min_ffn.cpp`：最小 LN+FFN 对拍（排查用）
+  - `test_mel.cpp`：wav/重采样/mel/norm_spec 对拍（golden 见 dump_golden_ref.py；`tests/audio/` 为 TTS 合成的参考音频）
   - `test_dit.cpp`：DiT/CFM 对拍 + 基准（`GSV_DIT_DEVICE`/`GSV_DIT_BENCH`/`GSV_DIT_THREADS`；失败时打印误差最大位置与有效区/pad 区占比）
   - `golden/`（不入库）由上述 dump 脚本生成
 
