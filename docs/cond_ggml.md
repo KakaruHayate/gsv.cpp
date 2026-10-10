@@ -542,3 +542,28 @@ golden：`tools/dump_golden_chain.py`；构建：`scripts/build-chain.bat`
 **结论：条件段与 HuBERT 默认开 coopmat2**：误差升 1.2~7× 但全部在各自验收阈值内（wns1 的升幅
 绝对值 2.9e-3 相对其量程可忽略）；首次吃满张量核的条件段整链 −23%。要复现旧口径时进程启动前设
 `GGML_VK_DISABLE_COOPMAT2=1`。
+
+## 13. wns1 conv 档：按后端/T 自动选择（2026-10-10 长 T 复评）
+
+§9 的 mode 2 结论是 T=120 下得出的。本次给测试加了长 T 剖面（`GSV_WNS1_LONGT=T`，
+T 为 wns1 的帧数、LEN=T 全掩码 = 生产形态），重扫：
+
+| T | CPU mode 0 (stock conv_1d) | CPU mode 2 (fast im2col F32, 旧默认) | Vulkan mode 0 | Vulkan mode 2 |
+|---|---|---|---|---|
+| 120（§9 工况） | 68.7 ms | **47.5 ms** | **2.51** | 3.11 ms |
+| 256 | 65.2 | **59.1** | **3.11** | 3.23 |
+| 512 | 59.9 | **53.3** | **4.00** | 4.46 |
+| 768 | **267** | 571 | — | — |
+| 1000（5s 音频生产值） | **326** | 778 | **7.40** | 8.67 |
+| 1536 | **519** | 1180 | — | — |
+
+- **CPU 交叉点在 512~768 之间**：T≥640 时 mode 0 反超 **2.4×**（此前短 T 时 mode 2 快 ~30%）；
+- **Vulkan 所有测点 mode 0 都更优**（−10~20%）；
+- 精度两侧都在门内：mode 0 = CPU 6.5e-4 / VK 2.9e-3（对 golden），mode 2 = 1.07e-6 / 2.9e-3。
+
+**实现**：`gsv_wns1` 改为自动选档 —— `GSV_WNS1_CONV` 显式指定时优先；否则 **GPU 一律 mode 0、
+CPU 按 `T ≥ 640 ? 0 : 2`**（verbose 打印选中档）。链式对拍（T=160）双后端仍 PASS。
+
+**conv_direct_1d 的 Vulkan K=1 崩溃（patch bug）：不修**。mode 4（hybrid，绕开 K=1）在长 T 实测
+16.9 ms（VK T=1000）远慢于 mode 0 的 7.4 ms；mode 3 全 direct 更差（CPU 2349 ms）。该 bug 对当前
+任何工况都无收益，留待上游或将来真用 direct 时处理（最小复现 `tests/test_conv_direct_vk.cpp`）。

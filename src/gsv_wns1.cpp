@@ -31,6 +31,8 @@ struct gsv_wns1::impl {
     ggml_tensor * g_mask = nullptr;
     ggml_tensor * g_out = nullptr;
     int T = 120, LEN = 100;   // T 为"当前图缓存对应的长度"; encode(T != 缓存) 时重建图
+    int  cmode = 2;           // 本次构图的 conv 实现档 (见 wns1_conv_mode_auto)
+    bool is_cpu = false;
     int n_threads = 0;
     bool verbose = false;
     ggml_tensor * need(const char * n) const {
@@ -50,7 +52,20 @@ struct gsv_wns1::impl {
 // Vulkan 与之持平且精度略好 (2.9e-3 vs 3.6e-3)。
 static int wns1_conv_mode(){
     const char * e = getenv("GSV_WNS1_CONV");
-    return e ? atoi(e) : 2;
+    return e ? atoi(e) : -1;   // -1 = 未显式指定, 由 wns1_conv_mode_auto 按后端/T 决定
+}
+// conv 实现选档 (2026-10-10 长 T 复评, docs/cond_ggml.md 12):
+//   GPU: mode 0 (stock ggml_conv_1d) 各 T 全面更优 (T=1000: 8.22 vs 9.49 ms)
+//   CPU: T < 640 → mode 2 (fast im2col + F32 dst, 短 T 快 ~30%); T >= 640 → mode 0
+//        (长 T 反超 2.4x: T=1000 326 vs 778 ms; 交叉点在 512~768)
+// 精度: mode 0 = CPU 6.5e-4 / VK 3.6e-3, mode 2 = 1.07e-6 / 2.9e-3, 都在 2e-2 门内。
+// 注: mode 3 (conv_direct_1d) 的 Vulkan K=1 崩溃仍在 (patch bug), 且 direct/hybrid
+// 在长 T 实测更差 (T=1000 VK 16.9 vs 8.2 ms), 故不修、不选。
+static int wns1_conv_mode_auto(bool is_cpu, int T){
+    const int e = wns1_conv_mode();
+    if (e >= 0) return e;
+    if (!is_cpu) return 0;
+    return (T >= 640) ? 0 : 2;
 }
 // 3D 视图助手: 量化后的 k=1 权重是 2D ([in, out], 见 quantize_gguf 的压形), 不能 reshape;
 // 这里对 2D 原样返回, 由 conv1d_pick 的 2D 分支处理 (直接 mul_mat, 等价 k=1 im2col)。
@@ -102,6 +117,8 @@ static void build_graph(gsv_wns1::impl & s){
     s.gctx = ggml_init(ip);
     ggml_context * c = s.gctx;
     const int T = s.T, C = C_HID;
+    s.cmode = wns1_conv_mode_auto(s.is_cpu, T);
+    if (s.verbose) printf("[gsv_wns1] conv mode = %d (T=%d, %s)\n", s.cmode, T, s.is_cpu ? "cpu" : "gpu");
     ggml_tensor * x = ggml_new_tensor_2d(c, GGML_TYPE_F32, T, C);
     ggml_set_input(x); s.g_in = x;
     ggml_tensor * ge = ggml_new_tensor_1d(c, GGML_TYPE_F32, C);
@@ -112,7 +129,7 @@ static void build_graph(gsv_wns1::impl & s){
     // pre: Conv1d 512->512 k=1, then * mask
     {
         ggml_tensor * w = as3d(c, s.need("wns1.pre.weight"), 1, C, C);
-        ggml_tensor * y = conv1d_pick(c, w, x, 0, wns1_conv_mode());
+        ggml_tensor * y = conv1d_pick(c, w, x, 0, s.cmode);
         ggml_tensor * b = ggml_reshape_3d(c, s.need("wns1.pre.bias"), 1, C, 1);
         y = ggml_add(c, y, b);
         y = ggml_mul(c, y, mask);
@@ -130,13 +147,13 @@ static void build_graph(gsv_wns1::impl & s){
         ggml_tensor * iw = ggml_reshape_3d(c, s.need(nm), K, C, 2*C);
         snprintf(nm,160,"wns1.enc.in_layers.%d.bias",li);
         ggml_tensor * ib = ggml_reshape_3d(c, s.need(nm), 1, 2*C, 1);
-        ggml_tensor * xin = conv1d_pick(c, iw, x, PAD, wns1_conv_mode());
+        ggml_tensor * xin = conv1d_pick(c, iw, x, PAD, s.cmode);
         xin = ggml_add(c, xin, ib);
         const int off = li * 2 * C;
         const size_t cw_stride = (cw_full->ne[2] == 1 && cw_full->ne[3] == 1) ? cw_full->nb[1] : cw_full->nb[2];
         ggml_tensor * cw = ggml_view_2d(c, cw_full, C, 2*C, cw_stride, (size_t)off * cw_stride);
         ggml_tensor * cw3 = as3d(c, cw, 1, C, 2*C);
-        xin = ggml_add(c, xin, conv1d_pick(c, cw3, ge3, 0, wns1_conv_mode()));
+        xin = ggml_add(c, xin, conv1d_pick(c, cw3, ge3, 0, s.cmode));
         ggml_tensor * cbv = ggml_view_1d(c, cb_full, 2*C, (size_t)off * 4);
         xin = ggml_add(c, xin, ggml_reshape_3d(c, cbv, 1, 2*C, 1));
         // gate: tanh(xin[:C])*sigmoid(xin[C:])  xin [T, 2C, 1] contiguous
@@ -149,7 +166,7 @@ static void build_graph(gsv_wns1::impl & s){
         ggml_tensor * rw = as3d(c, s.need(nm), 1, C, rc);
         snprintf(nm,160,"wns1.enc.res_skip_layers.%d.bias",li);
         ggml_tensor * rb = ggml_reshape_3d(c, s.need(nm), 1, rc, 1);
-        ggml_tensor * rs = conv1d_pick(c, rw, acts, 0, wns1_conv_mode());
+        ggml_tensor * rs = conv1d_pick(c, rw, acts, 0, s.cmode);
         rs = ggml_add(c, rs, rb);
         if(li < NL-1){
             ggml_tensor * rres = ggml_view_1d(c, rs, (int64_t)C*T, 0);
@@ -166,7 +183,7 @@ static void build_graph(gsv_wns1::impl & s){
     sk = ggml_mul(c, sk, mask);
     {
         ggml_tensor * w = as3d(c, s.need("wns1.proj.weight"), 1, C, C);
-        ggml_tensor * y = conv1d_pick(c, w, sk, 0, wns1_conv_mode());
+        ggml_tensor * y = conv1d_pick(c, w, sk, 0, s.cmode);
         ggml_tensor * b = ggml_reshape_3d(c, s.need("wns1.proj.bias"), 1, C, 1);
         y = ggml_mul(c, ggml_add(c, y, b), mask);
         s.g_out = y;
@@ -210,6 +227,7 @@ gsv_wns1 * gsv_wns1::load(const std::string & gguf_path, const gsv_wns1_cfg & cf
     }
     if(!dev){ fprintf(stderr,"[gsv_wns1] no usable backend device\n"); delete m; return nullptr; }
     if(s.verbose) printf("[gsv_wns1] device: %s\n", ggml_backend_dev_name(dev));
+    s.is_cpu = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
     s.backend = ggml_backend_dev_init(dev, nullptr);
     if(!s.backend){ fprintf(stderr,"[gsv_wns1] backend init failed\n"); delete m; return nullptr; }
     if(ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && s.n_threads > 0)

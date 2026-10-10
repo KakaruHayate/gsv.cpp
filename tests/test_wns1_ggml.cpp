@@ -66,6 +66,28 @@ int main(int argc, char ** argv){
         double ssum = 0; for(double v : ts) ssum += v;
         printf("ggml %s: avg %.3f ms min %.3f max %.3f n=%d\n", cfg.device.empty()?"cpu":"vulkan", ssum/ts.size(), ts.front(), ts.back(), (int)ts.size());
     }
+    // 生产长 T 剖面 (无 golden, 只测速度/健全性): GSV_WNS1_LONGT=T
+    if (const char * lt = getenv("GSV_WNS1_LONGT")) {
+        const int TL = atoi(lt);
+        if (TL < 8 || TL > 8192) { fprintf(stderr, "bad GSV_WNS1_LONGT=%d\n", TL); return 5; }
+        std::vector<float> xl((size_t) C * TL), gel((size_t) 512 * TL), ol;
+        for (size_t i = 0; i < xl.size(); i++) xl[i] = 0.1f * (float) ((i % 23) - 11);
+        for (size_t i = 0; i < gel.size(); i++) gel[i] = 0.1f * (float) ((i % 19) - 9);
+        const char * be2 = getenv("GSV_WNS1_BENCH");
+        const int n = be2 ? atoi(be2) : 5;
+        std::vector<double> ts;
+        for (int i = 0; i < n + 3; i++) {
+            auto t0 = std::chrono::steady_clock::now();
+            const bool ok = m->encode(xl.data(), gel.data(), TL, TL, ol);   // LEN=T (mask 全 1, 生产形态)
+            auto t1 = std::chrono::steady_clock::now();
+            if (!ok) { fprintf(stderr, "LONGT encode failed (T=%d)\n", TL); return 4; }
+            if (i >= 3) ts.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        }
+        std::sort(ts.begin(), ts.end());
+        double s2 = 0; for (double v : ts) s2 += v;
+        printf("ggml wns1 LONGT (T=%d, %s): avg %.2f ms min %.2f ms n=%d\n",
+               TL, cfg.device.empty() ? "cpu" : "vulkan", s2 / ts.size(), ts.front(), (int) ts.size());
+    }
     delete m;
     return md < 2e-2 ? 0 : 2;
 }
