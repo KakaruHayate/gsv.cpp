@@ -247,3 +247,22 @@ BERT 段已就绪的能力：`gsv_bert::load(gguf, {device, n_threads})` → `en
 3. HuBERT/RVQ→enc_p/MRTE/ref_enc/bridge/wns1 与 DiT/vocoder 各自接入。
 
 对 AR 侧的建议：**BERT 走 Vulkan 时，AR 的 `bert` 输入误差与 f32 参考的差异已在 token 稳定区内**，无需为 BERT 单独降级后端。
+
+## 8. 服务化加速：特征缓存 + 多文本批量（2026-10-10）
+
+两项新能力（`src/gsv_bert.h`，测试见 `tests/test_bert_ggml.cpp`）：
+
+1. **特征 LRU 缓存**（`cfg.feat_cache = N`，默认 0=关；`encode_feat_cached()`）：
+   键 = (T, 完整 ids)，命中直接返回存档特征（测试实测两次数值 max|d| = 0）。服务化场景里
+   同一文本重复合成（试听/调参/多音色）省掉整段 BERT（GPU T=25 约 8~9 ms、CPU 约 110 ms，
+   后者是 CPU TTFT 的大头）。`feat_cache_stats()` 给命中/未命中。
+2. **多文本批量**（`encode_feat_batch(B, ids_flat, lens, Tmax)`）：B 条序列右补齐到 `Tmax`、
+   单图跑 `S = Tmax×B` 列，注意力用**块对角 mask**（同序列内可见、补齐位屏蔽）。
+   - **正确性**：与逐条 `encode_feat` 对比 —— CPU max|d| = **7.6e-06**（同一后端、FA F32，
+     说明列间无泄漏、mask/pos 正确）；Vulkan ≈ 3.5e-2，为 FA 在不同 S 下的分块/f16 噪声
+     （与它自身对 fp32 golden 的 3.6e-2 同量级）。
+   - **速度**（4 段短文本，Tmax=25）：**Vulkan 15.6 ms vs 逐条 34.5 ms = 2.2×**（宽的 GEMM 摊薄）；
+     **CPU 反而 0.7×**（padding 的 S² 注意力浪费 + CPU FA 无优势）——
+     因此 `encode_feat_batch` 在 CPU 后端**自动回退逐条**（输出同语义；`GSV_BERT_BATCH_CPU=1`
+     可强制图路径，测试覆盖用）。
+   - 注意 mask 为 S² F16（B=4/Tmax=64 → 32KB）；S 上限 65536。

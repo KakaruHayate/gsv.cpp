@@ -25,6 +25,7 @@ struct bert_layer_w {
 struct gsv_bert::impl {
     int D = 1024, NH = 16, HD = 64, NL = 22, VOCAB = 21128, MAXPOS = 512, FFD = 4096;
     float EPS = 1e-12f;
+    bool  is_cpu = false;                 // CPU 后端: 批量路径自动回退逐条 (见 encode_feat_batch)
 
     ggml_tensor * word_emb = nullptr, * pos_emb = nullptr, * type_emb = nullptr;
     ggml_tensor * emb_ln_w = nullptr, * emb_ln_b = nullptr;
@@ -63,40 +64,58 @@ struct gsv_bert::impl {
 
     // 全序列前向: ids [T] -> x [D, T] (行主序 d + t*D); n_layers < 0 = 全部
     void run(const int32_t * ids, int T, std::vector<float> & out, int n_layers);
+    // 通用入口: 显式 pos/typ 与可选 S×S F16 mask (nullptr = 全 0), 供多文本批量路径用
+    void run_g(const int32_t * ids, const int32_t * pos, const int32_t * typ, int S,
+               const ggml_fp16_t * mask_ss, std::vector<float> & out, int n_layers);
+
+    // encode_feat_cached 的 LRU (键 = T + 完整 ids; 命中直接返回存档特征)
+    int  feat_cache_n = 0;
+    uint64_t feat_use = 0;
+    int  fc_hits = 0, fc_misses = 0;
+    struct feat_entry { uint64_t h; uint64_t use; std::vector<int32_t> ids; std::vector<float> feat; };
+    std::vector<feat_entry> feat_cache;
 };
 
 void gsv_bert::impl::run(const int32_t * ids, int T, std::vector<float> & out, int n_layers) {
-    if (T < 1 || T > MAXPOS) { fprintf(stderr, "[gsv_bert] bad T=%d (max_pos=%d)\n", T, MAXPOS); return; }
+    std::vector<int32_t> pos((size_t) T), typ((size_t) T, 0);
+    for (int i = 0; i < T; i++) pos[i] = i;
+    run_g(ids, pos.data(), typ.data(), T, nullptr, out, n_layers);
+}
+
+void gsv_bert::impl::run_g(const int32_t * ids, const int32_t * pos, const int32_t * typ, int S,
+                           const ggml_fp16_t * mask_ss, std::vector<float> & out, int n_layers) {
+    if (S < 1 || S > 65536) { fprintf(stderr, "[gsv_bert] bad S=%d\n", S); return; }
     if (n_layers < 0 || n_layers > NL) n_layers = NL;
 
     ggml_init_params ip = { ggml_tensor_overhead() * 65536, NULL, true };
     ggml_context * ctx = ggml_init(ip);
 
-    ggml_tensor * t_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);   ggml_set_input(t_ids);
-    ggml_tensor * t_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);   ggml_set_input(t_pos);
-    ggml_tensor * t_typ = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);   ggml_set_input(t_typ);
-    // 无 padding, mask 全 0 (flash_attn_ext 需要 F16 mask); n_layers=0 时注意力不参与图, 不建 mask
+    ggml_tensor * t_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, S);   ggml_set_input(t_ids);
+    ggml_tensor * t_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, S);   ggml_set_input(t_pos);
+    ggml_tensor * t_typ = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, S);   ggml_set_input(t_typ);
+    // mask 由调用方给 (批量时是块对角); 默认全 0 = 无屏蔽 (flash_attn_ext 需要 F16 mask);
+    // n_layers=0 时注意力不参与图, 不建 mask
     ggml_tensor * t_msk = nullptr;
-    if (n_layers > 0) { t_msk = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, T, T, 1, 1); ggml_set_input(t_msk); }
+    if (n_layers > 0) { t_msk = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, S, S, 1, 1); ggml_set_input(t_msk); }
 
     ggml_tensor * cur = ggml_add(ctx, ggml_add(ctx,
                             emb_row(ctx, word_emb, t_ids),
                             emb_row(ctx, pos_emb, t_pos)),
-                            emb_row(ctx, type_emb, t_typ));                    // [D, T]
+                            emb_row(ctx, type_emb, t_typ));                    // [D, S]
     cur = ln_affine(ctx, cur, nullptr, nullptr, ln_pack[0], EPS);   // embedding: 无残差/bias
 
     for (int li = 0; li < n_layers; li++) {
         const bert_layer_w & w = ws[li];
-        // QKV 一次 matmul + 三个 (HD,T,NH,1) 视图直送 flash:
+        // QKV 一次 matmul + 三个 (HD,S,NH,1) 视图直送 flash:
         // qkv 的行序是 (hd, nh) 且 S 维步长 = 3D*4, head 维步长 = HD*4 -> 无需 permute/cont
-        ggml_tensor * qkv = ggml_add(ctx, ggml_mul_mat(ctx, w.qkv_w, cur), w.qkv_b);   // [3D, T]
-        ggml_tensor * q3 = ggml_reshape_3d(ctx, qkv, D, 3, T);                          // nb=(4, 4D, 12D)
+        ggml_tensor * qkv = ggml_add(ctx, ggml_mul_mat(ctx, w.qkv_w, cur), w.qkv_b);   // [3D, S]
+        ggml_tensor * q3 = ggml_reshape_3d(ctx, qkv, D, 3, S);                          // nb=(4, 4D, 12D)
         const size_t nb_s = q3->nb[2], nb_h = 4 * HD;
-        ggml_tensor * qh = ggml_view_4d(ctx, q3, HD, T, NH, 1, nb_s, nb_h, nb_h * T, 0);
-        ggml_tensor * kh = ggml_view_4d(ctx, q3, HD, T, NH, 1, nb_s, nb_h, nb_h * T, q3->nb[1]);
-        ggml_tensor * vh = ggml_view_4d(ctx, q3, HD, T, NH, 1, nb_s, nb_h, nb_h * T, 2 * q3->nb[1]);
+        ggml_tensor * qh = ggml_view_4d(ctx, q3, HD, S, NH, 1, nb_s, nb_h, nb_h * S, 0);
+        ggml_tensor * kh = ggml_view_4d(ctx, q3, HD, S, NH, 1, nb_s, nb_h, nb_h * S, q3->nb[1]);
+        ggml_tensor * vh = ggml_view_4d(ctx, q3, HD, S, NH, 1, nb_s, nb_h, nb_h * S, 2 * q3->nb[1]);
         ggml_tensor * attn = ggml_flash_attn_ext(ctx, qh, kh, vh, t_msk, 1.0f / std::sqrt((float) HD), 0.0f, 0.0f);
-        attn = ggml_reshape_2d(ctx, ggml_reshape_4d(ctx, attn, D, T, 1, 1), D, T);
+        attn = ggml_reshape_2d(ctx, ggml_reshape_4d(ctx, attn, D, S, 1, 1), D, S);
         ggml_tensor * ao = ggml_mul_mat(ctx, w.attn_out_w, attn);
         cur = ln_affine(ctx, cur, ao, w.attn_out_b, ln_pack[1 + 2*li + 0], EPS);      // post-LN 1
         ggml_tensor * h = fuse_act
@@ -110,27 +129,29 @@ void gsv_bert::impl::run(const int32_t * ids, int T, std::vector<float> & out, i
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 8192, false);
     ggml_build_forward_expand(graph, cur);
     if (!ggml_gallocr_alloc_graph(galloc, graph))
-        fprintf(stderr, "[gsv_bert] alloc_graph failed (T=%d n_layers=%d)\n", T, n_layers);
+        fprintf(stderr, "[gsv_bert] alloc_graph failed (S=%d n_layers=%d)\n", S, n_layers);
 
-    std::vector<int32_t> pos(T), typ(T, 0);
-    for (int i = 0; i < T; i++) pos[i] = i;
-    ggml_backend_tensor_set(t_ids, ids, 0, (size_t) T * 4);
-    ggml_backend_tensor_set(t_pos, pos.data(), 0, (size_t) T * 4);
-    ggml_backend_tensor_set(t_typ, typ.data(), 0, (size_t) T * 4);
+    ggml_backend_tensor_set(t_ids, ids, 0, (size_t) S * 4);
+    ggml_backend_tensor_set(t_pos, pos, 0, (size_t) S * 4);
+    ggml_backend_tensor_set(t_typ, typ, 0, (size_t) S * 4);
     if (t_msk) {
-        std::vector<ggml_fp16_t> msk((size_t) T * T, ggml_fp32_to_fp16(0.0f));
-        ggml_backend_tensor_set(t_msk, msk.data(), 0, msk.size() * 2);
+        if (mask_ss) {
+            ggml_backend_tensor_set(t_msk, mask_ss, 0, (size_t) S * S * 2);
+        } else {
+            std::vector<ggml_fp16_t> msk((size_t) S * S, ggml_fp32_to_fp16(0.0f));
+            ggml_backend_tensor_set(t_msk, msk.data(), 0, msk.size() * 2);
+        }
     }
 
     ggml_backend_graph_compute(backend, graph);
 
-    // ggml 布局: idx = d + t*D; 导出为 [D, T] 行主序 (idx = d*T + t)
+    // ggml 布局: idx = d + t*D; 导出为 [D, S] 行主序 (idx = d*S + t)
     auto to_host_td = [&](ggml_tensor * t, std::vector<float> & dst) {
         std::vector<float> tmp(ggml_nelements(t));
         ggml_backend_tensor_get(t, tmp.data(), 0, tmp.size() * 4);
         dst.assign(tmp.size(), 0.0f);
         for (int d = 0; d < D; d++)
-            for (int i = 0; i < T; i++) dst[(size_t) d * T + i] = tmp[(size_t) d + (size_t) i * D];
+            for (int i = 0; i < S; i++) dst[(size_t) d * S + i] = tmp[(size_t) d + (size_t) i * D];
     };
     to_host_td(cur, out);
 
@@ -180,6 +201,84 @@ void gsv_bert::encode_layers(const int32_t * ids, int T, std::vector<float> & fe
     }
 }
 
+static uint64_t hash_ids(const int32_t * ids, int T) {
+    uint64_t h = 1469598103934665603ull;                 // FNV-1a
+    for (int i = 0; i < T; i++) { h ^= (uint32_t) ids[i]; h *= 1099511628211ull; }
+    h ^= (uint64_t) (uint32_t) T; h *= 1099511628211ull;
+    return h;
+}
+
+void gsv_bert::encode_feat_cached(const int32_t * ids, int T, std::vector<float> & feat) {
+    impl & s = *p;
+    if (s.feat_cache_n <= 0) { encode_feat(ids, T, feat); return; }
+    const uint64_t h = hash_ids(ids, T);
+    for (impl::feat_entry & e : s.feat_cache) {
+        if (e.h == h && (int) e.ids.size() == T && memcmp(e.ids.data(), ids, (size_t) T * 4) == 0) {
+            feat = e.feat; e.use = ++s.feat_use; s.fc_hits++;
+            return;
+        }
+    }
+    s.fc_misses++;
+    encode_feat(ids, T, feat);
+    if ((int) s.feat_cache.size() >= s.feat_cache_n) {          // LRU 淘汰
+        size_t victim = 0;
+        for (size_t i = 1; i < s.feat_cache.size(); i++)
+            if (s.feat_cache[i].use < s.feat_cache[victim].use) victim = i;
+        s.feat_cache.erase(s.feat_cache.begin() + (long) victim);
+    }
+    impl::feat_entry e;
+    e.h = h; e.use = ++s.feat_use;
+    e.ids.assign(ids, ids + T);
+    e.feat = feat;
+    s.feat_cache.push_back(std::move(e));
+}
+
+void gsv_bert::feat_cache_stats(int & hits, int & misses) const {
+    hits = p->fc_hits; misses = p->fc_misses;
+}
+
+bool gsv_bert::encode_feat_batch(int B, const int32_t * ids_flat, const int * lens, int Tmax,
+                                 std::vector<std::vector<float>> & feats) {
+    impl & s = *p;
+    feats.assign((size_t) (B > 0 ? B : 0), {});
+    if (B <= 0 || !ids_flat || !lens || Tmax < 3 || Tmax > s.MAXPOS) {
+        fprintf(stderr, "[gsv_bert] encode_feat_batch: bad args (B=%d Tmax=%d max_pos=%d)\n", B, Tmax, s.MAXPOS);
+        return false;
+    }
+    const int S = Tmax * B;
+    if (S > 65536) { fprintf(stderr, "[gsv_bert] encode_feat_batch: S=%d too large\n", S); return false; }
+    // CPU 后端自动回退逐条: padding 浪费在 CPU 上净亏 (T=25×4 实测 0.7×), GPU 上才是赚的 (2.2×)。
+    // GSV_BERT_BATCH_CPU=1 可强制走图路径 (测试覆盖用)。
+    if (s.is_cpu && getenv("GSV_BERT_BATCH_CPU") == nullptr) {
+        for (int b = 0; b < B; b++) encode_feat(ids_flat + (size_t) b * Tmax, lens[b], feats[b]);
+        return true;
+    }
+    std::vector<int32_t> pos((size_t) S, 0), typ((size_t) S, 0);
+    for (int b = 0; b < B; b++)
+        for (int i = 0; i < Tmax; i++)
+            if (i < lens[b]) pos[(size_t) b * Tmax + i] = i;
+    // 块对角 mask: 允许 iff (同序列 && key 是真实 token); F16 0 / -inf (与 AR/DiT 的 pad mask 同款)
+    std::vector<ggml_fp16_t> msk((size_t) S * S);
+    const ggml_fp16_t f_keep = ggml_fp32_to_fp16(0.0f), f_mask = ggml_fp32_to_fp16(-1e30f);
+    for (int q = 0; q < S; q++) {
+        const int bq = q / Tmax;
+        for (int k = 0; k < S; k++)
+            msk[(size_t) k + (size_t) S * q] = (k / Tmax == bq && (k % Tmax) < lens[bq]) ? f_keep : f_mask;
+    }
+    std::vector<float> out;
+    s.run_g(ids_flat, pos.data(), typ.data(), S, msk.data(), out, -1);      // out: [D, S], idx = d*S + t
+    if ((int) out.size() != s.D * S) { fprintf(stderr, "[gsv_bert] encode_feat_batch: bad out size\n"); return false; }
+    for (int b = 0; b < B; b++) {
+        const int T2 = lens[b] - 2;
+        if (T2 <= 0) continue;
+        feats[b].assign((size_t) s.D * T2, 0.0f);
+        for (int d = 0; d < s.D; d++)
+            for (int i = 0; i < T2; i++)
+                feats[b][(size_t) d * T2 + i] = out[(size_t) d * S + (size_t) b * Tmax + i + 1];
+    }
+    return true;
+}
+
 gsv_bert * gsv_bert::load(const std::string & gguf_path, const gsv_bert_cfg & cfg) {
     gsv_bert * m = new gsv_bert();
     impl & s = *m->p;
@@ -210,8 +309,9 @@ gsv_bert * gsv_bert::load(const std::string & gguf_path, const gsv_bert_cfg & cf
     if (!s.backend) { fprintf(stderr, "[gsv_bert] backend init failed\n"); delete m; return nullptr; }
     if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && cfg.n_threads > 0)
         ggml_backend_cpu_set_n_threads(s.backend, cfg.n_threads);
+    s.is_cpu = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
     s.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(s.backend));
-
+    s.feat_cache_n = cfg.feat_cache > 0 ? cfg.feat_cache : 0;
     gguf_init_params gip = { /*no_alloc*/ true, &s.wctx };
     s.gf = gguf_init_from_file(gguf_path.c_str(), gip);
     if (!s.gf) { fprintf(stderr, "[gsv_bert] failed to open %s\n", gguf_path.c_str()); delete m; return nullptr; }

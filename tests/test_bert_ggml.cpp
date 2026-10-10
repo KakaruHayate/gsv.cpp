@@ -7,6 +7,7 @@
 // 用法: test_bert_ggml [--bench]   环境: GSV_BERT_DEVICE=(""|vulkan) GSV_BERT_THREADS GSV_BERT_LAYERS=1
 #include "../src/gsv_bert.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -65,7 +66,11 @@ int main(int argc, char ** argv) {
     cfg.verbose = true;
     if (const char * dv = getenv("GSV_BERT_DEVICE")) cfg.device = dv;
     if (const char * nt = getenv("GSV_BERT_THREADS")) cfg.n_threads = atoi(nt);
+    cfg.feat_cache = 4;   // 测试用: 让 encode_feat_cached 生效
 
+#ifdef _WIN32
+    _putenv_s("GSV_BERT_BATCH_CPU", "1");   // 测试覆盖: 强制批量走图路径 (含 CPU; 生产 CPU 默认回退逐条)
+#endif
     gsv_bert * m = gsv_bert::load(mdl, cfg);
     if (!m) { fprintf(stderr, "load failed: %s\n", mdl); return 1; }
     const int D = m->hidden();
@@ -105,6 +110,63 @@ int main(int argc, char ** argv) {
                i, T, s1.max_abs, s1.mean_abs, s1.cos, s2.max_abs, s2.cos, ok ? "OK" : "FAIL");
     }
 
+    // ---- 特征缓存 (LRU) ----
+    {
+        std::vector<float> idsf = read_bin(std::string(gdir) + "/bert.0.ids.bin");
+        const int T = (int) idsf.size();
+        std::vector<int32_t> ids(T);
+        for (int k = 0; k < T; k++) ids[k] = (int32_t) (idsf[k] + 0.5f);
+        int h0 = 0, m0 = 0; m->feat_cache_stats(h0, m0);
+        std::vector<float> f1, f2;
+        m->encode_feat_cached(ids.data(), T, f1);
+        m->encode_feat_cached(ids.data(), T, f2);
+        int h1 = 0, m1 = 0; m->feat_cache_stats(h1, m1);
+        const stats_t sc = cmp_vec(f1, f2);
+        const bool ok = (h1 - h0 == 1) && (m1 - m0 == 1) && sc.max_abs == 0.0;
+        if (!ok) n_bad++;
+        printf("feat_cache: hits+%d misses+%d, 两次数值 max|d|=%.1e  %s\n",
+               h1 - h0, m1 - m0, sc.max_abs, ok ? "OK" : "FAIL");
+    }
+    // ---- 多文本批量 (摊薄小 GEMM): 与逐条 encode_feat 对比 ----
+    {
+        std::vector<std::vector<int32_t>> ids_all;
+        int Tmax = 0;
+        for (int i = 0; i < n_texts; i++) {
+            std::vector<float> idsf = read_bin(std::string(gdir) + "/bert." + std::to_string(i) + ".ids.bin");
+            std::vector<int32_t> v(idsf.size());
+            for (size_t k = 0; k < idsf.size(); k++) v[k] = (int32_t) (idsf[k] + 0.5f);
+            Tmax = std::max(Tmax, (int) v.size());
+            ids_all.push_back(std::move(v));
+        }
+        std::vector<int32_t> flat((size_t) Tmax * n_texts, 0);
+        std::vector<int> lens(n_texts);
+        for (int b = 0; b < n_texts; b++) {
+            lens[b] = (int) ids_all[b].size();
+            memcpy(flat.data() + (size_t) b * Tmax, ids_all[b].data(), ids_all[b].size() * 4);
+        }
+        std::vector<std::vector<float>> feats;
+        m->encode_feat_batch(n_texts, flat.data(), lens.data(), Tmax, feats);   // 冷启动预热 (galloc 重规划/管线缓存)
+        const auto tb0 = std::chrono::steady_clock::now();
+        const bool bok = m->encode_feat_batch(n_texts, flat.data(), lens.data(), Tmax, feats);
+        const auto tb1 = std::chrono::steady_clock::now();
+        const auto ts0 = std::chrono::steady_clock::now();
+        for (int b = 0; b < n_texts; b++) { std::vector<float> f; m->encode_feat(ids_all[b].data(), lens[b], f); }
+        const auto ts1 = std::chrono::steady_clock::now();
+        double worst = 0;
+        if (bok) for (int b = 0; b < n_texts; b++) {
+            std::vector<float> seq;
+            m->encode_feat(ids_all[b].data(), lens[b], seq);
+            const stats_t sb = cmp_vec(feats[b], seq);
+            worst = std::max(worst, sb.max_abs);
+        }
+        // vk 的批量 vs 逐条差 = FA 在不同 S 下的分块/f16 噪声 (~5e-2, 与自身对 golden 的 3.6e-2 同量级)
+        const bool ok = bok && worst < (cfg.device.empty() ? 2e-3 : 1e-1);
+        if (!ok) n_bad++;
+        printf("batch B=%d Tmax=%d: vs 逐条 max|d|=%.3e  [batch %.2f ms vs 逐条 %.2f ms]  %s\n",
+               n_texts, Tmax, worst,
+               std::chrono::duration<double, std::milli>(tb1 - tb0).count(),
+               std::chrono::duration<double, std::milli>(ts1 - ts0).count(), ok ? "OK" : "FAIL");
+    }
     if (getenv("GSV_BERT_LAYERS")) {
         std::vector<float> idsf = read_bin(std::string(gdir) + "/bert.0.ids.bin");
         const int T = (int) idsf.size();
