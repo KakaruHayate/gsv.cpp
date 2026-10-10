@@ -37,6 +37,22 @@ struct gsv_bert::impl {
     ggml_backend_t backend = nullptr;
     ggml_gallocr_t galloc = nullptr;
 
+    // 图缓存 (同形状复用 ctx+graph+已规划的 galloc): 短文本下"每次建图/建 ctx"是可见的固定开销
+    // (enc_p/ref_enc/wns1/DiT/AR 都已是按形状缓存, BERT 之前逐次重建)。
+    // 命中时只做 tensor_set + graph_compute; 形状变化才重建 (同时刻只有一张图, galloc 直接复用)。
+    ggml_context * gctx = nullptr;
+    ggml_cgraph   * gcache = nullptr;
+    int64_t         gkey = -1;
+    struct gs_t {
+        ggml_tensor * ids = nullptr, * pos = nullptr, * typ = nullptr, * msk = nullptr, * out = nullptr;
+    } gt;
+    void graph_release() {
+        gt = gs_t();
+        gcache = nullptr;
+        gkey = -1;
+        if (gctx) { ggml_free(gctx); gctx = nullptr; }
+    }
+
     bool fuse_ln = true, fuse_act = true;   // 融合算子开关 (GSV_NO_FUSE / GSV_NO_FUSE_LN / GSV_NO_FUSE_ACT)
     // [w;b] 打包张量: 0 = embedding LN, 1 = attn_ln, 2 = out_ln (每层)
     ggml_context * pctx = nullptr;
@@ -87,8 +103,13 @@ void gsv_bert::impl::run_g(const int32_t * ids, const int32_t * pos, const int32
     if (S < 1 || S > 65536) { fprintf(stderr, "[gsv_bert] bad S=%d\n", S); return; }
     if (n_layers < 0 || n_layers > NL) n_layers = NL;
 
-    ggml_init_params ip = { ggml_tensor_overhead() * 65536, NULL, true };
-    ggml_context * ctx = ggml_init(ip);
+    const int64_t key = ((int64_t) S << 16) | (int64_t) (n_layers + 1);
+    if (getenv("GSV_BERT_NO_GRAPHCACHE")) graph_release();   // A/B 用: 强制逐次重建
+    if (!gcache || key != gkey) {                      // 形状变化: 重建 (否则直接用缓存)
+        graph_release();
+        ggml_init_params ip = { ggml_tensor_overhead() * 65536, NULL, true };
+        gctx = ggml_init(ip);
+        ggml_context * ctx = gctx;
 
     ggml_tensor * t_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, S);   ggml_set_input(t_ids);
     ggml_tensor * t_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, S);   ggml_set_input(t_pos);
@@ -124,12 +145,21 @@ void gsv_bert::impl::run_g(const int32_t * ids, const int32_t * pos, const int32
         ggml_tensor * fo = ggml_mul_mat(ctx, w.ff2_w, h);
         cur = ln_affine(ctx, cur, fo, w.ff2_b, ln_pack[1 + 2*li + 1], EPS);           // post-LN 2
     }
-    ggml_set_output(cur);
+        ggml_set_output(cur);
 
-    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 8192, false);
-    ggml_build_forward_expand(graph, cur);
-    if (!ggml_gallocr_alloc_graph(galloc, graph))
-        fprintf(stderr, "[gsv_bert] alloc_graph failed (S=%d n_layers=%d)\n", S, n_layers);
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx, 8192, false);
+        ggml_build_forward_expand(graph, cur);
+        if (!ggml_gallocr_alloc_graph(galloc, graph))
+            fprintf(stderr, "[gsv_bert] alloc_graph failed (S=%d n_layers=%d)\n", S, n_layers);
+        gcache = graph;
+        gkey   = key;
+        gt.ids = t_ids; gt.pos = t_pos; gt.typ = t_typ; gt.msk = t_msk; gt.out = cur;
+    }                                                  // 命中: 直接用缓存 (仅上传输入 + compute)
+
+    ggml_tensor * t_ids = gt.ids, * t_pos = gt.pos, * t_typ = gt.typ;
+    ggml_tensor * t_msk = gt.msk;
+    ggml_tensor * cur   = gt.out;
+    ggml_cgraph * graph = gcache;
 
     ggml_backend_tensor_set(t_ids, ids, 0, (size_t) S * 4);
     ggml_backend_tensor_set(t_pos, pos, 0, (size_t) S * 4);
@@ -154,14 +184,14 @@ void gsv_bert::impl::run_g(const int32_t * ids, const int32_t * pos, const int32
             for (int i = 0; i < S; i++) dst[(size_t) d * S + i] = tmp[(size_t) d + (size_t) i * D];
     };
     to_host_td(cur, out);
-
-    ggml_free(ctx);
+    // ctx/graph/galloc 保留在缓存中 (graph_release / 析构时释放)
 }
 
 gsv_bert::gsv_bert() : p(new impl) {}
 gsv_bert::~gsv_bert() {
     impl & s = *p;
     if (s.galloc) ggml_gallocr_free(s.galloc);
+    s.graph_release();
     if (s.backend) ggml_backend_free(s.backend);
     if (s.wbuf) ggml_backend_buffer_free(s.wbuf);
     if (s.wctx) ggml_free(s.wctx);
