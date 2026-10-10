@@ -265,27 +265,57 @@ struct gsv_dit::impl {
         snprintf(nm, sizeof(nm), "dit.transformer_blocks.%d.attn.to_v.bias", li);
         ggml_tensor * bv = need(nm);
         ggml_tensor * cat = nullptr;
-        // 输出行块 [h*64, h*64+64) 的字节偏移 = 行数 × 行步长 (nb[1] 对 F32/F16/量化块类型统一成立;
-        // 量化张量的行是整块存储, 不能用 元素数×type_size)
-        for (int h = 0; h < HEADS; h++) {
-            const size_t wo = (size_t) h * DH * wq->nb[1];
-            ggml_tensor * qh = lin(c, ggml_view_2d(c, wq, DIM, DH, wq->nb[1], wo),
-                                      ggml_view_1d(c, bq, DH, (size_t) h * DH * 4), x);
-            ggml_tensor * kh = lin(c, ggml_view_2d(c, wk, DIM, DH, wk->nb[1], wo),
-                                      ggml_view_1d(c, bk, DH, (size_t) h * DH * 4), x);
-            ggml_tensor * vh = lin(c, ggml_view_2d(c, wv, DIM, DH, wv->nb[1], wo),
-                                      ggml_view_1d(c, bv, DH, (size_t) h * DH * 4), x);
-            if (h == 0) {                                     // RoPE 只在第 0 号头
-                if (li == 0 && mark_on) { mark(qh, "dbg_q0_raw"); }
-                qh = rope64(c, qh, cos_t, sin_t, Tt);
-                kh = rope64(c, kh, cos_t, sin_t, Tt);
-                if (li == 0 && mark_on) { mark(qh, "dbg_q0_roped"); mark(kh, "dbg_k0_roped"); }
+        static const bool attn_legacy = getenv("GSV_DIT_ATTN_LEGACY") != nullptr;
+        if (attn_legacy) {
+            // [legacy] 每头独立投影 (权重按输出行块切稠密 view), 逐头 softmax
+            // 输出行块 [h*64, h*64+64) 的字节偏移 = 行数 × 行步长 (nb[1] 对 F32/F16/量化块类型统一成立;
+            // 量化张量的行是整块存储, 不能用 元素数×type_size)
+            for (int h = 0; h < HEADS; h++) {
+                const size_t wo = (size_t) h * DH * wq->nb[1];
+                ggml_tensor * qh = lin(c, ggml_view_2d(c, wq, DIM, DH, wq->nb[1], wo),
+                                          ggml_view_1d(c, bq, DH, (size_t) h * DH * 4), x);
+                ggml_tensor * kh = lin(c, ggml_view_2d(c, wk, DIM, DH, wk->nb[1], wo),
+                                          ggml_view_1d(c, bk, DH, (size_t) h * DH * 4), x);
+                ggml_tensor * vh = lin(c, ggml_view_2d(c, wv, DIM, DH, wv->nb[1], wo),
+                                          ggml_view_1d(c, bv, DH, (size_t) h * DH * 4), x);
+                if (h == 0) {                                     // RoPE 只在第 0 号头
+                    if (li == 0 && mark_on) { mark(qh, "dbg_q0_raw"); }
+                    qh = rope64(c, qh, cos_t, sin_t, Tt);
+                    kh = rope64(c, kh, cos_t, sin_t, Tt);
+                    if (li == 0 && mark_on) { mark(qh, "dbg_q0_roped"); mark(kh, "dbg_k0_roped"); }
+                }
+                ggml_tensor * vT = ggml_cont(c, ggml_permute(c, vh, 1, 0, 2, 3));   // [T_k, 64]
+                ggml_tensor * sc = mm(c, kh, qh, "L234");                         // [T_k, T_q]
+                ggml_tensor * pm = ggml_soft_max_ext(c, sc, amask, ATTN_SCALE, 0.0f);
+                ggml_tensor * oh = mm(c, vT, pm, "L236");                         // [64, T_q]
+                cat = cat ? ggml_concat(c, cat, oh, 0) : oh;
             }
-            ggml_tensor * vT = ggml_cont(c, ggml_permute(c, vh, 1, 0, 2, 3));   // [T_k, 64]
-            ggml_tensor * sc = mm(c, kh, qh, "L234");                         // [T_k, T_q]
-            ggml_tensor * pm = ggml_soft_max_ext(c, sc, amask, ATTN_SCALE, 0.0f);
-            ggml_tensor * oh = mm(c, vT, pm, "L236");                         // [64, T_q]
-            cat = cat ? ggml_concat(c, cat, oh, 0) : oh;
+        } else {
+            // [fused] 整块 QKV (3 次大 matmul) + 批量 flash_attn_ext
+            //  - head0 单独 RoPE: 前 64 行切片 cont 后 rope64, 再与其余 960 行 concat
+            //    (rope64 内部的 reshape 要求连续, 直接切 strided view 会断言)
+            //  - q/k/v 以 (hd, T, nh) 步长视图直送 FA (与 AR decode 同款: 两端都按视图步长寻址)
+            //  - FA 输出 (hd, nh, T) 的元素序 = hd + 64*nh + 1024*t, 与 [DIM, T] 行主序一致
+            ggml_tensor * q = lin(c, wq, bq, x);
+            ggml_tensor * k = lin(c, wk, bk, x);
+            ggml_tensor * v = lin(c, wv, bv, x);
+            ggml_tensor * q0 = ggml_cont(c, ggml_view_2d(c, q, DH, Tt, q->nb[1], 0));
+            ggml_tensor * k0 = ggml_cont(c, ggml_view_2d(c, k, DH, Tt, k->nb[1], 0));
+            if (li == 0 && mark_on) { mark(q0, "dbg_q0_raw"); }
+            ggml_tensor * q0r = rope64(c, q0, cos_t, sin_t, Tt);
+            ggml_tensor * k0r = rope64(c, k0, cos_t, sin_t, Tt);
+            if (li == 0 && mark_on) { mark(q0r, "dbg_q0_roped"); mark(k0r, "dbg_k0_roped"); }
+            ggml_tensor * qf = ggml_concat(c, q0r,
+                    ggml_cont(c, ggml_view_2d(c, q, DIM - DH, Tt, q->nb[1], (size_t) DH * 4)), 0);
+            ggml_tensor * kf = ggml_concat(c, k0r,
+                    ggml_cont(c, ggml_view_2d(c, k, DIM - DH, Tt, k->nb[1], (size_t) DH * 4)), 0);
+            auto fa_view = [&](ggml_tensor * t) {
+                return ggml_view_4d(c, t, DH, Tt, HEADS, 1, (size_t) DIM * 4, (size_t) DH * 4, 0, 0);
+            };
+            ggml_tensor * o = ggml_flash_attn_ext(c, fa_view(qf), fa_view(kf), fa_view(v),
+                                                  ggml_reshape_4d(c, amask, Tt, Tt, 1, 1),
+                                                  ATTN_SCALE, 0.0f, 0.0f);
+            cat = ggml_reshape_2d(c, ggml_reshape_4d(c, o, DIM, Tt, 1, 1), DIM, Tt);
         }
         snprintf(nm, sizeof(nm), "dit.transformer_blocks.%d.attn.to_out.0.weight", li);
         ggml_tensor * wo2 = need(nm);

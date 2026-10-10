@@ -35,7 +35,14 @@ v5 变体 `use_step_embedding=False`、`noise_temperature=0.875`。
   - **cache 图**：`prompt_x + mu → text_embed(4×ConvNeXtV2) + concat + proj → condition / negative_condition`，
     `prepare()` 时算一次并拷入持久张量（同 T 重复 prepare 只重算这一步）；
   - **step 图 ×2（pos/neg）**：`linear(proj[:100]) + static → conv_pos(两层分组 conv + Mish) → 22×DiTBlock`
-    （AdaLN 调制 + 16 头逐头注意力 + head0 RoPE + FFN）`→ norm_out → proj_out`；
+    （AdaLN 调制 + 16 头注意力 + head0 RoPE + FFN）`→ norm_out → proj_out`；
+  - **16 头注意力融合（2026-10-10）**：QKV 三次整块 matmul（原为每头 3 个小 matmul ×16）→ head0 前
+    64 行切片 `cont` 后 rope64、再与其余 960 行 `concat`（rope64 内部 reshape 要求连续，直接切
+    strided view 会断言）→ q/k/v 以 `(hd, T, nh)` 步长视图直送 `ggml_flash_attn_ext`
+    （F16 mask `[T,T,1,1]`；FA 输出元素序 = `hd + 64·nh + 1024·t`，即 [DIM, T] 行主序，直接 reshape）
+    → to_out + pad 行掩码。**单步图节点 7783 → 1975（−75%）**；`GSV_DIT_ATTN_LEGACY=1` 回退旧逐头路径。
+    精度：CPU 与旧路径接近逐位一致（FA F32）；Vulkan 数值不变（FA 的 F16 K/V 误差被既有 F16 权重噪声
+    掩盖）——两后端 110 项对拍全 PASS。
   - **三张图各自独立 gallocr**（踩坑 #1，见下），构建时规划一次，运行期不再重规划；
   - 对外 API 一律 torch 布局：`x/prompt/mu/vel` 都是 `[1,C,T]` 字节序；`sample()` = CFM.inference 等价，
     `synthesize()` = 分块 + rolling prompt（`V5_REFERENCE_FRAMES=500`、`TAIL=32`、块 640）等价。
@@ -60,16 +67,19 @@ golden（`tools/dump_golden_dit.py` + `dump_golden_cfm.py`，torch 真实实现�
 | CFM s8c13（cfg，16 次正/负前向） | 5.3e-4 | 1.5e-2 |
 | 分块 synthesize（3 块 rolling） | 9.2e-5 | 4.9e-3 |
 
-判定阈值：`d < 2e-2 × max|ref|`（尺度自适应），CPU 与 Vulkan 均 **ALL PASS**（108 项检查）。
+判定阈值：`d < 2e-2 × max|ref|`（尺度自适应），CPU 与 Vulkan 均 **ALL PASS**（110 项检查）。
+（2026-10-10 注意力融合后重跑两后端仍全 PASS；各探针数值与上表同量级，CPU vel 1.61e-4。）
 
 ## 3. 生产尺寸基准（T=1000，prompt 500，单步，v5turbo 4 步形态）
 
-| 后端 | avg ms/步 | min |
-|---|---|---|
-| torch CPU f32（16 线程） | 2108.7 | 2099.9 |
-| **ggml CPU f32（16 线程）** | **3039.5** | 2990.7（1.44× 于 torch） |
-| torch CUDA f16（RTX 2070） | 113.3 | 107.5 |
-| **ggml Vulkan（RTX 2070）** | **110.8** | 108.8（≈ torch CUDA） |
+| 后端 | 旧（逐头注意力） | 融合注意力（现默认） | vs torch |
+|---|---|---|---|
+| torch CPU f32（16 线程） | 2108.7 | — | 参照 |
+| **ggml CPU f32（16 线程）** | 2992.8 | **1968.3** | **−34%，反超 torch CPU（1.07×）** |
+| torch CUDA f16（RTX 2070） | 113.3 | — | 参照 |
+| **ggml Vulkan（RTX 2070）** | 107.0 | **62.9** | **−41%，快 torch CUDA 1.8×** |
+
+（同段配对 ABA，a-b-a 漂移 <2%。此前"Vulkan ≈ torch CUDA、CPU 1.44× 落后"的结论已随注意力融合翻转。）
 
 > CPU 注意 ggml 默认 4 线程：不设 `GSV_DIT_THREADS` 时 ~6356 ms，16 线程 3039 ms，32 逻辑核反而回退（3564 ms）。
 > torch 侧脚本 `tools/bench_dit.py --device cpu --threads 16`（同 workload）。
@@ -115,20 +125,25 @@ GAME/game.cpp 的移植是它在离散扩散上的特例，本项目直接对上
 配置：`gsv_dit_cfg.dbcache_*`（测试串 `GSV_DIT_DBCACHE="fn=8,thr=0.12,warmup=8,ds=4"`；
 `GSV_DIT_DBCACHE_TRACE=1` 逐步打印 HIT/MISS/fd 与分段耗时）。
 
-### 消融（T=96, s32c13 = 32 步 cfg=1.30, sample() 端到端, 与无缓存输出对比）
+### 消融（T=96, s32c13 = 32 步 cfg=1.30, sample() 端到端, 与无缓存输出对比；数含注意力融合）
 
 | 档 (Fn/thr) | 命中 (pos/neg) | vs 无缓存 max/mean\|d\| | CPU 时间 | Vulkan 时间 |
 |---|---|---|---|---|
-| 无缓存 | — | — | 33995 ms | 3201 ms |
-| F8/.08 | 16/16 | 0.041 / 0.0062 | 23805 ms（**−30%**） | 4644 ms |
-| F8/.12 | 18/18 | 0.064 / 0.0097 | 22233 ms（**−35%**） | 4507 ms |
-| F12/.12 | 20/21 | 0.122 / 0.0137 | 24897 ms（−27%） | — |
-| F16/.20 | 22/22 | 0.201 / 0.0295 | 28112 ms（−17%） | — |
+| 无缓存 | — | — | 28178 ms | 1096 ms |
+| F8/.08 | 16/16 | 0.041 / 0.0062 | 19522 ms（**−31%**） | 1093 ms（±0） |
+| F8/.12 | 18/18 | 0.064 / 0.0097 | 18456 ms（**−35%**） | 1024 ms（−7%） |
+| F12/.12 | 20/21 | 0.122 / 0.0137 | 20359 ms（−28%） | 1137 ms |
+| F16/.20 | 22/22 | 0.201 / 0.0295 | 23089 ms（−18%） | 1307 ms |
 
-生产尺寸（T=1000，Vulkan，受控交错对照）：单体 132 ms/步；命中步（thr .12, ds=4, ~92% 命中）
-**79 ms/步（−40%）**；全 miss 分段 151~164 ms/步（分段本身 +14~24% 开销）；
-`s32c13_big` 真实扩散分布 32 步 e2e：参考 7272 ms → F8/.12 6754 ms（**−7%**，命中 18/18/56%）。
-（T=96 的 Vulkan 反而变慢——小 T 下每步 3 次 submit/fd 回读的固定开销盖过 8/22 块的节省。）
+（同配置的**逐头旧路径**下 s32c13 参考 CPU 为 33355 ms —— 即注意力融合本身使 e2e 参考 −16%；
+T=1000 单步的融合增益见 §3。）
+
+生产尺寸（T=1000，Vulkan，受控三档对照）：单体 **62.1 ms/步**；全 miss 分段 64.3 ms/步
+（**分段开销只剩 +3.5%**，融合前为 +14~24% —— 单步节点数 7783→1975 后 submit/fd 的固定开销大减）；
+高命中场景（thr .12，90% 命中）**27.6 ms/步（−56%）**。真实扩散分布 `s32c13_big` 32 步 e2e：
+参考 4166 ms → F8/.08 3107 ms（−25%）/ F8/.12 2961 ms（**−29%**，命中 56%），质量 mean|d| 与
+融合前一致（0.0063 / 0.0100）。**结论：注意力融合后 cache-dit 的相对收益从"−7%"升到
+"−25~29%"，32 步档建议开（F8/thr 0.12）；4 步 turbo 依旧不适用。**
 
 **4 步 turbo（v5turbo）：不要用 cache**。v5turbo 是 **DMD（Distribution Matching Distillation）
 训练的 shortcut 模型**（开发者确认；§见调研文档），步间 Δt=0.25，fd 远超任何合理阈值：
@@ -167,3 +182,5 @@ mean|d| 立刻跳到 0.021~0.026（电机可闻级别劣化）。DMD 蒸馏出�
 - vocoder 保持 ONNX fp32 不量化（既定约束）；端到端引擎接线（A~E 项）见调研文档 §7。
 - cache-dit 保留为 32 步档可选特性（默认关）；若要进一步压 head 开销，方向是
   fd 判定与 add 融合进 head 图（少一次 submit）。
+- ~~16 头注意力融合~~ **已完成**（2026-10-10，−34% CPU / −41% Vulkan，见 §1/§3）；之后同类余量：
+  q/k/v 改 `ggml_cpy` 原地写 head0（省两次 `cont`+`concat`）、prompt 列的 q/out 投影按需裁剪（理论 ~20%）。
