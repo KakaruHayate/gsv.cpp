@@ -22,8 +22,9 @@ public:
     static gsv_hubert * load(const std::string & gguf_path, const gsv_hubert_cfg & cfg);
     ~gsv_hubert();
 
-    // audio_norm: z-score 后的 16kHz 音频 (16000 采样 = 1 秒参考)
-    // out        : [768, 49] 行主序 (idx = d + t*768), 即 encoder last_hidden_state^T
+    // audio_norm: z-score 后的 16kHz 音频 (变长; >= 720 采样, 帧数 = (n-400)/320+1)
+    // out        : [768, T] 行主序 (idx = d + t*768), 即 encoder last_hidden_state^T
+    //              帧数或采样数变化时自动重建图 (与 wns1 同款按需重建)
     bool encode(const float * audio_norm, int n_samples, std::vector<float> & out);
 
     int  hidden() const;      // 768

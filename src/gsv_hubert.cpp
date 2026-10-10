@@ -35,6 +35,7 @@ static const int  GN_GROUPS = 512;  // transformers: GroupNorm(num_groups=512) =
 struct gsv_hubert::impl {
     ggml_backend_t s_back = nullptr;   // 供 build_xxx 取 buffer type
     int D = D_HID, T = T_FRAMES;
+    int Traw = TRAW;                       // 当前图对应的原始采样数 (变长: encode 时按需重建两张图)
     int n_threads = 0;
     bool verbose = false;
 
@@ -77,15 +78,21 @@ struct gsv_hubert::impl {
         return t;
     }
 
-    void build_g1() {
+    void build_g1(int n_samples) {
+        // 变长: 先拆旧图 (encode 里 T 变化时重建)
+        if (g1_ctx) { if (g1_galloc) { ggml_gallocr_free(g1_galloc); g1_galloc = nullptr; } ggml_free(g1_ctx); g1_ctx = nullptr; g1 = nullptr; g1_in = g1_out = nullptr; }
+        Traw = n_samples;
+        T = (Traw - 400) / 320 + 1;        // 7 层 conv (k/s 见 CK/CS): 感受野 400, 总步长 320
+        if (T < 1) { fprintf(stderr, "[gsv_hubert] audio too short (%d samples)\n", Traw); return; }
         const bool cpu_be = ggml_backend_get_device(s_back) &&
                             ggml_backend_dev_type(ggml_backend_get_device(s_back)) == GGML_BACKEND_DEVICE_TYPE_CPU;
         const bool im2col_f32 = getenv("GSV_HUBERT_IM2COL_F32") ? atoi(getenv("GSV_HUBERT_IM2COL_F32")) != 0 : cpu_be;
         const bool pos_gpu = this->pos_gpu;
-        if (getenv("GSV_HUBERT_DEBUG")) fprintf(stderr, "  [g1] ctx init...\n");
+        if (getenv("GSV_HUBERT_DEBUG")) fprintf(stderr, "  [g1] ctx init... (Traw=%d T=%d)\n", Traw, T);
         ggml_init_params ip = { ggml_tensor_overhead() * 8192, NULL, true };
         g1_ctx = ggml_init(ip);
-        ggml_tensor * x = ggml_new_tensor_1d(g1_ctx, GGML_TYPE_F32, TRAW);
+        const int ol0 = (Traw - 10) / 5 + 1;                   // L0 conv 输出长度 (GroupNorm 的 reshape 用)
+        ggml_tensor * x = ggml_new_tensor_1d(g1_ctx, GGML_TYPE_F32, Traw);
         ggml_set_input(x);
         g1_in = x;
         char nm[160];
@@ -112,13 +119,13 @@ struct gsv_hubert::impl {
             if (i == 0) {
                 // GroupNorm(512=per-channel): ggml_group_norm needs channels at ne2.
                 // conv out [OL, C, 1] -> [OL, 1, C, 1] view; GN+affine; reshape back.
-                y = ggml_reshape_4d(g1_ctx, y, CONV_OL[i], 1, C_CONV, 1);
+                y = ggml_reshape_4d(g1_ctx, y, ol0, 1, C_CONV, 1);
                 y = ggml_group_norm(g1_ctx, y, GN_GROUPS, GN_EPS);
                 // GroupNorm(affine=True): per-channel gamma/beta (channels at ne2)
                 ggml_tensor * gw = ggml_reshape_4d(g1_ctx, need("hubert.feat_conv.0.norm_w"), 1, 1, C_CONV, 1);
                 ggml_tensor * gb = ggml_reshape_4d(g1_ctx, need("hubert.feat_conv.0.norm_b"), 1, 1, C_CONV, 1);
                 y = ggml_add(g1_ctx, ggml_mul(g1_ctx, y, gw), gb);
-                y = ggml_reshape_3d(g1_ctx, y, CONV_OL[i], C_CONV, 1);
+                y = ggml_reshape_3d(g1_ctx, y, ol0, C_CONV, 1);
             }
             y = ggml_gelu_erf(g1_ctx, y);
             x = y;
@@ -167,6 +174,7 @@ struct gsv_hubert::impl {
     }
 
     void build_g2() {
+        if (g2_ctx) { if (g2_galloc) { ggml_gallocr_free(g2_galloc); g2_galloc = nullptr; } ggml_free(g2_ctx); g2_ctx = nullptr; g2 = nullptr; g2_in = g2_out = nullptr; }
         if (getenv("GSV_HUBERT_DEBUG")) fprintf(stderr, "  [g2] ctx init...\n");
         ggml_init_params ip = { ggml_tensor_overhead() * 16384, NULL, true };
         g2_ctx = ggml_init(ip);
@@ -488,7 +496,7 @@ gsv_hubert * gsv_hubert::load(const std::string & gguf_path, const gsv_hubert_cf
     }
 
     if (getenv("GSV_HUBERT_DEBUG")) fprintf(stderr, "  [load] build_g1...\n");
-    s.build_g1();
+    s.build_g1(TRAW);
     s.build_g2();
     if (cfg.verbose) printf("[gsv_hubert] loaded %s: D=%d layers=%d frames=%d\n",
                             gguf_path.c_str(), s.D, NL, s.T);
@@ -526,39 +534,43 @@ static void hubert_pos_conv(const std::vector<float> & x, int T,
     //   acc 为**全部帧**的 8 宽向量 (7 个 YMM), w 以广播方式从顺序流读取
     //   => 每个 w 元素只读一遍 (18.9MB), x 留在 L1/L2
     // 累加顺序 (ic, k 递增) 与初版 (k, ic 递增) 不同 —— 见下方 N 顺序说明
-    const int NTB = (T + 7) / 8;
+    // 内核一次覆盖 56 帧 (7 个 YMM 累加器); 长音频按 56 帧分块 (块内 (ic,k) 累加顺序不变 -> 数值不变)
+    const int FB = 56;
 #pragma omp parallel for schedule(static) collapse(2)
     for (int g = 0; g < G; g++) {
         for (int ob = 0; ob < CG; ob += 8) {
-            for (int o = 0; o < 8; o++) {
-                const int c = g * CG + ob + o;
-                const float * wp = w + (size_t)c * (CG * K);
-                __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
-                __m256 a4 = a0, a5 = a0, a6 = a0;
-                for (int ic = 0; ic < CG; ic++) {
-                    const float * xp = &xt[(size_t)(g * CG + ic) * TPAD];
-                    const float * wrow = wp + (size_t)ic * K;
-                    for (int k = 0; k < K; k++) {
-                        const __m256 wv = _mm256_broadcast_ss(wrow + k);
-                        const float * xb = xp + k;
-                        a0 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xb),      a0);
-                        a1 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xb + 8),  a1);
-                        a2 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xb + 16), a2);
-                        a3 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xb + 24), a3);
-                        a4 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xb + 32), a4);
-                        a5 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xb + 40), a5);
-                        a6 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xb + 48), a6);
+            for (int tb = 0; tb < T; tb += FB) {
+                const int nb = (T - tb < FB) ? (T - tb) : FB;
+                for (int o = 0; o < 8; o++) {
+                    const int c = g * CG + ob + o;
+                    const float * wp = w + (size_t)c * (CG * K);
+                    __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+                    __m256 a4 = a0, a5 = a0, a6 = a0;
+                    for (int ic = 0; ic < CG; ic++) {
+                        const float * xp = &xt[(size_t)(g * CG + ic) * TPAD + tb];
+                        const float * wrow = wp + (size_t)ic * K;
+                        for (int k = 0; k < K; k++) {
+                            const __m256 wv = _mm256_broadcast_ss(wrow + k);
+                            const float * xb = xp + k;
+                            a0 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xb),      a0);
+                            a1 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xb + 8),  a1);
+                            a2 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xb + 16), a2);
+                            a3 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xb + 24), a3);
+                            a4 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xb + 32), a4);
+                            a5 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xb + 40), a5);
+                            a6 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xb + 48), a6);
+                        }
                     }
-                }
-                float tmp[64];
-                _mm256_storeu_ps(tmp,      a0); _mm256_storeu_ps(tmp + 8,  a1);
-                _mm256_storeu_ps(tmp + 16, a2); _mm256_storeu_ps(tmp + 24, a3);
-                _mm256_storeu_ps(tmp + 32, a4); _mm256_storeu_ps(tmp + 40, a5);
-                _mm256_storeu_ps(tmp + 48, a6);
-                float * yc = &y[(size_t)c];
-                for (int t = 0; t < T; t++) {
-                    const float v = tmp[t] + bias[c];
-                    yc[(size_t)t * C] = 0.5f * v * (1.0f + erff(v * 0.70710678118f));
+                    float tmp[64];
+                    _mm256_storeu_ps(tmp,      a0); _mm256_storeu_ps(tmp + 8,  a1);
+                    _mm256_storeu_ps(tmp + 16, a2); _mm256_storeu_ps(tmp + 24, a3);
+                    _mm256_storeu_ps(tmp + 32, a4); _mm256_storeu_ps(tmp + 40, a5);
+                    _mm256_storeu_ps(tmp + 48, a6);
+                    float * yc = &y[(size_t)c];
+                    for (int t = 0; t < nb; t++) {
+                        const float v = tmp[t] + bias[c];
+                        yc[(size_t)(t + tb) * C] = 0.5f * v * (1.0f + erff(v * 0.70710678118f));
+                    }
                 }
             }
         }
@@ -572,14 +584,24 @@ bool gsv_hubert::encode(const float * audio_norm, int n_samples, std::vector<flo
     const auto tpc = [] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
     double t_a = 0, t_b = 0, t_c = 0, t_d = 0;
     if (dbg_t) t_a = tpc();
-    if (n_samples != TRAW) { fprintf(stderr, "[gsv_hubert] expect %d samples, got %d\n", TRAW, n_samples); return false; }
+    if (n_samples < 400 + 320) { fprintf(stderr, "[gsv_hubert] audio too short: %d samples\n", n_samples); return false; }
+    // 变长: 帧数变化时按需重建两张图 (与 wns1 同款)
+    {
+        const int Tf = (n_samples - 400) / 320 + 1;
+        if (!s.g1 || Tf != s.T || n_samples != s.Traw) {
+            if (getenv("GSV_HUBERT_DEBUG")) fprintf(stderr, "  [run] rebuild graphs: Traw %d->%d (T %d->%d)\n", s.Traw, n_samples, s.T, Tf);
+            s.build_g1(n_samples);
+            s.build_g2();
+            if (!s.g1 || !s.g2) { fprintf(stderr, "[gsv_hubert] rebuild failed\n"); return false; }
+        }
+    }
 
     // ---- 图 1: CNN 前端 + feat_proj -> feat [768, T] ----
-    ggml_backend_tensor_set(s.g1_in, audio_norm, 0, (size_t) TRAW * 4);
+    ggml_backend_tensor_set(s.g1_in, audio_norm, 0, (size_t) n_samples * 4);
     if (getenv("GSV_HUBERT_DEBUG")) fprintf(stderr, "  [run] g1 compute...\n");
     ggml_backend_graph_compute(s.backend, s.g1);
     if (getenv("GSV_HUBERT_DEBUG")) fprintf(stderr, "  [run] g1 done\n");
-    std::vector<float> feat((size_t) T_FRAMES * D_HID);   // host [T, C] 布局 (pos_conv 用)
+    std::vector<float> feat((size_t) s.T * D_HID);   // host [T, C] 布局 (pos_conv 用)
     {
         // g1_out 是 ggml [D, T] 列主: g_data[d + t*D] = F[d, t]
         // host feat [T, D] 行主: feat[t*D + d] = F[d, t] —— 两者字节序恒等, 直接拷贝
@@ -600,13 +622,13 @@ bool gsv_hubert::encode(const float * audio_norm, int n_samples, std::vector<flo
     if (!s.pos_gpu) {
         std::vector<float> & pos = s.pos_y;
         const double t_p0 = dbg_t ? tpc() : 0;
-        hubert_pos_conv(feat, T_FRAMES, s.pos_w_perm.data(), s.pos_b.data(), s.pos_xt, pos);
+        hubert_pos_conv(feat, s.T, s.pos_w_perm.data(), s.pos_b.data(), s.pos_xt, pos);
         if (dbg_t) fprintf(stderr, "    [pos_conv] %.2f ms\n", tpc() - t_p0);
         for (size_t i = 0; i < feat.size(); i++) feat[i] += pos[i];
         const float * wd = s.enc_nw.data();
         const float * bd = s.enc_nb.data();
         #pragma omp parallel for schedule(static)
-        for (int t = 0; t < T_FRAMES; t++) {
+        for (int t = 0; t < s.T; t++) {
             float * xr = &feat[(size_t) t * D_HID];
             double m = 0; for (int d = 0; d < D_HID; d++) m += xr[d]; m /= D_HID;
             double v = 0; for (int d = 0; d < D_HID; d++) { double e = xr[d] - m; v += e * e; }
@@ -617,7 +639,7 @@ bool gsv_hubert::encode(const float * audio_norm, int n_samples, std::vector<flo
     if (dbg_t) { t_c = tpc(); }
     // 调试: 直接用 golden enc_in 作为 g2 输入 (隔离 host 段)
     if (const char * gf2 = getenv("GSV_HUBERT_ENCIN")) {
-        std::vector<float> ref((size_t) T_FRAMES * D_HID);
+        std::vector<float> ref((size_t) s.T * D_HID);
         FILE * f = fopen(gf2, "rb");
         if (!f || fread(ref.data(), 4, ref.size(), f) != ref.size()) { fprintf(stderr, "encin read fail\n"); return false; }
         fclose(f);
@@ -638,7 +660,7 @@ bool gsv_hubert::encode(const float * audio_norm, int n_samples, std::vector<flo
         ggml_backend_graph_compute(s.backend, s.g2);
         if (getenv("GSV_HUBERT_DEBUG")) fprintf(stderr, "  [run] g2 done\n");
     }
-    out.assign((size_t) D_HID * T_FRAMES, 0.0f);
+    out.assign((size_t) D_HID * s.T, 0.0f);
     ggml_backend_tensor_get(s.g2_out, out.data(), 0, out.size() * 4);
     if (dbg_t) {
         t_d = tpc();

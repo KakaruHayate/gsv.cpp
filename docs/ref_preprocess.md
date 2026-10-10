@@ -77,3 +77,50 @@ python tools/dump_golden_ref.py
 # 构建 + 对拍（纯 host 侧, CPU Release）
 scripts\build-mel.bat && tests\relcpu\test_mel.exe
 ```
+
+## 5. 参考音频 → prompt semantic tokens（v5 `_set_prompt_semantic` 链的后半段）
+
+`src/gsv_refcode.{h,cpp}` + `tools/convert_refcode.py`（→ `models/gsv-refcode.gguf`：ssl_proj 拆成
+w0/w1 两个 [IC,OC] + codebook）+ `tools/export_resampy_filter.py`（→ resampy kaiser_best 表）：
+
+```
+16k wav(含 9600 零尾) → z-score(HF Wav2Vec2FeatureExtractor: 零均值单位方差, eps 1e-7)
+  → HuBERT(last_hidden_state^T = ssl [768,T], 50Hz)
+  → ssl_proj = Conv1d(768,768,k=2,stride=2)  [w0·x[2i] + w1·x[2i+1] + b]      (25Hz)
+  → RVQ 编码 argmin(x² − 2x·Eᵀ + E²)  (E = quantizer.vq.layers.0._codebook.embed)
+  → codes [T/2] (int32) = AR 的 prompt semantic tokens
+```
+
+对拍（`tests/test_refcode.cpp`，golden 由 `tools/dump_golden_refcode.py` 生成；三段素材 zhs/en/zh32）：
+
+| 项 | zhs（16k 源 4.4s） | en（16k 源 5.6s） | zh32（32k 源 14.3s） |
+|---|---|---|---|
+| match_librosa 重采样 | 0（16k 源直通） | 0 | **1.8e-7** |
+| ssl_proj 输出（vs torch） | **3.5e-5** | **2.8e-5** | **3.5e-5** |
+| codes（由 golden ssl 输入） | **124/124** | **153/153** | **372/372** |
+
+- **重采样**：复刻 repo 的 `resample(match_librosa=True)`（resampy kaiser_best 表 + 双边窗口 +
+  表内线性插值 + 索引 clamp）—— 与 torch 逐位一致（残差 ≤1.8e-7 = double 累加 vs torch f32）。
+- **ssl_proj + RVQ**：由 golden 的 ssl 出发，codes 与 torch **逐帧完全一致**。踩坑记录：
+  3D 权重 `ne{K,IC,OC}` 的 ic 维被 k 打断 → 切片 view 无法直接喂 mul_mat，转换器改成拆两份；
+  `ggml [bins,T2]` 的平铺是 `b + bins*i`（不是行主 `b*T2+i`）；argmin 初值取 `D[bins*i]`。
+- **全链（wav→重采样→z-score→我们的 HuBERT→ssl_proj→argmin）**：codes 与 torch 的匹配率
+  **83% / 89% / 80%** —— 差异全部来自我们 HuBERT 本身的输出偏差（下表），非 refcode 段。
+
+### 5.1 待查：HuBERT 变长在真实语音上的偏差（已暴露，未解决）
+
+`gsv_hubert` 本次补了变长（按 T 重建两张图 + pos_conv host 内核按 56 帧分块；自一致性 ✓
+逐位可重复、跨长度重建无状态问题），但用 **真实语音** input 时与 torch 的 ssl 存在偏差：
+
+| 素材 | T | 我们的 ssl vs torch max\|d\|（refmax≈4.8） |
+|---|---|---|
+| zhs 4.4s | 248 | 0.38（集中在首块，后段 0.07~0.2） |
+| en 5.6s | 307 | 0.087（较均匀） |
+| zh32 14.3s | 745 | **6.06（集中在前 112 帧），后段 0.1~1.2** |
+
+对照：**T=49 的合成输入 golden 仍是 6.7e-6**（原对拍）→ 说明问题出在"变长 + 真实语音
+（含前导低能量段）"的组合，怀疑点按优先级：(1) pos_conv 左补零段在长 T 下的行为（56 帧分块
+边界/索引）；(2) 12 层 transformer 在长 T 下的 FA/数值；(3) z-score 口径的细微差异。
+定位手段已就绪：可对 pre-pos feat / post-pos feat 逐段 hook 对拍（torch 侧 hook
+`feature_projection` / `pos_conv` 即可）。**在此问题解决前，全链 codes 匹配率 ~80~90% 是上限；**
+refcode 段本身（golden ssl → codes）已逐帧一致，可独立使用。
