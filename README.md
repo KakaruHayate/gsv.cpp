@@ -20,6 +20,7 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
 | DiT（CFM + static cache，v5turbo 4 步） | ✅ 单步(t96/pad/t0)/4步/8步cfg(正负交替)/32步(v5dev)/分块 rolling 全对拍 PASS（CPU vel ≤1.2e-3、Vulkan ≤2.5e-2；te_pos 逐位一致）；**16 头注意力融合（QKV 整块 + head0 切片 RoPE + flash_attn_ext，节点 7783→1975）：Vulkan 62.9 ms/步 @T=1000（−41%，快 torch CUDA 1.8×）、CPU 1968 ms（−34%，反超 torch CPU）**；**量化最小档全 F16 = 651 MiB（1.98×↓，Q8 FAIL）**；**cache-dit（DBCache）可选：32 步档 CPU −31~35%、Vulkan e2e −25~29%（高命中步 −56%，融合后建议开），4 步 turbo（DMD 蒸馏）无效**；见 [docs/dit_ggml.md](docs/dit_ggml.md) |
 | vocoder（ONNX，fp32 严格不量化） | ✅ 导出 57.8MB / sha256 `13f95a88…`；对拍 max\|Δ\| ≤1.1e-4、corr 1.0；ORT-DML ≈ torch CUDA，ORT-CPU 快 torch 1.85×，见 [docs/vocoder_onnx.md](docs/vocoder_onnx.md) |
 | 参考音频预处理（wav → 重采样 → mel_fn_v4 → norm_spec） | ✅ `src/gsv_mel`（读 PCM16/24/32/float、torchaudio 等价 sinc 重采样、librosa Slaney mel、log(clamp 1e-5)）；对拍重采样 **≤2.4e-7**、mel（log 域）≤1.3e-3、帧数一致；素材 = 本地 TTS 合成的 speech（zh 32k / en 16k，`tests/audio/`），见 [docs/ref_preprocess.md](docs/ref_preprocess.md) |
+| 参考音频 → prompt semantic tokens（ssl_proj + RVQ） | ✅ `src/gsv_refcode`：Conv1d(768,768,k2,s2) + argmin(x²−2x·Eᵀ+E²)；**codes 逐帧一致**（124/124、153/153、372/372），ssl_proj ≤3.5e-5；含 match_librosa 重采样（resampy kaiser_best 表复刻，≤1.8e-7）。⚠️ 全链 codes 匹配率 80~89% 受限于我们 HuBERT 变长在真实语音上的偏差（0.09~6，[待查](docs/ref_preprocess.md) §5.1） |
 
 ## 目录
 
@@ -44,10 +45,12 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
   - `gsv_refenc.{h,cpp}`：MelStyleEncoder（**WIP**：spectral/temporal PASS，attention 卡点见 docs/cond_ggml.md 第 7 节）
   - `gsv_hubert.{h,cpp}`：HuBERT 音频前端（CNN 前端 + 12 层 post-LN transformer；`GSV_HUBERT_DEVICE`/`BENCH`/`TIMING` 等）
   - `gsv_mel.{h,cpp}`：参考音频预处理（wav 读取 / 带限 sinc 重采样 / mel_fn_v4 / norm_spec；依赖 vendored `third_party/pocketfft_hdronly.h`）
+  - `gsv_refcode.{h,cpp}`：参考音频 → prompt semantic tokens（ssl_proj 分组 conv + RVQ argmin + match_librosa 重采样）
   - `gsv_dit.{h,cpp}`：DiT/CFM 生成器（cache 图 + pos/neg step 图三 gallocr、CFM host 循环、分块 rolling prompt；`GSV_DIT_DEVICE`/`GSV_DIT_DEBUG` 逐层探针）
 - `scripts/build-tests.bat` — 一键构建 ggml + 全部对拍可执行文件（VS2019 BuildTools，含 `/utf-8`；脚本须保持纯 ASCII）
 - `scripts/build-bert-vk.bat` — BERT Release+Vulkan 构建（用 `llama.cpp/build-vk-rel`，产物 `tests/rel/`）
 - `scripts/build-mel.bat` — mel/重采样对拍构建（`tests/relcpu/test_mel.exe`，纯 host 侧）
+- `scripts/build-refcode.bat` — 参考 token 链对拍构建（`tests/rel/test_refcode.exe`，CPU+Vulkan）
 - `scripts/build-ar-vk.bat` — AR 基准/对拍 Release+Vulkan 构建（`tests/rel/bench_ar_rel.exe`、`test_ar_engine_rel.exe`）
 - `scripts/build-dit.bat` / `scripts/build-dit-vk.bat` — DiT 对拍/基准构建（`tests/relcpu/test_dit.exe` / `tests/rel/test_dit_rel.exe`）
 - `tools/` — 权重转换与 golden 导出（Python，diffsinger env）
@@ -60,6 +63,7 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
   - `bench_bert.py`：torch 侧 BERT 基准（CPU fp32 / GPU fp32 / GPU fp16）
   - `quantize_gguf.cpp`：GGUF 量化器（含 K-quants；`--spec` 分组同转换脚本）
   - `dump_golden_ref.py`：参考音频预处理 golden（torchaudio 重采样 + repo mel_fn_v4/norm_spec）
+  - `dump_golden_refcode.py` / `convert_refcode.py` / `export_resampy_filter.py`：参考 token 链 golden（CNHubert+extract_latent）/ 权重 GGUF / resampy 滤波表
   - `convert_dit.py`：s2Gv5turbo.pth 的 `cfm.estimator` → `models/gsv-dit-f32.gguf`（proj 拆分、conv 重排）
   - `dump_golden_dit.py` / `dump_golden_cfm.py`：DiT 单步（t96/pad/t0，含逐层探针）与 CFM 采样（4步/8步cfg/分块）golden
   - `bench_dit.py`：torch 侧 DiT 基准（与 test_dit.cpp 的 `GSV_DIT_BENCH` 同 workload）
@@ -73,6 +77,7 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
   - `bench_ar.cpp`：AR 基准（bs=1/3/8，见 docs/benchmark_ar.md）
   - `test_min_ffn.cpp`：最小 LN+FFN 对拍（排查用）
   - `test_mel.cpp`：wav/重采样/mel/norm_spec 对拍（golden 见 dump_golden_ref.py；`tests/audio/` 为 TTS 合成的参考音频）
+  - `test_refcode.cpp`：重采样(match_librosa)/ssl_proj+RVQ/全链(HuBERT) 对拍
   - `test_dit.cpp`：DiT/CFM 对拍 + 基准（`GSV_DIT_DEVICE`/`GSV_DIT_BENCH`/`GSV_DIT_THREADS`；失败时打印误差最大位置与有效区/pad 区占比）
   - `golden/`（不入库）由上述 dump 脚本生成
 
