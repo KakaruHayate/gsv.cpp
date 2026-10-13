@@ -1,4 +1,4 @@
-# 参考音频预处理：wav / 重采样 / mel_fn_v4（+ 测试素材）
+# 参考音频预处理：wav / 重采样 / mel_fn_v4 / spectrogram_torch（+ 测试素材）
 
 日期：2026-10-10 · 机器同前（RTX 2070 / Vulkan + CPU）
 
@@ -18,6 +18,33 @@
 
 重采样基本逐位（残差来自 torch 的 float32 累加）；mel 差 1e-3 量级是 FFT 舍入经 log 放大的结果，
 相对 refmax≈11.5 只有 1e-4 —— 下游（ref_enc/DiT）的容差在 1e-2 量级，余量充足。
+
+### 0.1 线性幅度谱（`spectrogram_torch`）→ `refer_audio_spec` → `ref_enc` → `ge`
+
+`src/gsv_mel.{h,cpp}` 新增 `gsv_spec`（`spectrogram_torch` 等价：reflect pad → 周期 hann →
+onesided rFFT → `|X| = sqrt(re²+im²+1e-8)`，**不做 mel、不取 log**）与 `gsv_refspec_wav()`
+（= repo `TTS.py::_get_ref_spec` 的生产路径）。golden 由 `tools/dump_golden_refspec.py` 生成
+（torch 侧直接调 repo 的 `spectrogram_torch` + `ref_enc`），对拍 `tests/test_refspec.cpp`
+（`scripts/build-refspec.bat`）：
+
+| 项 | syn (T=300) | zh (T=715) | en (T=277) | zhs (T=219) |
+|---|---|---|---|---|
+| resample→32k + maxx 归一化 | — | **0** | **1.8e-7** | **8.9e-8** |
+| spec704（1025 频点裁到 704） | **7.6e-6** | **1.5e-5** | **2.3e-5** | **1.1e-5** |
+| **ge**（ref_enc 输出，512 维） | **2.9e-6** | **1.2e-6** | **2.4e-6** | **3.3e-6** |
+
+参数取自 `s2Gv5turbo.pth` 的 `config.data`：`filter_length=win_length=2048, hop_length=640,
+sr=32000` → `pad = (2048-640)/2 = 704`（两侧对称），`n_bins = 1025`；`ref_enc` 的
+`MelStyleEncoder(704, ...)` 只吃前 704 个频点。**v5turbo 的两条参考路参数不同**，不可混用：
+
+| 路径 | 参数 | 下游 |
+|---|---|---|
+| `_get_ref_spec` → `spectrogram_torch` | n_fft=win=2048, hop=640, **1025 线性幅度** | `ref_enc` → `ge[512]` |
+| `_get_ref_spec`/`using_vocoder_synthesis` → `mel_fn_v4` | n_fft=win=1280, hop=320, **100 mel + log + norm_spec** | DiT 的 prompt mel |
+
+> 口径差异（易错）：`_get_ref_spec` 对重采样后的波形做 `if maxx > 1: audio /= min(2, maxx)`
+> 归一化，而 `mel_fn_v4` 那条路（`TTS.py:1764`）**不做**。故 `gsv_refspec_wav` 默认开归一化，
+> `gsv_refspec_wav(..., apply_maxx_norm=false)` 只在"喂入已归一化波形"时用（测试第 1 段）。
 
 ## 1. 测试素材：参考音频从哪来
 
@@ -74,17 +101,44 @@ y[o] = Σ_m x[m] · 2·fc·sinc(2·fc·(τ_o − m)) · hann((τ_o − m)/W)
 ```bash
 # golden（diffsinger env；torchaudio 2.11 走 torchcodec, 本环境缺 DLL → 脚本用 soundfile/stdlib wave 读 wav）
 python tools/dump_golden_ref.py
+python tools/dump_golden_refspec.py            # 追加 --T 300 生成合成用例
+python tools/dump_golden_refcode.py
 # 构建 + 对拍（纯 host 侧, CPU Release）
-scripts\build-mel.bat && tests\relcpu\test_mel.exe
+scripts\build-mel.bat     && tests\relcpu\test_mel.exe
+scripts\build-refspec.bat && tests\relcpu\test_refspec.exe
+scripts\build-refcode.bat && tests\rel\test_refcode.exe     # 需要 HuBERT(Vulkan 融合算子)
 ```
 
-## 5. 参考音频 → prompt semantic tokens（v5 `_set_prompt_semantic` 链的后半段）
+## 5. 参考音频 → 两份条件 + prompt semantic tokens（v5 `set_ref_audio` 的三条产出）
+
+repo 的 `TTS.py::set_ref_audio` 一次参考音频读出**三份**东西，分属两条完全不同的前处理链：
+
+```
+raw wav (任意 sr, 多声道取均值)
+├─(a) torchaudio resample → 16k, 拼 0.3s 零尾 → [RAW 波形, 不 z-score] → HuBERT → ssl [768,T]
+│     → ssl_proj Conv1d(768,768,k2,s2) → RVQ argmin(x²−2x·Eᵀ+E²) → codes [T/2]   (见 §5.1)
+├─(b) torchaudio resample → 32k → maxx 归一化 → spectrogram_torch(2048/640/2048) → [1025,T]
+│     → refer[:, :704] × refer_mask → ref_enc(MelStyleEncoder) → ge [512]        (见 §0.1)
+└─(c) torchaudio resample → 32k → [不归一化] → mel_fn_v4(1280/320) → norm_spec
+      → mel2 = DiT 的 prompt mel（V5_REFERENCE_FRAMES=500 上限）                  (见 §2)
+```
+
+三份产物的下游：`decode_encp(prompt_codes, prompt_phones, refer_spec=b)` → `fea_ref`；目标侧
+`decode_encp(codes, phones, refer_spec, ge)` 复用同一 `ge`；`synthesize_v5_mel(fea_ref, fea_todo,
+mel2)` 把 (c) 当 prompt mel。
+
+> **帧数口径**（`synthesize_v5_mel`）：`reference_frames = min(mel2.T, fea_ref.T)`。
+> `fea_ref = 4·len(prompt_codes)`（25Hz →×2 enc_p →×2 bridge），因 (a) 末尾拼了 0.3s 零尾，
+> `fea_ref.T` 恒比 `mel2.T` 多 ~60 帧 → **min 恒取 mel2**（prompt 长度由参考 mel 决定）。
+> `test_refspec.cpp` 的 `ref_frames` 用例把这个约定钉成 PASS/FAIL。
+
+## 5.1 参考音频 → prompt semantic tokens（`_set_prompt_semantic` 链的后半段）
 
 `src/gsv_refcode.{h,cpp}` + `tools/convert_refcode.py`（→ `models/gsv-refcode.gguf`：ssl_proj 拆成
 w0/w1 两个 [IC,OC] + codebook）+ `tools/export_resampy_filter.py`（→ resampy kaiser_best 表）：
 
 ```
-16k wav(含 9600 零尾) → z-score(HF Wav2Vec2FeatureExtractor: 零均值单位方差, eps 1e-7)
+16k wav(含 0.3s 零尾 = int(32000*0.3) = 9600) → [RAW 波形, 不做 z-score, 见 5.1 末的口径说明]
   → HuBERT(last_hidden_state^T = ssl [768,T], 50Hz)
   → ssl_proj = Conv1d(768,768,k=2,stride=2)  [w0·x[2i] + w1·x[2i+1] + b]      (25Hz)
   → RVQ 编码 argmin(x² − 2x·Eᵀ + E²)  (E = quantizer.vq.layers.0._codebook.embed)

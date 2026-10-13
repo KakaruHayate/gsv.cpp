@@ -172,6 +172,132 @@ void gsv_resample(const float * x, int64_t n, int sr_in, int sr_out, std::vector
     }
 }
 
+// ============================ 线性幅度谱 (spectrogram_torch) ============================
+// repo/GPT_SoVITS/module/mel_processing.py::spectrogram_torch:
+//   y = F.pad(y, (int((n_fft-hop)/2), int((n_fft-hop)/2)), 'reflect')     # 两侧对称
+//   spec = torch.stft(y, n_fft, hop, win_length=win, window=hann(win), center=False,
+//                     onesided=True)                                       # -> [n_fft/2+1, T] 复数
+//   spec = sqrt(pow(spec, 2).sum(-1) + 1e-8)                              # |X|, float32
+// 与 mel_spectrogram_torch 共用: reflect pad / 周期 hann / |X| 的 1e-8; 区别只是
+// **没有 mel filterbank、没有 log** (输出线性幅度)。
+// v5turbo 的 spec 参数来自 hps["data"]: filter_length=win_length=2048, hop_length=640
+//   -> pad = (2048-640)/2 = 704, n_bins = 1025
+// (mel 那边 n_fft=win=1280 -> pad=480 两侧对称; 注意不是 game.cpp 的 480/481 非对称写法)
+
+struct gsv_spec::impl {
+    gsv_spec_cfg cfg;
+    std::vector<float> win;
+    int pad = 0, n_bins = 0;
+};
+
+gsv_spec::gsv_spec(const gsv_spec_cfg & cfg) : p(new impl) {
+    p->cfg  = cfg;
+    p->win  = make_hann(cfg.win);
+    p->pad  = (cfg.n_fft - cfg.hop) / 2;          // 两侧对称 (repo: int((n_fft-hop_size)/2))
+    p->n_bins = cfg.n_fft / 2 + 1;
+}
+gsv_spec::~gsv_spec() { delete p; }
+const gsv_spec_cfg & gsv_spec::cfg() const { return p->cfg; }
+int gsv_spec::n_bins() const { return p->n_bins; }
+
+int gsv_spec::frames(int64_t n) const {
+    const int64_t padded = n + 2 * (int64_t) p->pad;
+    const int64_t T = (padded - p->cfg.n_fft) / p->cfg.hop + 1;
+    return T > 0 ? (int) T : 0;
+}
+
+bool gsv_spec::forward(const float * wav, int64_t n, std::vector<float> & spec, int & T) const {
+    const gsv_spec_cfg & c = p->cfg;
+    const int n_bins = p->n_bins;
+    T = frames(n);
+    spec.clear();
+    if (T <= 0) return false;
+
+    std::vector<float> padded;
+    reflect_pad(wav, n, p->pad, padded);
+    spec.assign((size_t) n_bins * T, 0.0f);
+
+    auto worker = [&](int t0, int t1) {
+        std::vector<float> frame((size_t) c.n_fft);
+        std::vector<std::complex<float>> sp((size_t) n_bins);
+        pocketfft::shape_t  sh = { (size_t) c.n_fft };
+        pocketfft::stride_t si = { (std::ptrdiff_t) sizeof(float) };
+        pocketfft::stride_t so = { (std::ptrdiff_t) sizeof(std::complex<float>) };
+        pocketfft::shape_t  ax = { 0 };
+        for (int t = t0; t < t1; t++) {
+            const float * src = padded.data() + (size_t) t * c.hop;
+            for (int k = 0; k < c.win; k++) frame[(size_t) k] = src[k] * p->win[(size_t) k];
+            for (int k = c.win; k < c.n_fft; k++) frame[(size_t) k] = 0.0f;   // win == n_fft 时为空转
+            pocketfft::r2c(sh, si, so, ax, pocketfft::FORWARD, frame.data(), sp.data(), 1.0f);
+            for (int k = 0; k < n_bins; k++) {
+                const float re = sp[(size_t) k].real(), im = sp[(size_t) k].imag();
+                spec[(size_t) k * T + t] = std::sqrt(re * re + im * im + 1e-8f);   // repo: sqrt(pow2.sum + 1e-8)
+            }
+        }
+    };
+
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 1;
+    int want = c.n_threads > 0 ? c.n_threads : (int) std::min<unsigned>(hw, 8u);
+    const int n_thr = std::max(1, std::min(want, T / 64 + 1));
+    if (n_thr == 1) { worker(0, T); return true; }
+    const int per = (T + n_thr - 1) / n_thr;
+    std::vector<std::thread> pool;
+    for (int t0 = 0; t0 < T; t0 += per) pool.emplace_back(worker, t0, std::min(T, t0 + per));
+    for (auto & th : pool) th.join();
+    return true;
+}
+
+// ---- repo TTS.py::_get_ref_spec 的等价封装 ----
+// 关键口径差异 (与 mel2 那条路对比):
+//   spec 这条路对**重采样后的音频**做 `if maxx > 1: audio /= min(2, maxx)` 归一化;
+//   mel2 (mel_fn_v4) **不做**这个归一化 (TTS.py:1764 直接用 resample 后的 ref_audio)。
+// v5turbo: raw_sr != 32000 -> resample(raw, raw_sr, 32000); 多声道已在 gsv_wav_load 取均值
+// ref_enc 只吃前 704 个频点 (MelStyleEncoder(704, ...)), 故裁到 [704, T]
+bool gsv_refspec_wav(const float * wav, int64_t n, int sr_in,
+                     std::vector<float> & spec704, int & T, bool apply_maxx_norm) {
+    spec704.clear(); T = 0;
+    if (n <= 0) return false;
+    std::vector<float> a32;
+    if (sr_in == 32000) a32.assign(wav, wav + n);
+    else gsv_resample(wav, n, sr_in, 32000, a32);
+    if (a32.empty()) return false;
+
+    if (apply_maxx_norm) {                       // repo: maxx = audio.abs().max(); if maxx > 1: audio /= min(2, maxx)
+        float maxx = 0.0f;
+        for (float v : a32) maxx = std::max(maxx, std::fabs(v));
+        if (maxx > 1.0f) {
+            const float d = std::min(2.0f, maxx);
+            for (float & v : a32) v /= d;
+        }
+    }
+    gsv_spec_cfg scfg;                            // 默认 = v5turbo 的 2048/2048/640/32000
+    gsv_spec sp(scfg);
+    std::vector<float> full;
+    int Tf = 0;
+    if (!sp.forward(a32.data(), (int64_t) a32.size(), full, Tf)) return false;
+    T = Tf;
+    const int nb = sp.n_bins();
+    const int C = gsv_refenc_in_dim;               // 704 (在 gsv_mel.h 里以常量声明, 避免循环依赖)
+    if (C > nb) return false;
+    spec704.assign((size_t) C * Tf, 0.0f);
+    for (int k = 0; k < C; k++)
+        std::memcpy(spec704.data() + (size_t) k * Tf, full.data() + (size_t) k * Tf, (size_t) Tf * sizeof(float));
+    return true;
+}
+
+bool gsv_refspec(const std::string & wav_path, std::vector<float> & spec704, int & T,
+                 bool apply_maxx_norm, bool verbose) {
+    std::vector<float> raw;
+    int sr = 0;
+    if (!gsv_wav_load(wav_path, raw, sr)) return false;
+    const bool ok = gsv_refspec_wav(raw.data(), (int64_t) raw.size(), sr, spec704, T, apply_maxx_norm);
+    if (ok && verbose)
+        printf("[refspec] %s: %zu samples @ %d Hz -> [%d, %d]\n",
+               wav_path.c_str(), raw.size(), sr, gsv_refenc_in_dim, T);
+    return ok;
+}
+
 // ============================ mel ============================
 
 struct gsv_mel::impl {
