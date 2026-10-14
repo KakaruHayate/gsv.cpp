@@ -1125,26 +1125,35 @@ bool gsv_dit::sample(const float * mu, const float * prompt, int P, int T, int s
 
 // synthesize_v5_mel 等价: rolling prompt 分块
 bool gsv_dit::synthesize(const float * fea_ref, int R, const float * fea_todo, int N,
-                         const float * mel_ref, int steps, float cfg, uint64_t seed,
+                         const float * mel_ref, int mel_ref_T, int steps, float cfg, uint64_t seed,
                          int block_override, const std::vector<const float *> * x0_chunks,
                          std::vector<float> & mel_out) {
     impl & s = *p;
     static const int REF = 500, TAIL = 32, TOTAL = 1000, MAXCHUNK = 640;
     if (R <= 0 || N <= 0) { fprintf(stderr, "[gsv_dit] synthesize(): bad R=%d N=%d\n", R, N); return false; }
-    const int ref_off = (R > REF) ? (R - REF) : 0;            // [..., -REF:]
-    const int ref_frames = R - ref_off;
+    // repo module/models_v5.py::synthesize_v5_mel 的口径:
+    //   reference_frames = min(mel2.T, fea_ref.T)          <- **先截到公共长度**
+    //   reference_mel      = mel2[..., :reference_frames][..., -REF:]
+    //   reference_features = fea_ref[..., :reference_frames][..., -REF:]
+    // fea_ref.T (= 4*len(codes), 参考音频含 0.3s 零尾) 通常比 mel2.T 多 ~60 帧,
+    // 故 min 恒取 mel2 —— 但两侧都必须按同一个 reference_frames 取帧, 否则 mel_ref 会越界读。
+    if (mel_ref_T <= 0) { fprintf(stderr, "[gsv_dit] synthesize(): bad mel_ref_T=%d\n", mel_ref_T); return false; }
+    const int ref_common = std::min(mel_ref_T, R);       // reference_frames
+    const int ref_off    = (ref_common > REF) ? (ref_common - REF) : 0;   // [..., -REF:]
+    const int ref_frames = ref_common - ref_off;
     const int chunk_frames = std::min(TOTAL - ref_frames, block_override > 0 ? block_override : MAXCHUNK);
     if (chunk_frames <= 0) { fprintf(stderr, "[gsv_dit] synthesize(): ref too long\n"); return false; }
 
-    // 从 [C, R] 的列偏移 ref_off 处取 ref_frames 帧 -> [C, ref_frames]
-    auto slice_cols = [&](const float * src, int C, std::vector<float> & dst) {
+    // 从 [C, ref_common] 的列偏移 ref_off 处取 ref_frames 帧 -> [C, ref_frames]
+    // (mel_ref 的列数是 mel_ref_T, fea_ref 的是 R; 两者都截到 ref_common 后再取末 REF 帧)
+    auto slice_cols = [&](const float * src, int C, int cols, std::vector<float> & dst) {
         dst.resize((size_t) C * ref_frames);
         for (int c = 0; c < C; c++)
-            memcpy(dst.data() + (size_t) c * ref_frames, src + (size_t) c * R + ref_off, (size_t) ref_frames * 4);
+            memcpy(dst.data() + (size_t) c * ref_frames, src + (size_t) c * cols + ref_off, (size_t) ref_frames * 4);
     };
     std::vector<float> mel_ref_s, fea_ref_s;
-    slice_cols(mel_ref, MEL, mel_ref_s);
-    slice_cols(fea_ref, TEXTD, fea_ref_s);
+    slice_cols(mel_ref, MEL, mel_ref_T, mel_ref_s);
+    slice_cols(fea_ref, TEXTD, R, fea_ref_s);
 
     std::vector<float> rolling_mel = mel_ref_s;      // [MEL, ref_frames]
     std::vector<float> rolling_feat = fea_ref_s;     // [TEXTD, ref_frames]

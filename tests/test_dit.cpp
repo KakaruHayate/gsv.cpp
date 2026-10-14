@@ -433,7 +433,8 @@ int main(int argc, char ** argv) {
         if (fr.empty() || out_ref.empty()) { printf("  [chunk] golden missing -> skip\n"); }
         else {
             const int R = 4, N = 12, block = blk.empty() ? 5 : (int) blk[0];
-            printf("  [chunk] R=%d N=%d block=%d (rolling prompt)\n", R, N, block);
+            const int mel_T = (int) (mr.size() / 100);   // golden 的 mel_ref 帧数 (此处与 R 相等)
+            printf("  [chunk] R=%d N=%d block=%d mel_T=%d (rolling prompt)\n", R, N, block, mel_T);
             std::vector<std::vector<float>> noises;
             for (int i = 0; i < 8; i++) {
                 auto nz = read_bin(p + "noise" + std::to_string(i) + ".bin");
@@ -444,7 +445,7 @@ int main(int argc, char ** argv) {
             std::vector<const float *> nzptrs;
             for (auto & v : noises) nzptrs.push_back(v.data());
             std::vector<float> mel;
-            if (!m->synthesize(fr.data(), R, ft.data(), N, mr.data(), 4, 0.0f, 12345, block,
+            if (!m->synthesize(fr.data(), R, ft.data(), N, mr.data(), mel_T, 4, 0.0f, 12345, block,
                                &nzptrs, mel)) n_fail++;
             else check("chunk_out", mel, out_ref, 0.0, 100, N);
             printf("    (chunks=%d)\n", (int) noises.size());

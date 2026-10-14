@@ -46,6 +46,10 @@ v5 变体 `use_step_embedding=False`、`noise_temperature=0.875`。
   - **三张图各自独立 gallocr**（踩坑 #1，见下），构建时规划一次，运行期不再重规划；
   - 对外 API 一律 torch 布局：`x/prompt/mu/vel` 都是 `[1,C,T]` 字节序；`sample()` = CFM.inference 等价，
     `synthesize()` = 分块 + rolling prompt（`V5_REFERENCE_FRAMES=500`、`TAIL=32`、块 640）等价。
+    **注意 `synthesize(fea_ref, R, fea_todo, N, mel_ref, mel_ref_T, ...)` 的 `mel_ref_T` 必须显式传**：
+    repo 的口径是 `reference_frames = min(mel_ref_T, R)` 后两侧**按同一个截断**取末 500 帧
+    （fea_ref.T = 4·len(codes) 因参考音频含 0.3s 零尾，通常比 mel2.T 多 ~60 帧 → min 恒取 mel2）。
+    早期实现误用 `R` 作为 mel_ref 的列数 → 越界读 → NaN（端到端集成时暴露，2026-10-14 修）。
 - `tests/test_dit.cpp`：单步三用例（t96 / pad `x_lens<T` 掩码 / t0）+ CFM 4 步 cfg0 + 8 步 cfg1.30
   （pos/neg 逐次对拍）+ 分块（block=5 强制 3 块）+ `GSV_DIT_BENCH` 生产尺寸基准；
   `GSV_DIT_DEBUG=1` 下约 25 个中间张量可用 `debug_read()` 读回逐层对拍

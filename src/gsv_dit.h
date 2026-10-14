@@ -64,11 +64,12 @@ public:
                 uint64_t seed, const float * x0, std::vector<float> & mel_out);
 
     // synthesize_v5_mel 等价 (分块 + rolling prompt).
-    //   fea_ref [512,R] / fea_todo [512,N] / mel_ref [100,R] (都 torch 布局)
+    //   fea_ref [512,R] / fea_todo [512,N] / mel_ref [100,mel_ref_T] (都 torch 布局)
+    //   reference_frames = min(mel_ref_T, R) 后取末 500 帧 (repo 口径; 两侧同一截断!)
     //   block_override > 0 时覆盖 chunk_frames (测试用小值), 否则用生产值 640
     //   x0_chunks 非空时: 第 i 块用 (*x0_chunks)[i] 作初始噪声 (对拍用, 长度 = 块数)
     bool synthesize(const float * fea_ref, int R, const float * fea_todo, int N,
-                    const float * mel_ref, int steps, float cfg, uint64_t seed,
+                    const float * mel_ref, int mel_ref_T, int steps, float cfg, uint64_t seed,
                     int block_override, const std::vector<const float *> * x0_chunks,
                     std::vector<float> & mel_out);
 
