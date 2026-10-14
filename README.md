@@ -20,7 +20,8 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
 | DiT（CFM + static cache，v5turbo 4 步） | ✅ 单步(t96/pad/t0)/4步/8步cfg(正负交替)/32步(v5dev)/分块 rolling 全对拍 PASS（CPU vel ≤1.2e-3、Vulkan ≤2.5e-2；te_pos 逐位一致）；**16 头注意力融合（QKV 整块 + head0 切片 RoPE + flash_attn_ext，节点 7783→1975）：Vulkan 62.9 ms/步 @T=1000（−41%，快 torch CUDA 1.8×）、CPU 1968 ms（−34%，反超 torch CPU）**；**量化最小档全 F16 = 651 MiB（1.98×↓，Q8 FAIL）**；**cache-dit（DBCache）可选：32 步档 CPU −31~35%、Vulkan e2e −25~29%（高命中步 −56%，融合后建议开），4 步 turbo（DMD 蒸馏）无效**；见 [docs/dit_ggml.md](docs/dit_ggml.md) |
 | vocoder（ONNX，fp32 严格不量化） | ✅ 导出 57.8MB / sha256 `13f95a88…`；**C++ 集成 `src/gsv_vocoder`（ORT C API 运行时加载，DML/WebGPU/CPU 三 EP 自动挑选）**；对拍 max\|Δ\| ≤2.6e-6；**WebGPU 最快**（T=200 71 ms vs DML 172 / CPU 1564），见 [docs/ort_integration.md](docs/ort_integration.md) |
 | G2PW（多音字消歧，ONNX） | ✅ **C++ 集成 `src/gsv_g2pw`**：12 层 BERT + 条件描述符头 + **自带 WordPiece tokenizer**（复刻 repo `wordize_and_map`）；对拍 pred **逐条一致**、probs max\|Δ\| **6.0e-8**（含数字/标点/变长 batch）；WebGPU 36 ms vs DML 110 / CPU 75（N=16） |
-| 端到端（半程） | ✅ `tests/demo_e2e.cpp`：参考音频三链 + AR + decode_encp×2 + DiT synthesize + vocoder → **wav**（0.66 s 真实语音，峰值 −15 dBFS，70% 能量在语音带）；36 s（CPU ggml + WebGPU ORT）。**文本前端未接线**（phones/bert 仍取自 golden） |
+| 前后端分离（`gsv_ggml_cli` server + Python 前端） | ✅ **常驻 server**（`tools/gsv_ggml_cli.cpp` + `src/gsv_engine` + `src/ipc`，模型只加载一次）+ **Python 前端**（`tools/frontend/`，套 repo 的 `text/` 做 G2PW/音素化，BERT 前向在 C++ 侧）。传输 = 两平面 framing（vendored from `openutau-vst-bridge`，MPL-2.0）：行式控制面 + `tensor` 长度前缀二进制帧。**文本端到端出 wav**（长句 6.72 s，95% 能量在语音带）；AR 侧已与 torch 逐项对拍（长度一致、bert max\|d\| 4.2e-3/corr 0.99999995），见 [docs/e2e_server.md](docs/e2e_server.md) |
+| 端到端（半程 demo） | ✅ `tests/demo_e2e.cpp`：参考音频三链 + AR + decode_encp×2 + DiT synthesize + vocoder → **wav**（36 s，CPU ggml + WebGPU ORT） |
 | 参考音频预处理（wav → 重采样 → mel_fn_v4 → norm_spec） | ✅ `src/gsv_mel`（读 PCM16/24/32/float、torchaudio 等价 sinc 重采样、librosa Slaney mel、log(clamp 1e-5)）；对拍重采样 **≤2.4e-7**、mel（log 域）≤1.3e-3、帧数一致；素材 = 本地 TTS 合成的 speech（zh 32k / en 16k，`tests/audio/`），见 [docs/ref_preprocess.md](docs/ref_preprocess.md) |
 | 参考音频 → refer_audio_spec（spectrogram_torch）→ ref_enc → ge | ✅ `gsv_spec` + `gsv_refspec_wav`（= repo `_get_ref_spec`：32k 重采样 + maxx 归一化 + n_fft=2048/hop=640 的线性幅度谱，1025 频点裁到 704）；对拍 spec704 **≤2.3e-5**、**ge ≤3.3e-6**（4 段素材），ref_frames 口径（min(mel2.T, fea_ref.T) 恒取 mel2）已钉死 |
 | 参考音频 → prompt semantic tokens（ssl_proj + RVQ） | ✅ `src/gsv_refcode`：Conv1d(768,768,k2,s2) + argmin(x²−2x·Eᵀ+E²)；**codes 逐帧一致**（124/124、153/153、372/372），ssl_proj ≤3.5e-5；含 match_librosa 重采样（resampy kaiser_best 表复刻，≤1.8e-7）。**全链 codes 100%（含 14.3s 长音频）**；HuBERT 变长（按 T 重建 + pos_conv 56 帧分块）ssl 偏差 ≤4.8e-4 |
@@ -39,6 +40,7 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
 - `docs/cond_ggml.md` — 条件段（V5 decode_encp 链）侦察 + RVQ 实现（链条入口，bit-exact）
 - `docs/dit_ggml.md` — DiT/CFM（cache/step 图、head0-only RoPE、分组 conv、GRN/mask 语义、对拍与基准）
 - `docs/ort_integration.md` — vocoder + G2PW 的 ORT 集成（运行时加载、DML/WebGPU/CPU 三 EP、自带 tokenizer、端到端 demo）
+- `docs/e2e_server.md` — 前后端分离（`gsv_ggml_cli` server 的两平面协议 + Python 前端接线 + 与 torch 的 AR 对照）
 - `models/` — 权重（不入库）：s1v3.ckpt(AR) / s2Gv5turbo.pth / vocoder.pth / chinese-hubert-base / chinese-roberta-wwm-ext-large
 - `src/` — 引擎代码
   - `gsv_sampler.{h,cpp}`：AR 采样链（严格复刻 `AR/models/utils.py::logits_to_probs` 的顺序与语义）+ exp-trick 采样
@@ -53,6 +55,8 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
   - `gsv_dit.{h,cpp}`：DiT/CFM 生成器（cache 图 + pos/neg step 图三 gallocr、CFM host 循环、分块 rolling prompt；`GSV_DIT_DEVICE`/`GSV_DIT_DEBUG` 逐层探针）
   - `gsv_vocoder.{h,cpp}`：vocoder ONNX 推理（ORT C API 运行时 `LoadLibrary`，DML/WebGPU/CPU 自动挑 EP）
   - `gsv_g2pw.{h,cpp}`：G2PW 多音字消歧（ORT + 自带 BERT WordPiece tokenizer）
+  - `gsv_engine.{h,cpp}`：引擎门面（复用全部 gsv_* 模块，供 server 调用）
+  - `ipc/`：两平面 IPC 传输（`stream`/`socket`/`frame`/`reader`/`hash`/`discovery`/`session`，vendored from openutau-vst-bridge, MPL-2.0）
 - `scripts/build-tests.bat` — 一键构建 ggml + 全部对拍可执行文件（VS2019 BuildTools，含 `/utf-8`；脚本须保持纯 ASCII）
 - `scripts/build-bert-vk.bat` — BERT Release+Vulkan 构建（用 `llama.cpp/build-vk-rel`，产物 `tests/rel/`）
 - `scripts/build-mel.bat` — mel/重采样对拍构建（`tests/relcpu/test_mel.exe`，纯 host 侧）
@@ -63,6 +67,9 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
 - `scripts/build-vocoder.bat` — vocoder（ORT）对拍构建（`tests/relcpu/test_vocoder.exe`，DLL 运行时加载）
 - `scripts/build-g2pw.bat` — G2PW 对拍构建（`tests/relcpu/test_g2pw.exe`）
 - `scripts/build-e2e.bat` — 端到端 demo 构建（`tests/relcpu/demo_e2e.exe`，链接 build-vk-rel）
+- `scripts/build-cli.bat` — **server 构建**（`tests/relcpu/gsv_ggml_cli.exe`）
+- `scripts/build-ipc-probe.bat` — framing 冒烟测试（`tests/relcpu/ipc_probe.exe`）
+- `scripts/link-g2pw-model.bat` / `scripts/fetch-nltk-data.bat` — 前端一次性环境准备
 - `tools/` — 权重转换与 golden 导出（Python，diffsinger env）
   - `convert_ar.py`：s1v3.ckpt → `models/gsv-ar-f32.gguf`
   - `dump_golden_ar.py`：torch 侧 golden（step0 各段 + K/V cache + decode 步）
@@ -94,6 +101,8 @@ GPT-SoVITS V5 推理的 ggml/C++ 实现（开发中）。
   - `test_dit.cpp`：DiT/CFM 对拍 + 基准（`GSV_DIT_DEVICE`/`GSV_DIT_BENCH`/`GSV_DIT_THREADS`；失败时打印误差最大位置与有效区/pad 区占比）
   - `test_vocoder.cpp` / `test_g2pw.cpp`：ORT ONNX 对拍 + 基准（`GSV_VOC_DEVICE`/`GSV_G2PW_DEVICE` = cpu/dml/webgpu）
   - `demo_e2e.cpp`：端到端 demo（参考音频三链 + AR + 条件段 + DiT + vocoder → wav；`--ref/--out/--steps`）
+  - `ipc_probe.cpp`：framing 冒烟（数据帧跨读 / 头预读负载未到）
+  - `tools/frontend/`：**Python 前端 + server 客户端**（`gsv_client` / `frontend` / `tts`；`python tools/frontend/tts.py --text ...`）
   - `golden/`（不入库）由上述 dump 脚本生成
 
 ## 获取 ggml 基线

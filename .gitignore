@@ -14,3 +14,8 @@ __pycache__/
 tests/vk/
 models/sweep/
 tests/rel/
+
+# 前后端分离: 本地 NLTK 数据 + 生成的音频 + 临时 probe 落盘
+.nltk_data/
+tests/e2e_out/
+tests/e2e_*/
