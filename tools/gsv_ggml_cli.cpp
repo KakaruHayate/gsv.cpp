@@ -189,24 +189,31 @@ bool EngineRequests::Handle(const std::string &kind, const std::string &params,
     if (kind == "ar") {
         const gsvipc::ParkedTensor *ph = need("phones");
         const gsvipc::ParkedTensor *pr = need("prompt");
-        if (!ph || !pr) return false;
-        std::vector<int32_t> phones, prompt;
-        if (!AsI32(*ph, &phones) || !AsI32(*pr, &prompt)) {
-            error = "phones/prompt must be int32 arrays";
+        const gsvipc::ParkedTensor *pp = need("promptPhones");
+        if (!ph || !pr || !pp) return false;
+        std::vector<int32_t> phones, prompt, promptPhones;
+        if (!AsI32(*ph, &phones) || !AsI32(*pr, &prompt) || !AsI32(*pp, &promptPhones)) {
+            error = "phones/prompt/promptPhones must be int32 arrays";
             return false;
         }
-        // bert 可省 (非 zh 口径 = 全零)
-        std::vector<float> bert;
+        // bert / promptBert 可省 (非 zh 口径 = 全零)
+        std::vector<float> bert, promptBert;
         auto bit = tensors.find("bert");
         if (bit != tensors.end() && !AsF32(bit->second, &bert)) {
             error = "bert must be a float32 array";
+            return false;
+        }
+        auto pbit = tensors.find("promptBert");
+        if (pbit != tensors.end() && !AsF32(pbit->second, &promptBert)) {
+            error = "promptBert must be a float32 array";
             return false;
         }
         const int maxSteps = req.value("maxSteps", 1500);
         const int earlyStop = req.value("earlyStop", -1);
         const uint64_t seed = req.value("seed", (uint64_t) 0);
         std::vector<int32_t> sem;
-        if (!engine_->ar_generate(phones, bert, prompt, maxSteps, earlyStop, seed, sem)) {
+        if (!engine_->ar_generate(phones, bert, promptPhones, promptBert, prompt,
+                                  maxSteps, earlyStop, seed, sem)) {
             error = "ar_generate failed";
             return false;
         }
@@ -222,13 +229,14 @@ bool EngineRequests::Handle(const std::string &kind, const std::string &params,
         const gsvipc::ParkedTensor *sm = need("sem");
         const gsvipc::ParkedTensor *ph = need("phones");
         const gsvipc::ParkedTensor *pr = need("prompt");
+        const gsvipc::ParkedTensor *pp = need("promptPhones");
         const gsvipc::ParkedTensor *ge = need("ge");
         const gsvipc::ParkedTensor *m2 = need("mel2");
-        if (!sm || !ph || !pr || !ge || !m2) return false;
-        std::vector<int32_t> sem, phones, prompt;
+        if (!sm || !ph || !pr || !pp || !ge || !m2) return false;
+        std::vector<int32_t> sem, phones, prompt, promptPhones;
         std::vector<float> geV, mel2;
         if (!AsI32(*sm, &sem) || !AsI32(*ph, &phones) || !AsI32(*pr, &prompt) ||
-            !AsF32(*ge, &geV) || !AsF32(*m2, &mel2)) {
+            !AsI32(*pp, &promptPhones) || !AsF32(*ge, &geV) || !AsF32(*m2, &mel2)) {
             error = "synth tensors have the wrong element size";
             return false;
         }
@@ -241,7 +249,8 @@ bool EngineRequests::Handle(const std::string &kind, const std::string &params,
         const float cfgRate = req.value("cfg", 0.0f);
         const uint64_t seed = req.value("seed", (uint64_t) 0);
         std::vector<float> wav;
-        if (!engine_->synthesize(sem, phones, prompt, geV, mel2, melT, steps, cfgRate, seed, wav)) {
+        if (!engine_->synthesize(sem, phones, prompt, promptPhones, geV, mel2, melT,
+                                 steps, cfgRate, seed, wav)) {
             error = "synthesize failed";
             return false;
         }

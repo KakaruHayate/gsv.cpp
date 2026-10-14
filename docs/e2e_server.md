@@ -14,18 +14,23 @@
 | 传输层 | `src/ipc/*` | 两平面 framing（vendored from openutau-vst-bridge，MPL-2.0） |
 | Python 前端 | `tools/frontend/{gsv_client,frontend,tts}.py` | 协议客户端 + 文本前端 + 驱动 |
 
-**端到端**（`python -m tools.frontend.tts --text ...`）：
+**端到端**（`python -m tools.frontend.tts --text ... --ref ... --ref-text ...`）：
 
 ```
-参考音频(4.38s) -> prepRef    prompt codes=124 / ge[512] / mel2[100,438]   2.0 s
-文本 "大家好，这是一段用来测试的语音合成。"
-                -> bert        [1024, 34]                                    0.3 s
-                -> ar          sem=19                                       1.0 s
-                -> synth       条件段 + DiT(4步) + vocoder -> wav 1.14 s     20.5 s
+参考音频(7.87s) + 它的文本 -> prepRef   prompt codes=211 / ge[512] / mel2[100,786]   5.4 s
+文本 "你好，欢迎使用语音合成系统。" (26 phones)
+                -> bert        prompt 59 + target 26 = 85 帧                 0.2 s
+                -> ar          sem=85                                        3.3 s
+                -> synth       条件段 + DiT(4步) + vocoder -> wav 5.10 s     35 s
 ```
 
-长句（111 phones）→ 语义 token 112 个 → **6.72 s 语音**（95% 能量在 100–4000 Hz 语音带）。
-短句有时停在 11 个 token（0.66 s）——见 §6，**torch 在同一输入上也停 11**，是模型行为。
+三句实测（时长与文本成比例，音色与参考的谱相关度 0.84~0.88）：
+
+| 文本 | phones | sem | 时长 |
+|---|---|---|---|
+| 你好，欢迎使用语音合成系统。 | 26 | 85 | 5.10 s |
+| 这是一段特意写得很长的句子，用来观察语义token的数量会不会随着文本变长而增加。 | 70 | 179 | 10.74 s |
+| 今天天气不错，我们出去走走吧。 | 28 | 79 | 4.74 s |
 
 ## 1. 为什么这么切
 
@@ -116,24 +121,30 @@ base64（+33%）且整体拼内存 —— bridge 的 §15 明确否掉了这条�
 
 ## 6. 与 torch 的对照（AR 只出 11 个 token 的判案）
 
-短文本经常只生成 11 个语义 token（0.66 s）。11 恰好是 EOS 解锁的边界（AR 前 11 步屏蔽 EOS），
-所以看起来像"引擎卡住了"。用**同一份输入**喂 torch 版 AR（`tools/probe_ar_torch.py`）：
+初版短文本只生成 11 个语义 token（0.66 s），11 恰好是 EOS 解锁的边界，看着像引擎卡住。
+用**同一份输入**喂 torch 版 AR（`tools/probe_ar_torch.py`）也得到 11，于是判定"模型行为"。
+
+**这个结论当时是对的、但问题问错了。** 真正的原因是**参考侧条件漏了一半**（见 §7.5）：
+repo 的 AR 输入不是"目标文本音素"，而是 **参考文本音素 ++ 目标文本音素**。
+补上之后同一句话从 11 个 token 变成 85 个（0.66 s → 5.10 s），音色谱相关度 0.62 → 0.87。
+
+> 教训：torch 与我们对拍"行为一致"，只能证明**我们对输入的加工**与它一致；
+> 如果两边喂的都是同一份**错的输入**，对拍结果一样"正常"。用 torch 判案前，
+> 先确认喂进去的东西和 repo 生产路径喂的是同一个。
+
+修正后的对照（同一份输入，含完整参考侧）：
 
 ```
-inputs: phones=(1,34) bert=(1,1024,34) prompt=(1,164)
-torch AR: 总长=175, 生成=11 (idx=11)
-ours  sem=11
+ours  : phones=70 prompt=211 -> sem=30     ［修正前, 只喂目标半］
+torch : 总长=240, 生成=29                  ［同样只喂目标半, 所以一致］
+ours  : prompt 59 + target 70 = 129 帧 -> sem=179   ［修正后, 完整条件］
 ```
 
-**结论：torch 也停在 11 —— 是模型行为，不是移植问题。** 两侧 token **长度一致**；具体取值不同，
-因为我们的采样用 xorshift RNG 而 torch 用 `torch.multinomial`（同一分布的不同抽样）。
+输入侧逐项对拍：`bert` vs HF `hidden_states[-3]`（经 word2ph 扩展）**max|d| = 4.2e-3 /
+refmax 26（相对 1.6e-4）、corr 0.99999995**（F16 档底噪）；`prompt codes` 与 torch 100% 一致。
 
-输入侧已逐项对拍：`bert` 与 HF `hidden_states[-3]` 经 word2ph 重复后
-**max|d| = 4.2e-3 / refmax 26（相对 1.6e-4）、corr 0.99999995**（F16 档底噪）；
-`prompt codes` 与 torch 100% 一致（refcode 链）；`phones` 直接来自 repo 前端。
-
-> 参考音频必须 **3~10 s**（repo `_set_prompt_semantic` 会 `OSError` 拒掉其余长度）。
-> `tests/audio/ref_zh_short_16k.wav`（4.38 s）是合适的默认素材。
+> 参考音频必须 **3~10 s**，且**必须连同它的文本一起给**（`--ref-text`）。
+> `tests/audio/ref_zh_known_16k.wav`（7.87 s，本地 TTS 合成，文本已知）是默认素材。
 
 ## 7. 踩坑记录
 
@@ -151,6 +162,31 @@ ours  sem=11
    `min(mel2.T, fea_ref.T)` 再取末 500 帧，早期实现误用 R 当列数 → 越界 → NaN。
 6. **中文注释写在 `.bat` 里会让 cmd 解析错位**（代码页 + 行尾），脚本保持纯 ASCII。
 7. **heredoc 里的 `\n` 会变真换行**，写进 C 字符串字面量就断行（C2001）。用 Edit 工具改。
+8. **参考侧的条件有两处，都容易漏**（见 §7.5）——只对拍单模块是发现不了的。
+
+### 7.5 两个"参考侧缺条件"的 bug（同一类，都很隐蔽）
+
+repo 里"参考音频"的文本参与了**两处**条件构造，而我们的 `prepRef` 一开始只吃 wav：
+
+**(a) DiT 的 `fea_ref` 要用参考文本的音素**
+```python
+fea_ref, ge = self.vits_model.decode_encp(prompt_semantic_tokens, prompt_phones, refer_audio_spec)
+```
+`fea_ref` 是 DiT `mu` 的前半段（参考侧上下文）。我们原来传的是**目标文本的 phones** →
+条件全错 → 音色谱相关度只有 0.62~0.65。
+
+**(b) AR 的输入是参考音素 ++ 目标音素**
+```python
+all_bert_features = torch.cat([prompt_data["bert_features"], item["bert_features"]], dim=1)
+all_phones        = torch.LongTensor(prompt_data["phones"] + item["phones"])
+```
+我们原来只喂目标那一半 → 条件缺一半 → 模型早早判 EOS（短句只出 11 个 token）。
+
+补上之后：短句 0.72 → **5.10 s**，长句 1.80 → **10.74 s**，音色谱相关度 → **0.84~0.88**。
+
+> 为什么单模块对拍查不出来：`refcode`/`refspec`/`mel`/`enc_p`/`DiT` 每个都已对拍通过，
+> 错的是**它们之间的接线**（谁的条件喂给谁）。这类 bug 只有把整链跑起来、
+> 并且**逐行核对 repo 生产路径的参数来源**才能发现。
 
 ## 8. 复现
 

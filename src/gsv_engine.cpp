@@ -253,6 +253,8 @@ bool gsv_engine::bert_feature(const std::vector<int32_t> & ids,
 
 bool gsv_engine::ar_generate(const std::vector<int32_t> & phones,
                              const std::vector<float> & bert,
+                             const std::vector<int32_t> & prompt_phones,
+                             const std::vector<float> & prompt_bert,
                              const std::vector<int32_t> & prompt_codes,
                              int max_steps, int early_stop, uint64_t seed,
                              std::vector<int32_t> & sem) {
@@ -263,10 +265,40 @@ bool gsv_engine::ar_generate(const std::vector<int32_t> & phones,
         fprintf(stderr, "[gsv_engine] bert 尺寸 %zu != 1024*%zu\n", bert.size(), phones.size());
         return false;
     }
+    if (prompt_phones.empty()) {
+        fprintf(stderr, "[gsv_engine] prompt_phones 为空: repo 的 AR 输入是 "
+                        "参考文本音素 ++ 目标文本音素 (TTS.py:1017)\n");
+        return false;
+    }
+    if (!prompt_bert.empty() && prompt_bert.size() != (size_t) 1024 * prompt_phones.size()) {
+        fprintf(stderr, "[gsv_engine] prompt_bert 尺寸 %zu != 1024*%zu\n",
+                prompt_bert.size(), prompt_phones.size());
+        return false;
+    }
+
+    // x = prompt_phones ++ phones (repo: all_phones = prompt_data["phones"] + item["phones"])
     gsv_ar_request req;
-    req.phones = phones;
-    req.bert = bert;                       // 空 = 全零 (非 zh 口径)
+    req.phones.reserve(prompt_phones.size() + phones.size());
+    req.phones.insert(req.phones.end(), prompt_phones.begin(), prompt_phones.end());
+    req.phones.insert(req.phones.end(), phones.begin(), phones.end());
+
+    // bert 同样沿时间轴拼接 (repo: torch.cat([prompt_bert, target_bert], dim=1))
+    if (!bert.empty() || !prompt_bert.empty()) {
+        const int Pp = (int) prompt_phones.size();
+        const int Pt = (int) phones.size();
+        const int P = Pp + Pt;
+        req.bert.assign((size_t) 1024 * (size_t) P, 0.0f);
+        for (int k = 0; k < 1024; k++) {
+            if (!prompt_bert.empty())
+                std::memcpy(req.bert.data() + (size_t) k * P, prompt_bert.data() + (size_t) k * Pp,
+                            (size_t) Pp * sizeof(float));
+            if (!bert.empty())
+                std::memcpy(req.bert.data() + (size_t) k * P + Pp, bert.data() + (size_t) k * Pt,
+                            (size_t) Pt * sizeof(float));
+        }
+    }
     req.prompt = prompt_codes;
+
     gsv_sampler_cfg sc;                    // 默认 = repo TTS.py 的采样参数
     auto res = s.ar->generate({ req }, sc, seed, early_stop, max_steps);
     if (res.tokens.empty()) { fprintf(stderr, "[gsv_engine] AR 生成返回空\n"); return false; }
@@ -274,13 +306,15 @@ bool gsv_engine::ar_generate(const std::vector<int32_t> & phones,
     const size_t skip = std::min(prompt_codes.size(), all.size());
     sem.assign(all.begin() + skip, all.end());
     if (s.cfg.verbose)
-        printf("[gsv_engine] ar_generate: prompt=%zu -> sem=%zu\n", prompt_codes.size(), sem.size());
+        printf("[gsv_engine] ar_generate: x=%zu(=prompt %zu + target %zu) prompt_codes=%zu -> sem=%zu\n",
+               req.phones.size(), prompt_phones.size(), phones.size(), prompt_codes.size(), sem.size());
     return true;
 }
 
 bool gsv_engine::synthesize(const std::vector<int32_t> & sem,
                             const std::vector<int32_t> & phones,
                             const std::vector<int32_t> & prompt_codes,
+                            const std::vector<int32_t> & prompt_phones,
                             const std::vector<float> & ge,
                             const std::vector<float> & mel2, int mel2_T,
                             int steps, float cfg, uint64_t seed,
@@ -296,12 +330,20 @@ bool gsv_engine::synthesize(const std::vector<int32_t> & sem,
         fprintf(stderr, "[gsv_engine] mel2 尺寸 %zu != %d*%d\n", mel2.size(), MEL_DIM, mel2_T);
         return false;
     }
+    if (prompt_phones.empty()) {
+        fprintf(stderr, "[gsv_engine] prompt_phones 为空: 参考侧 fea_ref 必须用**参考文本**的音素\n"
+                        "(repo TTS.py::using_vocoder_synthesis 的 decode_encp(prompt_sem, prompt_phones, ...));\n"
+                        "传目标文本的音素会让 DiT 的参考条件全错\n");
+        return false;
+    }
 
     std::vector<float> fea_ref, fea_todo;
-    if (!s.decode_encp_run(prompt_codes, phones, ge, fea_ref)) {
+    // 参考侧: prompt_codes + **prompt_phones** (参考文本的音素)
+    if (!s.decode_encp_run(prompt_codes, prompt_phones, ge, fea_ref)) {
         fprintf(stderr, "[gsv_engine] decode_encp(参考侧) 失败\n");
         return false;
     }
+    // 目标侧: sem + 目标文本的 phones
     if (!s.decode_encp_run(sem, phones, ge, fea_todo)) {
         fprintf(stderr, "[gsv_engine] decode_encp(目标侧) 失败\n");
         return false;

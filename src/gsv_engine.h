@@ -42,22 +42,27 @@ public:
                       std::vector<float> & feat1024);
 
     // ---- AR (repo TTS.py 的 T2S 段) ----
-    //   phones [P] + bert [1024,P] + prompt_codes -> 语义 token (不含 prompt 本身)
+    //   repo 的 AR 输入 x = **参考文本音素 ++ 目标文本音素** (TTS.py:1017 `all_phones =
+    //   prompt_data["phones"] + item["phones"]`), bert 同理沿 dim=1 拼接; 语义 prompt 用参考码。
+    //   只喂目标那一半会让条件缺一半 -> 模型早早判 EOS。
+    //   prompt_bert 为空表示两半都用全零 (非 zh 口径)。
     bool ar_generate(const std::vector<int32_t> & phones,
-                     const std::vector<float> & bert,          // [1024, P] 行主
+                     const std::vector<float> & bert,           // [1024, Pt] 行主
+                     const std::vector<int32_t> & prompt_phones,
+                     const std::vector<float> & prompt_bert,    // [1024, Pp] 行主 (可空)
                      const std::vector<int32_t> & prompt_codes,
                      int max_steps, int early_stop, uint64_t seed,
                      std::vector<int32_t> & sem);
 
     // ---- 主链 (repo decode_encp + synthesize_v5_mel + vocoder) ----
-    //   sem -> RVQ/x2 -> enc_p -> bridge/x2 -> wns1  (目标侧 fea_todo)
-    //   prompt_codes -> 同链                       (参考侧 fea_ref, 复用 ge)
+    //   prompt_codes + **prompt_phones** -> 参考侧 fea_ref   (repo: decode_encp(prompt_sem,
+    //       prompt_phones, ...) —— 参考侧用的是**参考音频对应文本**的音素, 不是目标文本的!)
+    //   sem + phones                       -> 目标侧 fea_todo
     //   -> DiT synthesize_v5_mel (分块 rolling) -> denorm_spec -> vocoder -> wav [32k]
-    // bert 传空 vector 表示全零 (repo get_bert_inf 对非 zh 的口径; enc_p 的 text 路不用它,
-    //   这里保留参数是为了一致性与将来扩展)
     bool synthesize(const std::vector<int32_t> & sem,
                     const std::vector<int32_t> & phones,
                     const std::vector<int32_t> & prompt_codes,
+                    const std::vector<int32_t> & prompt_phones,
                     const std::vector<float> & ge,
                     const std::vector<float> & mel2, int mel2_T,
                     int steps, float cfg, uint64_t seed,

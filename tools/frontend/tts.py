@@ -20,6 +20,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from frontend.frontend import Frontend          # noqa: E402
 from frontend.gsv_client import GsvClient       # noqa: E402
 
+# ref_zh_known_16k.wav 的合成文本 (本地 TTS 生成, 见 scripts/make-ref-audio.py)
+REF_TEXT_DEFAULT = "大家好，这里是语音合成的参考音频，用来测试音色和韵律是否正常。"
+
 
 def write_wav(path, samples, sr=32000):
     """float32 [-1,1] -> 16-bit PCM wav。"""
@@ -61,20 +64,48 @@ class Tts:
         self.max_steps = max_steps
         self.ref = None          # (codes, ge, mel2, melT)
 
-    def set_reference(self, wav_path):
+    def set_reference(self, wav_path, ref_text):
+        """参考音频 + **它的文本**。
+
+        ref_text 不是可选的: repo 里参考侧的条件有两个用处 ——
+          AR : x = **参考文本音素 ++ 目标文本音素** (TTS.py:1017), bert 同理拼接;
+          DiT: fea_ref = decode_encp(prompt_semantic, prompt_phones, ...)。
+        不传或传目标文本, 两处条件都会错 (表现为早停 / 音色不对)。
+        """
+        if not ref_text or not ref_text.strip():
+            raise ValueError("必须给参考音频的文本 (ref_text)")
         data, t = self.c.request("prepRef", {"wavPath": wav_path})
         codes = np.frombuffer(t["codes"], dtype="<i4").astype(np.int32)
         ge = np.frombuffer(t["ge"], dtype="<f4").astype(np.float32)
         mel2 = np.frombuffer(t["mel2"], dtype="<f4").astype(np.float32)
         melT = int(data["melT"])
         assert mel2.size == 100 * melT, (mel2.size, melT)
-        self.ref = (codes, ge, mel2, melT)
+
+        pp_phones, pp_w2p, pp_ids = self.fe(ref_text)
+        pp_phones = np.asarray(pp_phones, dtype=np.int32)
+        pp_bert = self._bert(pp_ids, pp_w2p)
+        self.ref = (codes, ge, mel2, melT, pp_phones, pp_bert)
         return self.ref
+
+    def _bert(self, ids, word2ph):
+        """调 server 的 bert 命令 -> [1024, P] 的 bytes; ids 为空 (非 zh) 则返回 b''。"""
+        if not ids:
+            return b""
+        data, t = self.c.request(
+            "bert",
+            {"idsLen": len(ids), "word2phLen": len(word2ph)},
+            tensors={"ids": np.asarray(ids, dtype="<i4").tobytes(),
+                     "word2ph": np.asarray(word2ph, dtype="<i4").tobytes()},
+        )
+        feat = t["feat"]
+        n = int(data["phones"])
+        assert len(feat) == 1024 * n * 4, (len(feat), n)
+        return feat
 
     def synthesize(self, text, language=None, steps=None, verbose=True):
         if self.ref is None:
             raise RuntimeError("先调 set_reference()")
-        codes, ge, mel2, melT = self.ref
+        codes, ge, mel2, melT, pp_phones, pp_bert = self.ref
         lang = language or self.language
         t0 = time.time()
         phones, word2ph, bert_ids = self.fe(text, language=lang)
@@ -84,28 +115,23 @@ class Tts:
 
         ph32 = np.asarray(phones, dtype="<i4")
 
-        # BERT 特征 (只有 zh 需要; 其余语言 repo 给全零)
-        bert = b""
-        if bert_ids:
-            t1 = time.time()
-            data, t = self.c.request(
-                "bert",
-                {"idsLen": len(bert_ids), "word2phLen": len(word2ph)},
-                tensors={"ids": np.asarray(bert_ids, dtype="<i4").tobytes(),
-                         "word2ph": np.asarray(word2ph, dtype="<i4").tobytes()},
-            )
-            bert = t["feat"]
-            n = int(data["phones"])
-            assert len(bert) == 1024 * n * 4, (len(bert), n)
-            if verbose:
-                print("  bert feat [1024, %d] (%.0f ms)" % (n, (time.time() - t1) * 1000))
+        # BERT 特征: 参考文本与目标文本各一份, server 侧沿时间轴拼接 (repo TTS.py:1017)
+        t1 = time.time()
+        bert = self._bert(bert_ids, word2ph)
+        if verbose and (bert or pp_bert):
+            print("  bert: prompt %d + target %d = %d 帧 (%.0f ms)"
+                  % (len(pp_phones), len(phones), len(pp_phones) + len(phones),
+                     (time.time() - t1) * 1000))
 
-        # AR -> 语义 token
+        # AR -> 语义 token (x = 参考文本音素 ++ 目标文本音素)
         t2 = time.time()
         req = {"maxSteps": self.max_steps, "earlyStop": self.early_stop, "seed": self.seed}
-        tens = {"phones": ph32.tobytes(), "prompt": codes.tobytes()}
+        tens = {"phones": ph32.tobytes(), "prompt": codes.tobytes(),
+                "promptPhones": pp_phones.astype("<i4").tobytes()}
         if bert:
             tens["bert"] = bert
+        if pp_bert:
+            tens["promptBert"] = pp_bert
         data, t = self.c.request("ar", req, tensors=tens)
         sem = np.frombuffer(t["sem"], dtype="<i4").astype(np.int32)
         if verbose:
@@ -120,6 +146,7 @@ class Tts:
                 "sem": sem.tobytes(),
                 "phones": ph32.tobytes(),
                 "prompt": codes.tobytes(),
+                "promptPhones": pp_phones.astype("<i4").tobytes(),
                 "ge": ge.tobytes(),
                 "mel2": mel2.tobytes(),
             },
@@ -137,6 +164,8 @@ def main():
     ap.add_argument("--text", action="append", default=[],
                     help="要合成的句子 (可重复; 不填则用内置示例)")
     ap.add_argument("--ref", default=None, help="参考音频 wav")
+    ap.add_argument("--ref-text", default=None,
+                    help="参考音频对应的文本 (必填: fea_ref 依赖它的音素)")
     ap.add_argument("--out", default=None, help="单句输出路径; 多句时按序号加后缀")
     ap.add_argument("--outdir", default="tests/e2e_out", help="多句输出目录")
     ap.add_argument("--language", default="zh", help="zh/en/ja/ko/yue/auto")
@@ -151,9 +180,16 @@ def main():
     args = ap.parse_args()
 
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    # 参考音频必须 3~10 s (repo TTS.py::_set_prompt_semantic 会直接 OSError 拒掉其余长度),
-    # 所以默认用 4.38 s 的短素材, 而不是 14.3 s 的长素材。
-    ref = args.ref or os.path.join(root, "tests", "audio", "ref_zh_short_16k.wav")
+    # 参考音频必须 3~10 s (repo TTS.py::_set_prompt_semantic 会直接 OSError 拒掉其余长度)。
+    # ref_zh_known_16k.wav 是本地 TTS 合成的, 文本已知 (见 REF_TEXT_DEFAULT) —— 参考文本必须
+    # 与音频一致, 否则 fea_ref 条件错 (音色/韵律都会不对)。
+    ref = args.ref or os.path.join(root, "tests", "audio", "ref_zh_known_16k.wav")
+    ref_text = args.ref_text
+    if ref_text is None:
+        if os.path.basename(ref) == "ref_zh_known_16k.wav":
+            ref_text = REF_TEXT_DEFAULT
+        else:
+            ap.error("给了 --ref 就必须同时给 --ref-text (参考音频对应的文本)")
     exe = os.path.join(root, "tests", "relcpu", "gsv_ggml_cli.exe")
 
     texts = args.text or [
@@ -168,9 +204,9 @@ def main():
         t = Tts(c, language=args.language, seed=args.seed, early_stop=args.early_stop)
         print("[tts] 参考音频: %s" % ref)
         t0 = time.time()
-        codes, ge, mel2, melT = t.set_reference(ref)
-        print("  prompt codes=%d  ge[512]  mel2[100,%d]  (%.0f ms)"
-              % (codes.size, melT, (time.time() - t0) * 1000))
+        codes, ge, mel2, melT, pp_phones, pp_bert = t.set_reference(ref, ref_text)
+        print("  prompt codes=%d  ge[512]  mel2[100,%d]  prompt_phones=%d  (%.0f ms)"
+              % (codes.size, melT, pp_phones.size, (time.time() - t0) * 1000))
 
         multi = len(texts) > 1
         if multi:
