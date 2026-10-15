@@ -293,8 +293,10 @@ bool gsv_engine::ar_generate(const std::vector<int32_t> & phones,
     req.phones.insert(req.phones.end(), prompt_phones.begin(), prompt_phones.end());
     req.phones.insert(req.phones.end(), phones.begin(), phones.end());
 
-    // bert 同样沿时间轴拼接 (repo: torch.cat([prompt_bert, target_bert], dim=1))
-    if (!bert.empty() || !prompt_bert.empty()) {
+    // bert 沿时间轴拼接 (repo: torch.cat([prompt_bert, target_bert], dim=1))。
+    // 非 zh 时两半都是**全零** (repo get_bert_inf 的直接口径) —— 必须真的填一份零缓冲,
+    // 不能留空: gsv_ar 的 build_inputs 会无条件读 r.bert[k*T+t]。
+    {
         const int Pp = (int) prompt_phones.size();
         const int Pt = (int) phones.size();
         const int P = Pp + Pt;
