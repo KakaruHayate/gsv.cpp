@@ -13,7 +13,9 @@
 #include "gsv_vocoder.h"
 #include "gsv_wns1.h"
 
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -51,7 +53,8 @@ struct gsv_engine::impl {
     bool decode_encp_run(const std::vector<int32_t> & codes,
                          const std::vector<int32_t> & phones,
                          const std::vector<float> & ge,
-                         std::vector<float> & fea) {
+                         std::vector<float> & fea,
+                         const std::string * diag_dir = nullptr) {
         const int Tc = (int) codes.size();
         if (Tc <= 0) return false;
         std::vector<float> q;
@@ -64,6 +67,14 @@ struct gsv_engine::impl {
         if (!encp->encode(y_tc.data(), T, phones.data(), (int) phones.size(), ge.data(),
                           m, logs, &yenc))
             return false;
+        if (diag_dir) {   // 分段对拍: enc_p 的 y (bridge 输入) / bridge 输出 / x2 之后
+            auto wr2 = [&](const char * n, const std::vector<float> & v) {
+                FILE * f = fopen((*diag_dir + "/" + n).c_str(), "wb");
+                if (f) { fwrite(v.data(), 4, v.size(), f); fclose(f); }
+            };
+            wr2("ours_encp_y.f32", yenc);           // [192, T] torch 布局
+            wr2("ours_quant.f32", q);               // [768, 2Tc] ggml 布局
+        }
         std::vector<float> xb((size_t) 192 * T), br;
         for (int t = 0; t < T; t++)
             for (int c = 0; c < 192; c++) xb[(size_t) c + (size_t) t * 192] = yenc[(size_t) c * T + t];
@@ -338,19 +349,37 @@ bool gsv_engine::synthesize(const std::vector<int32_t> & sem,
     }
 
     std::vector<float> fea_ref, fea_todo;
+    const std::string diag_dir = getenv("GSV_ENGINE_DUMP") ? getenv("GSV_ENGINE_DUMP") : "";
     // 参考侧: prompt_codes + **prompt_phones** (参考文本的音素)
-    if (!s.decode_encp_run(prompt_codes, prompt_phones, ge, fea_ref)) {
+    if (!s.decode_encp_run(prompt_codes, prompt_phones, ge, fea_ref, &diag_dir)) {
         fprintf(stderr, "[gsv_engine] decode_encp(参考侧) 失败\n");
         return false;
     }
     // 目标侧: sem + 目标文本的 phones
-    if (!s.decode_encp_run(sem, phones, ge, fea_todo)) {
+    if (!s.decode_encp_run(sem, phones, ge, fea_todo, nullptr)) {
         fprintf(stderr, "[gsv_engine] decode_encp(目标侧) 失败\n");
         return false;
     }
     // wns1 输出 [2T, 512] (idx = c*2T + t) 与 DiT 要的 [512, N] (idx = c*N + t) 同布, 无需转置
     const int R = (int) (fea_ref.size() / TXT_DIM);
     const int N = (int) (fea_todo.size() / TXT_DIM);
+
+    // 诊断: 落盘 DiT 的输入 (GSV_ENGINE_DUMP=<dir>), 供 torch 复算对比
+    if (const char * dd = getenv("GSV_ENGINE_DUMP")) {
+        auto wr = [&](const char * n, const void * p, size_t bytes) {
+            FILE * f = fopen((std::string(dd) + "/" + n).c_str(), "wb");
+            if (f) { fwrite(p, 1, bytes, f); fclose(f); }
+        };
+        wr("fea_ref.f32", fea_ref.data(), fea_ref.size() * 4);
+        wr("fea_todo.f32", fea_todo.data(), fea_todo.size() * 4);
+        wr("mel2.f32", mel2.data(), mel2.size() * 4);
+        wr("sem.i32", sem.data(), sem.size() * 4);
+        wr("prompt_codes.i32", prompt_codes.data(), prompt_codes.size() * 4);
+        wr("prompt_phones.i32", prompt_phones.data(), prompt_phones.size() * 4);
+        wr("phones.i32", phones.data(), phones.size() * 4);
+        wr("ge.f32", ge.data(), ge.size() * 4);
+        printf("[gsv_engine] dumped DiT inputs to %s (R=%d N=%d melT=%d)\n", dd, R, N, mel2_T);
+    }
 
     std::vector<float> mel_out;
     if (!s.dit->synthesize(fea_ref.data(), R, fea_todo.data(), N, mel2.data(), mel2_T,
@@ -360,6 +389,56 @@ bool gsv_engine::synthesize(const std::vector<int32_t> & sem,
     }
     const int Nmel = (int) (mel_out.size() / MEL_DIM);
     if (Nmel <= 0) { fprintf(stderr, "[gsv_engine] DiT 输出为空\n"); return false; }
+    if (const char * dd = getenv("GSV_ENGINE_DUMP")) {
+        const std::string dir(dd);
+        FILE * f = fopen((dir + "/mel_out.f32").c_str(), "wb");
+        if (f) { fwrite(mel_out.data(), 4, mel_out.size(), f); fclose(f); }
+        // 复刻一份与 C++ 侧完全相同的初始噪声, 供 torch 侧做**同输入**对比:
+        // sample() 用 gsv_rng(seed) 逐元素生成 randn*0.875 填满 x [MEL, T]。
+        // (与 gsv_dit.cpp::randn01 同式 —— Box-Muller + gsv_rng 的 xorshift)
+        const int Tdump = s.dit->cur_T();   // prepare 后的 T = ref_frames + 块长
+        gsv_rng rng(seed ? seed : 1);
+        std::vector<float> noise((size_t) MEL_DIM * (size_t) Tdump);
+        for (size_t i = 0; i < noise.size(); i++) {
+            float u1 = rng.uniform01();
+            const float u2 = rng.uniform01();
+            if (u1 < 1e-30f) u1 = 1e-30f;
+            noise[i] = sqrtf(-2.0f * logf(u1)) * cosf(6.283185307179586f * u2) * 0.875f;
+        }
+        f = fopen((dir + "/noise.f32").c_str(), "wb");
+        if (f) { fwrite(noise.data(), 4, noise.size(), f); fclose(f); }
+
+        // 逐层速度场对拍: 用同一份噪声重放 4 步, 每步 dump vel (torch 侧 probe_dit_steps.py 同样拦 4 步)
+        std::vector<float> vel((size_t) MEL_DIM * (size_t) Tdump);
+        f = fopen((dir + "/vels.f32").c_str(), "wb");
+        if (f) {
+            const float st = 1.0f / (float) steps;
+            const int P = s.dit->cur_prompt_T();
+            for (int j = 0; j < steps; j++) {
+                const float t = (float) j * st;
+                if (!s.dit->velocity(noise.data(), t, false, vel.data())) break;
+                // 只对拍生成区 (prompt 区 x 恒 0, 两边都是 0)
+                for (int c = 0; c < MEL_DIM; c++)
+                    fwrite(vel.data() + (size_t) c * Tdump + P, 4, (size_t) (Tdump - P), f);
+                // 逐层探针必须在 **step 0** 之后读 (mark() 记录的是最近一次 velocity 的图);
+                // 若放到循环外读到的就是 step 3, 与 torch 的 t=0 对不上。
+                if (j == 0) {
+                    for (const char * nm : { "dbg_x_lin", "dbg_convpos", "dbg_b0_norm",
+                                             "dbg_b0_scale_msa", "dbg_b0_shift_msa",
+                                             "dbg_b0_attn", "dbg_b0_ff", "dbg_b0_out",
+                                             "dbg_b21_out", "dbg_norm_out" }) {
+                        std::vector<float> v;
+                        if (s.dit->debug_read(nm, v) && !v.empty()) {
+                            FILE * g = fopen((dir + "/" + nm + ".f32").c_str(), "wb");
+                            if (g) { fwrite(v.data(), 4, v.size(), g); fclose(g); }
+                        }
+                    }
+                }
+            }
+            fclose(f);
+            printf("[gsv_engine] dumped %d 步 vel + step0 逐层探针 (prompt_T=%d)\n", steps, P);
+        }
+    }
 
     // denorm_spec -> vocoder (输入是 torch 布局 [100, T], 正好是 mel_out 的布局)
     std::vector<float> mel_dn((size_t) MEL_DIM * (size_t) Nmel);

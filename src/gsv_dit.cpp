@@ -709,6 +709,15 @@ bool gsv_dit::prepare(const float * prompt_mel, const float * mu, int T, int x_l
     if (T <= 0) { fprintf(stderr, "[gsv_dit] bad T=%d\n", T); return false; }
     if (x_lens <= 0 || x_lens > T) x_lens = T;
 
+    // 诊断: 落盘 DiT 真正拿到的条件 (供 torch 同输入对比)
+    if (const char * dd = getenv("GSV_DIT_DUMP")) {
+        FILE * f = fopen((std::string(dd) + "/dit_prompt_x.f32").c_str(), "wb");
+        if (f) { fwrite(prompt_mel, 4, (size_t) MEL * T, f); fclose(f); }
+        f = fopen((std::string(dd) + "/dit_mu.f32").c_str(), "wb");
+        if (f) { fwrite(mu, 4, (size_t) TEXTD * T, f); fclose(f); }
+        printf("[gsv_dit] dumped prompt_x/mu [%d,%d] to %s\n", T, TEXTD, dd);
+    }
+
     // rope 角度表: angle = n * inv_freq[i] (fp32, 与 torch einsum 同式)
     s.cos_host.resize((size_t) 32 * T);
     s.sin_host.resize((size_t) 32 * T);
@@ -1144,12 +1153,23 @@ bool gsv_dit::synthesize(const float * fea_ref, int R, const float * fea_todo, i
     const int chunk_frames = std::min(TOTAL - ref_frames, block_override > 0 ? block_override : MAXCHUNK);
     if (chunk_frames <= 0) { fprintf(stderr, "[gsv_dit] synthesize(): ref too long\n"); return false; }
 
-    // 从 [C, ref_common] 的列偏移 ref_off 处取 ref_frames 帧 -> [C, ref_frames]
-    // (mel_ref 的列数是 mel_ref_T, fea_ref 的是 R; 两者都截到 ref_common 后再取末 REF 帧)
+    // repo module/models_v5.py::synthesize_v5_mel:
+    //   reference_frames = min(mel2.T, fea_ref.T)            <- 先截到公共长度
+    //   reference_mel      = mel2[...,  :reference_frames][..., -REF:]
+    //   reference_features = fea_ref[..., :reference_frames][..., -REF:]
+    //   reference_frames = reference_mel.shape[-1]           <- 之后以 mel 的实际长度为准
+    // 注意 ref_off 只由 ref_common 决定, 所以两侧取的是同一段区间; `cols` 参数只用于
+    // **越界检查** (mel_ref 有 mel_ref_T 列, fea_ref 有 R 列), 不影响取哪一帧。
+    // 早先版本把 fea_ref 的 cols 传成 R 曾让人以为两侧错位 —— 实测 offset 相同, 是等价改写。
     auto slice_cols = [&](const float * src, int C, int cols, std::vector<float> & dst) {
+        if (ref_off + ref_frames > cols) {
+            fprintf(stderr, "[gsv_dit] synthesize(): slice [%d,%d) 越界 (cols=%d)\n",
+                    ref_off, ref_off + ref_frames, cols);
+        }
         dst.resize((size_t) C * ref_frames);
         for (int c = 0; c < C; c++)
-            memcpy(dst.data() + (size_t) c * ref_frames, src + (size_t) c * cols + ref_off, (size_t) ref_frames * 4);
+            memcpy(dst.data() + (size_t) c * ref_frames, src + (size_t) c * cols + ref_off,
+                   (size_t) ref_frames * 4);
     };
     std::vector<float> mel_ref_s, fea_ref_s;
     slice_cols(mel_ref, MEL, mel_ref_T, mel_ref_s);
