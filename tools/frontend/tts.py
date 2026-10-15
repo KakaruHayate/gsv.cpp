@@ -24,7 +24,8 @@ from frontend.gsv_client import GsvClient       # noqa: E402
 REF_TEXT_DEFAULT = "大家好，这里是语音合成的参考音频，用来测试音色和韵律是否正常。"
 
 
-def write_wav(path, samples, sr=32000):
+# 默认 48000: v4/v5 的 vocoder 是 48 kHz (repo vocoder_configs["sr"] = 48000)
+def write_wav(path, samples, sr=48000):
     """float32 [-1,1] -> 16-bit PCM wav。"""
     x = np.clip(np.asarray(samples, dtype=np.float32), -1.0, 1.0)
     pcm = (x * 32767.0).astype("<i2")
@@ -152,7 +153,7 @@ class Tts:
             },
         )
         wav = np.frombuffer(t["wav"], dtype="<f4").astype(np.float32)
-        sr = int(data.get("sampleRate", 32000))
+        sr = int(data.get("sampleRate", 48000))
         if verbose:
             print("  wav=%d (%.2f s @%d) (%.0f ms)"
                   % (wav.size, wav.size / sr, sr, (time.time() - t3) * 1000))

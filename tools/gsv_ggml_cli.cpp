@@ -256,7 +256,10 @@ bool EngineRequests::Handle(const std::string &kind, const std::string &params,
         }
         json out;
         out["wav"] = wav.size();
-        out["sampleRate"] = 32000;
+        // **48 kHz**: v4/v5 的 vocoder 是 48 kHz 的 Generator (upsample_rates 连乘 = 480
+        // 样本/mel 帧), repo 也是 `vocoder_configs["sr"] = 48000`。这里写 32000 会让播放端
+        // 慢放 1.5 倍 (听感 = 男声慢放, 音高降一个纯五度)。
+        out["sampleRate"] = 48000;
         responseJson = out.dump();
         if (!wav.empty()) outTensors["wav"] = AsBytes(wav.data(), wav.size() * sizeof(float));
         return true;

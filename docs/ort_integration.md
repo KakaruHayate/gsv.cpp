@@ -11,7 +11,7 @@
 | EP 支持 | **WebGPU > DML > CPU**（自动挑选；`GSV_*_DEVICE=cpu/dml/webgpu` 强制） |
 | vocoder 对拍 | max\|Δ\| ≤ **2.6e-6**（T=1/100/200/257/300/500/1000 全过） |
 | g2pw 对拍 | pred **逐条一致**；probs max\|Δ\| = **6.0e-8**（7 个 case，含数字/标点/变长 batch） |
-| 端到端 | `tests/demo_e2e.cpp` 跑通 参考音频+phones → wav（0.66 s 语音，频谱 70% 能量在 100–4000 Hz） |
+| 端到端 | `tests/demo_e2e.cpp` 跑通 参考音频+phones → wav；`tools/frontend/tts.py` 文本端到端（长句 7.16 s @48k，见 [e2e_server.md](e2e_server.md)） |
 
 **EP 基准**（`test_vocoder.cpp GSV_VOC_BENCH=5` / `test_g2pw.cpp GSV_G2PW_BENCH=5`）：
 
@@ -58,6 +58,9 @@ for (const char * n : { "WebGpuExecutionProvider", "DmlExecutionProvider", "CPUE
 
 - **输入必须是 `denorm_spec()` 之后的 mel**（值域约 [-12, 2]），不是 [-1,1] 的归一化 mel；
   输出 `[B,1,T*480]`（480 = `prod(upsample_rates)` = 10·6·2·2·2），末端 `tanh` → 严格 |wav| ≤ 1。
+- **输出是 48 kHz**：mel 是 32 kHz/hop 320 = 100 fps，×480 = 48000 Hz。repo 同
+  (`TTS.py`: `vocoder_configs["sr"]=48000`, `upsample_rate=480`)。**写 wav 头若按 32k 标注，
+  播放端会慢放 1.5 倍**（听感 = 男声慢放）—— 见 docs/e2e_server.md §7.9。
 - **单动态 session**：DML/WebGPU 换形状会重新 plan（doc §3 的结论仍然成立），按形状建
   session 的创建成本收不回来。
 - **严格 fp32 不量化**：导出图内 0 个量化算子；不要对它跑 ORT 量化工具。
@@ -124,13 +127,13 @@ A) 参考音频 -> 三份产出
 B) phones+bert(golden) -> AR -> 语义 tokens
 C) decode_encp x2 (参考侧 / 目标侧) -> fea_ref[512,1488] / fea_todo[512,44]
 D) DiT synthesize_v5_mel (4 步, cfg=0) -> mel_out [100,44]
-E) denorm_spec -> vocoder (WebGPU) -> wav 21120 samples (0.66 s)
+E) denorm_spec -> vocoder (WebGPU) -> wav 21120 samples (0.66 s @32k 标注; 实际 48 kHz -> 0.44 s)
 ```
 
 时序（CPU ggml + WebGPU ORT）：A 11.3 s / B 4.3 s / C 3.3 s / D 20.5 s / E 2.7 s ≈ 36 s。
 DiT 的 4 步是 CPU ggml；切 `GSV_E2E_DEVICE=vulkan` 会快一个量级。
 
-**输出是真实语音**：0.66 s、21114/21120 非零、峰值归一化到 −15.3 dBFS、频谱 70% 能量落在
+**输出是真实语音**（该 demo 早于 48 kHz 修复）：21114/21120 非零、频谱 70% 能量落在
 100–4000 Hz 语音带、ZCR 0.0245（浊音）、谱峰 133/247/252 Hz（基频+谐波）。
 
 > AR 在 11 个 token 处正常停止（golden phones 只有 32 个，语义密度匹配）；

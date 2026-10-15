@@ -7,6 +7,10 @@
 //   - **严格 fp32, 不量化**: 导出时图内 0 个量化算子; 不要对它跑 ORT 量化工具
 //   - 输入 = denorm_spec() 之后的 mel [B,100,T] (值域约 [-12,2]), 不是 [-1,1] 的归一化 mel
 //   - 输出 = wav [B,1,T*480] (两维都动态); 末端 tanh -> 严格 |wav| <= 1
+//   - **输出采样率是 48000 Hz, 不是 32000**: 1 mel 帧 -> 480 采样 (prod(upsample_rates)
+//     = 10*6*2*2*2), 而 mel 是 32kHz/hop320 = 100 fps -> 100*480 = 48 kHz。
+//     repo 同: `TTS.py: v.vocoder_configs["sr"] = 48000` (upsample_rate = 480)。
+//     写 wav 头时若按 32k 标注会慢放 1.5 倍 (听感 = 男声慢放)。
 //   - 单动态 session: DML/WebGPU 换形状会重新 plan, 按形状建 session 创建成本高, 不划算
 //
 // 加载方式: **运行时动态加载** (LoadLibraryA + GetProcAddress("OrtGetApiBase"))。
@@ -32,7 +36,7 @@ public:
     ~gsv_vocoder();
 
     int  mel_dim()   const;    // 100
-    int  upsample()  const;    // 480 (T 帧 -> T*480 采样 = prod(upsample_rates) 10*6*2*2*2)
+    int  upsample()  const;    // 480 = 每 mel 帧产出的采样数 (prod(upsample_rates)); 见上方 48kHz 说明
     const char * ep_name() const;   // 实际生效的 EP (运行时决定)
 
     // mel: [100, T] torch 布局 (idx = m*T + t) —— **必须是 denorm_spec 之后的值**

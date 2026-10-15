@@ -284,7 +284,9 @@ int main(int argc, char ** argv) {
     if (!voc) { fprintf(stderr, "vocoder 加载失败\n"); return 1; }
     std::vector<float> wav;
     if (!voc->run(mel_dn.data(), Nmel, wav)) { fprintf(stderr, "vocoder 失败\n"); return 1; }
-    printf("  EP=%s wav [%zu] (%.2fs @32k)\n", voc->ep_name(), wav.size(), (double) wav.size() / 32000.0);
+    // vocoder 是 **48 kHz** 的 Generator (prod(upsample_rates)=480 样本/mel 帧);
+    // repo 也报 `vocoder_configs["sr"] = 48000`。写 32k 会让播放端慢放 1.5 倍。
+    printf("  EP=%s wav [%zu] (%.2fs @48k)\n", voc->ep_name(), wav.size(), (double) wav.size() / 48000.0);
     printf("  [E] %.1f ms\n", ms_since(tE));
 
     // 峰值归一化到 -3 dBFS (0.708): AR 提前停/参考音频短时输出幅度会很低,
@@ -302,9 +304,9 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (!wav_write(out_wav, wav, 32000)) { fprintf(stderr, "wav 写出失败: %s\n", out_wav.c_str()); return 1; }
+    if (!wav_write(out_wav, wav, 48000)) { fprintf(stderr, "wav 写出失败: %s\n", out_wav.c_str()); return 1; }
     printf("\n=== 完成 -> %s (%.2fs 音频, 全链 %.0f ms) ===\n",
-           out_wav.c_str(), (double) wav.size() / 32000.0,
+           out_wav.c_str(), (double) wav.size() / 48000.0,
            ms_since(tA));
 
     delete voc; delete dit; delete cond; delete encp; delete wns1;
