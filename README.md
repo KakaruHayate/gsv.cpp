@@ -14,7 +14,7 @@ text ──► Python text sidecar (G2P + BERT) ─┐
                           DiT (CFM, v5turbo 4 steps / v5dev 32 steps)
                                            │
                                            ▼
-                          vocoder (BigVGAN, ONNX Runtime WebGPU)
+                          vocoder (HiFi-GAN, ONNX Runtime WebGPU)
                                            │
                                            ▼
                                          48 kHz WAV

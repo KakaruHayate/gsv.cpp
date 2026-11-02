@@ -41,7 +41,7 @@ Converted models are published at **<https://huggingface.co/KakaruHayate/GSV.CPP
 | `gsv-v5dev-refcode.gguf` | reference encoder | v5dev |
 | `gsv-bert-f16.gguf` | BERT (Chinese RoBERTa) | shared |
 | `gsv-hubert-f16.gguf` | CN-HuBERT | shared |
-| `vocoder_fp32.onnx` | BigVGAN vocoder | shared |
+| `vocoder_fp32.onnx` | HiFi-GAN vocoder (48 kHz) | shared |
 | `resampy_kaiser_best.bin` | resampling filter table | shared |
 
 AR is published in two precisions; pick one (q8 is the default choice). The v5dev files are
