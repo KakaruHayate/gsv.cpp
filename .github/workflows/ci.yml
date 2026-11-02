@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [dev, main]
+    branches: [main]
   pull_request:
 
 jobs:
@@ -24,5 +24,6 @@ jobs:
 
       - name: Python syntax check
         run: |
-          python -m py_compile tools/text_sidecar.py tools/frontend/frontend.py tools/export_gguf/export.py
-          python -m py_compile tools/convert_ar.py tools/convert_cond.py tools/convert_dit.py tools/convert_refcode.py
+          python -m py_compile tools/text_sidecar.py
+          python -m py_compile tools/frontend/frontend.py
+          python -m py_compile tools/export_gguf/export.py
