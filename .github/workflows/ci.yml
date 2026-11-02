@@ -110,9 +110,11 @@ jobs:
       - name: add_act kernel test (CPU + Vulkan)
         shell: bash
         run: |
-          if [ "" = "Windows" ]; then
+          if [ "$RUNNER_OS" = "Windows" ]; then
             ./build/Release/test_add_act.exe --cpu
           else
+            ls -l /usr/share/vulkan/icd.d || true
+            VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json vulkaninfo --summary 2>&1 | head -25 || true
             VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
             LD_LIBRARY_PATH=llama.cpp/build-vk-rel/bin:llama.cpp/build-vk-rel/ggml/src:build \
             ./build/test_add_act --require-gpu

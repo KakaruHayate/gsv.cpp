@@ -53,6 +53,16 @@ int main(int argc, char ** argv) {
     const bool cpu_only = argc > 1 && std::strcmp(argv[1], "--cpu") == 0;
     const bool require_gpu = argc > 1 && std::strcmp(argv[1], "--require-gpu") == 0;
 
+    // With shared ggml libraries the GPU backend is a separate .so that must be loaded
+    // explicitly before enumerating devices (no symbol from it is referenced here).
+    ggml_backend_load_all();
+    printf("[test_add_act] registries=%zu devices=%zu\n", ggml_backend_reg_count(), ggml_backend_dev_count());
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        printf("[test_add_act]   dev %zu: %s (%s) type=%d\n", i, ggml_backend_dev_name(d),
+               ggml_backend_dev_description(d), (int) ggml_backend_dev_type(d));
+    }
+
     std::vector<float> a((size_t) NE0 * NR), b((size_t) NE0);
     for (size_t i = 0; i < a.size(); i++) a[i] = 0.02f * (float) ((int) (i * 37 % 101) - 50) + 0.5f;
     for (int i = 0; i < NE0; i++) b[i] = 0.01f * (float) ((i * 13) % 29 - 14);
