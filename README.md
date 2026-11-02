@@ -30,7 +30,16 @@ text ──► Python text sidecar (G2P + BERT) ─┐
 - **HTTP service**: `/tts`, `/batch` + jobs (SSE), `/models`, `/set_gpt_weights`, `/metrics`,
   token auth, path allow-list, crash dumps.
 
-V5 only: v2/v3/v4 checkpoints are intentionally not supported.
+V5 only: **v5turbo** and **v5dev** checkpoints are supported; v2/v3/v4 are intentionally
+not supported.
+
+## Documentation
+
+- [docs/usage.md](docs/usage.md) — build artifacts, model download/conversion, running the service
+- [docs/benchmark.md](docs/benchmark.md) — full-pipeline timings (torch vs ggml, turbo/dev)
+- [tools/export_gguf/README.md](tools/export_gguf/README.md) — exporter/quantizer reference
+
+Converted models: <https://huggingface.co/KakaruHayate/GSV.CPP> (GGUF + ONNX, AR in fp16 and q8).
 
 ## Requirements
 
@@ -83,7 +92,9 @@ load with error 1114).
 
 ## Models
 
-Weights are not distributed here. Export them from a GPT-SoVITS checkout:
+Converted weights: <https://huggingface.co/KakaruHayate/GSV.CPP> (GGUF + ONNX, AR in fp16 and
+q8; see [docs/usage.md](docs/usage.md) for the file list and manifests). To convert your own
+fine-tuned checkpoints:
 
 ```bat
 python tools\export_gguf\export.py --kind ar     --ckpt s1v3.ckpt  --out models\gsv-ar-q8.gguf --spec attn=q8_0,ffn=q8_0
@@ -159,5 +170,6 @@ powershell -File tests\contract_test.ps1   REM HTTP contract tests (mock engine)
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Third-party components keep their own licenses
-(`third_party/nlohmann/LICENSE.MIT`, ONNX Runtime headers, cpp-httplib, ggml).
+MIT — see [LICENSE](LICENSE). Third-party components and the model weights keep their own
+licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and
+[licenses/GPT-SoVITS-LICENSE.txt](licenses/GPT-SoVITS-LICENSE.txt).

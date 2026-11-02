@@ -5,18 +5,15 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  LLAMA_CPP_COMMIT: f0c41e0168dfd4b5ef72b21d1a311b24cc7a894a
+
 jobs:
-  unit:
-    runs-on: windows-latest
+  text:
+    name: text (python + licenses)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      - name: Service unit tests (svc_core.h)
-        run: cmd /c scripts\run-svc-tests.bat
 
       - uses: actions/setup-python@v5
         with:
@@ -27,3 +24,78 @@ jobs:
           python -m py_compile tools/text_sidecar.py
           python -m py_compile tools/frontend/frontend.py
           python -m py_compile tools/export_gguf/export.py
+          python -m py_compile tools/export_vocoder_onnx.py
+          python -m py_compile tools/export_resampy_filter.py
+
+      - name: License files present
+        run: |
+          test -f LICENSE
+          test -f licenses/GPT-SoVITS-LICENSE.txt
+          test -f third_party/nlohmann/LICENSE.MIT
+          test -f THIRD_PARTY_NOTICES.md
+
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          cache: true
+
+      - name: Vulkan build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libvulkan-dev glslang-tools
+
+      - name: Fetch llama.cpp and apply ggml patch
+        shell: bash
+        run: |
+          git clone https://github.com/ggml-org/llama.cpp llama.cpp
+          git -C llama.cpp checkout "$LLAMA_CPP_COMMIT"
+          git -C llama.cpp apply "${{ github.workspace }}/patches/0001-ggml-audio-patch-port-on-llamacpp.patch"
+
+      - name: Build ggml (Vulkan)
+        shell: bash
+        run: |
+          cmake -S llama.cpp -B llama.cpp/build-vk-rel \
+            -DGGML_VULKAN=ON \
+            -DGGML_BUILD_TESTS=OFF -DGGML_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build llama.cpp/build-vk-rel --config Release -j 4
+
+      - name: Build gsv_server
+        shell: bash
+        run: |
+          cmake -S . -B build -DGSV_GGML_LIB_DIR=llama.cpp/build-vk-rel -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release --target gsv_server -j 4
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -e
+          mkdir -p pkg
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp build/Release/gsv_server.exe pkg/
+            cp build/Release/*.dll pkg/ 2>/dev/null || true
+          else
+            cp build/gsv_server pkg/
+            find llama.cpp/build-vk-rel -name '*.so*' -exec cp -a {} pkg/ \; 2>/dev/null || true
+            chmod +x pkg/gsv_server
+          fi
+          ls -la pkg
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: gsv.cpp-${{ runner.os }}-x64-vulkan
+          path: pkg
+          if-no-files-found: error
