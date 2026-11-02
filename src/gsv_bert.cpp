@@ -1,4 +1,5 @@
 #include "gsv_bert.h"
+#include "gsv_device.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -315,21 +316,28 @@ gsv_bert * gsv_bert::load(const std::string & gguf_path, const gsv_bert_cfg & cf
 
     ggml_backend_dev_t dev = nullptr;
     {
-        const bool want_gpu = cfg.device == "gpu" || cfg.device == "vulkan" || cfg.device == "cuda" ||
-                               cfg.device == "GPU"  || cfg.device == "Vulkan" || cfg.device == "CUDA";
+        int gpu_idx = 0; bool gpu_explicit = false;
+        const bool want_gpu = gsv_device_parse(cfg.device, &gpu_idx, &gpu_explicit);
         const int n_dev = (int) ggml_backend_dev_count();
+        int gpu_seen = 0;
         for (int i = 0; i < n_dev && !dev; i++) {
             ggml_backend_dev_t d = ggml_backend_dev_get(i);
             const auto ty = ggml_backend_dev_type(d);
-            if (want_gpu) { if (ty == GGML_BACKEND_DEVICE_TYPE_GPU || ty == GGML_BACKEND_DEVICE_TYPE_IGPU) dev = d; }
-            else if (ty == GGML_BACKEND_DEVICE_TYPE_CPU) dev = d;
+            if (want_gpu) {
+                if ((ty == GGML_BACKEND_DEVICE_TYPE_GPU || ty == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
+                    gpu_seen++ == gpu_idx) dev = d;
+            } else if (ty == GGML_BACKEND_DEVICE_TYPE_CPU) dev = d;
         }
         if (!dev)
             for (int i = 0; i < n_dev && !dev; i++) {
                 ggml_backend_dev_t d = ggml_backend_dev_get(i);
                 if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_CPU) dev = d;
             }
-        if (!dev) { fprintf(stderr, "[gsv_bert] no usable backend device\n"); delete m; return nullptr; }
+                if (want_gpu && gpu_explicit && (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU)) {
+            fprintf(stderr, "[device] GPU %d not found (run --list-devices)\n", gpu_idx);
+            delete m; return nullptr;
+        }
+if (!dev) { fprintf(stderr, "[gsv_bert] no usable backend device\n"); delete m; return nullptr; }
         if (cfg.verbose) printf("[gsv_bert] device: %s (%s)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
         // coopmat2 默认开 (2026-10-10 复评): T>=256 时快 21~27%、T=25 持平; 精度 max|Δ|
         // 6.6e-3 -> 3.9e-2 (仍 < 5e-2 阈值, token 稳定余量 ~100x)。见 docs/bert_ggml.md §7。

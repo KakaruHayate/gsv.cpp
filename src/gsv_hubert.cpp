@@ -1,4 +1,5 @@
 #include "gsv_hubert.h"
+#include "gsv_device.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -298,20 +299,28 @@ gsv_hubert * gsv_hubert::load(const std::string & gguf_path, const gsv_hubert_cf
     ggml_backend_dev_t dev = nullptr;
     {
         if (getenv("GSV_HUBERT_DEBUG")) fprintf(stderr, "  [load] dev select, n_dev=%d\n", (int) ggml_backend_dev_count());
-        const bool want_gpu = cfg.device == "gpu" || cfg.device == "vulkan" || cfg.device == "GPU" || cfg.device == "Vulkan";
+        int gpu_idx = 0; bool gpu_explicit = false;
+        const bool want_gpu = gsv_device_parse(cfg.device, &gpu_idx, &gpu_explicit);
         const int n_dev = (int) ggml_backend_dev_count();
+        int gpu_seen = 0;
         for (int i = 0; i < n_dev && !dev; i++) {
             ggml_backend_dev_t d = ggml_backend_dev_get(i);
             const auto ty = ggml_backend_dev_type(d);
-            if (want_gpu) { if (ty == GGML_BACKEND_DEVICE_TYPE_GPU || ty == GGML_BACKEND_DEVICE_TYPE_IGPU) dev = d; }
-            else if (ty == GGML_BACKEND_DEVICE_TYPE_CPU) dev = d;
+            if (want_gpu) {
+                if ((ty == GGML_BACKEND_DEVICE_TYPE_GPU || ty == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
+                    gpu_seen++ == gpu_idx) dev = d;
+            } else if (ty == GGML_BACKEND_DEVICE_TYPE_CPU) dev = d;
         }
         if (!dev)
             for (int i = 0; i < n_dev && !dev; i++) {
                 ggml_backend_dev_t d = ggml_backend_dev_get(i);
                 if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_CPU) dev = d;
             }
-        if (!dev) { fprintf(stderr, "[gsv_hubert] no usable backend device\n"); delete m; return nullptr; }
+                if (want_gpu && gpu_explicit && (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU)) {
+            fprintf(stderr, "[device] GPU %d not found (run --list-devices)\n", gpu_idx);
+            delete m; return nullptr;
+        }
+if (!dev) { fprintf(stderr, "[gsv_hubert] no usable backend device\n"); delete m; return nullptr; }
         const bool is_gpu = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
                             ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU;
         s.pos_gpu = getenv("GSV_HUBERT_POS_GPU") ? atoi(getenv("GSV_HUBERT_POS_GPU")) != 0 : is_gpu;

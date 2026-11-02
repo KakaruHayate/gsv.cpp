@@ -15,7 +15,7 @@
 //   GET  /health /metrics
 //
 // 用法:
-//   gsv_server [--models models] [--device vulkan] [--voc-device auto]
+//   gsv_server [--models models] [--device vulkan|vulkan:N|cpu] [--voc-device auto]
 //              [--host 127.0.0.1] [--port 9880] [--sidecar 127.0.0.1:9882]
 //              [--log-dir logs] [--threads N] [--verbose]
 
@@ -49,6 +49,8 @@
 
 #include "httplib.h"
 #include "json.hpp"
+
+#include "ggml-backend.h"
 
 #include "svc_core.h"
 
@@ -316,6 +318,7 @@ int main(int argc, char ** argv) {
     SidecarCfg side;
     std::string log_dir = "logs";
     bool verbose = false;
+    bool list_devices = false;
     double job_ttl_arg = 3600.0;
     State st;
     st.base.model_dir = "models";
@@ -338,16 +341,44 @@ int main(int argc, char ** argv) {
         else if (a == "--token") g_token = next("--token");
         else if (a == "--allow-path") g_allow.push_back(next("--allow-path"));
         else if (a == "--job-ttl") job_ttl_arg = std::atof(next("--job-ttl").c_str());
+        else if (a == "--list-devices") list_devices = true;
         else if (a == "--mock-engine") st.mock_engine = true;
         else if (a == "--mock-sidecar") g_mock_sidecar = true;
         else if (a == "--verbose") verbose = true;
         else if (a == "-h" || a == "--help") {
-            std::printf("usage: gsv_server [--models DIR] [--device cpu|vulkan] [--voc-device auto|cpu|webgpu]\n"
+            std::printf("usage: gsv_server [--models DIR] [--device cpu|vulkan|vulkan:N|N] [--voc-device auto|cpu|webgpu]\n"
                         "                  [--host 127.0.0.1] [--port 9880] [--sidecar 127.0.0.1:9882]\n"
-                        "                  [--log-dir logs] [--threads N] [--verbose]\n");
+                        "                  [--log-dir logs] [--threads N] [--verbose] [--list-devices]\n");
             return 0;
         } else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
+    if (list_devices) {
+        ggml_backend_load_all();
+        const int n = (int) ggml_backend_dev_count();
+        std::printf("ggml devices (%d):\n", n);
+        int gpu = 0;
+        for (int i = 0; i < n; i++) {
+            ggml_backend_dev_t d = ggml_backend_dev_get(i);
+            const auto ty = ggml_backend_dev_type(d);
+            size_t fr = 0, tot = 0;
+            ggml_backend_dev_memory(d, &fr, &tot);
+            const char * t = ty == GGML_BACKEND_DEVICE_TYPE_GPU ? "GPU"
+                           : ty == GGML_BACKEND_DEVICE_TYPE_IGPU ? "iGPU" : "CPU";
+            if (ty == GGML_BACKEND_DEVICE_TYPE_GPU || ty == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                std::printf("  #%d  %-4s  %-10s  %s  (%.1f/%.1f GiB free)\n", gpu, t,
+                            ggml_backend_dev_name(d), ggml_backend_dev_description(d),
+                            (double) fr / (1024.0 * 1024.0 * 1024.0),
+                            (double) tot / (1024.0 * 1024.0 * 1024.0));
+                gpu++;
+            } else {
+                std::printf("  --   %-4s  %-10s  %s\n", t, ggml_backend_dev_name(d),
+                            ggml_backend_dev_description(d));
+            }
+        }
+        std::printf("use --device vulkan:N (or --device N) for GPU #N, --device cpu for CPU\n");
+        return 0;
+    }
+
     if (port <= 0 || port > 65535) { std::fprintf(stderr, "bad --port\n"); return 2; }
     if (!is_loopback(host) && g_token.empty()) {
         std::fprintf(stderr,

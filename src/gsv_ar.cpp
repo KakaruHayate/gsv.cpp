@@ -1,4 +1,5 @@
 #include "gsv_ar.h"
+#include "gsv_device.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -473,14 +474,17 @@ gsv_ar * gsv_ar::load(const std::string & gguf_path, const gsv_ar_cfg & cfg) {
     // 设备选择 (cfg.device: "" = CPU, "vulkan"/"gpu" = 第一个 GPU 设备)
     ggml_backend_dev_t dev = nullptr;
     {
-        const bool want_gpu = cfg.device == "gpu" || cfg.device == "vulkan" || cfg.device == "cuda" ||
-                               cfg.device == "GPU"  || cfg.device == "Vulkan" || cfg.device == "CUDA";
+        int gpu_idx = 0; bool gpu_explicit = false;
+        const bool want_gpu = gsv_device_parse(cfg.device, &gpu_idx, &gpu_explicit);
         const int n_dev = (int) ggml_backend_dev_count();
+        int gpu_seen = 0;
         for (int i = 0; i < n_dev && !dev; i++) {
             ggml_backend_dev_t d = ggml_backend_dev_get(i);
             const auto ty = ggml_backend_dev_type(d);
-            if (want_gpu) { if (ty == GGML_BACKEND_DEVICE_TYPE_GPU || ty == GGML_BACKEND_DEVICE_TYPE_IGPU) dev = d; }
-            else if (ty == GGML_BACKEND_DEVICE_TYPE_CPU) dev = d;
+            if (want_gpu) {
+                if ((ty == GGML_BACKEND_DEVICE_TYPE_GPU || ty == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
+                    gpu_seen++ == gpu_idx) dev = d;
+            } else if (ty == GGML_BACKEND_DEVICE_TYPE_CPU) dev = d;
         }
         if (!dev) {
             for (int i = 0; i < n_dev && !dev; i++) {
@@ -488,7 +492,11 @@ gsv_ar * gsv_ar::load(const std::string & gguf_path, const gsv_ar_cfg & cfg) {
                 if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_CPU) dev = d;
             }
         }
-        if (!dev) { fprintf(stderr, "[gsv_ar] no usable backend device"); delete m; return nullptr; }
+                if (want_gpu && gpu_explicit && (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU)) {
+            fprintf(stderr, "[device] GPU %d not found (run --list-devices)\n", gpu_idx);
+            delete m; return nullptr;
+        }
+if (!dev) { fprintf(stderr, "[gsv_ar] no usable backend device"); delete m; return nullptr; }
         if (cfg.verbose) printf("[gsv_ar] device: %s (%s)", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
         // coopmat2 是 VK_NV_cooperative_matrix2（NVIDIA 专有扩展）：非 NVIDIA 设备上
         // ggml 会自动退回 coopmat1（VK_KHR_cooperative_matrix）或纯 shader 路径，不需要干预。

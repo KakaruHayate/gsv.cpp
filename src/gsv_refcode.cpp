@@ -1,4 +1,5 @@
 #include "gsv_refcode.h"
+#include "gsv_device.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -151,19 +152,27 @@ gsv_refcode * gsv_refcode::load(const std::string & gguf_path, const gsv_refcode
 
     ggml_backend_dev_t dev = nullptr;
     {
-        const bool want_gpu = cfg.device == "gpu" || cfg.device == "vulkan" || cfg.device == "GPU";
+        int gpu_idx = 0; bool gpu_explicit = false;
+        const bool want_gpu = gsv_device_parse(cfg.device, &gpu_idx, &gpu_explicit);
         const int n_dev = (int) ggml_backend_dev_count();
+        int gpu_seen = 0;
         for (int i = 0; i < n_dev && !dev; i++) {
             ggml_backend_dev_t d = ggml_backend_dev_get(i);
             const auto ty = ggml_backend_dev_type(d);
-            if (want_gpu) { if (ty == GGML_BACKEND_DEVICE_TYPE_GPU || ty == GGML_BACKEND_DEVICE_TYPE_IGPU) dev = d; }
-            else if (ty == GGML_BACKEND_DEVICE_TYPE_CPU) dev = d;
+            if (want_gpu) {
+                if ((ty == GGML_BACKEND_DEVICE_TYPE_GPU || ty == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
+                    gpu_seen++ == gpu_idx) dev = d;
+            } else if (ty == GGML_BACKEND_DEVICE_TYPE_CPU) dev = d;
         }
         if (!dev) for (int i = 0; i < n_dev && !dev; i++) {
             ggml_backend_dev_t d = ggml_backend_dev_get(i);
             if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_CPU) dev = d;
         }
-        if (!dev) { fprintf(stderr, "[gsv_refcode] no device\n"); delete m; return nullptr; }
+                if (want_gpu && gpu_explicit && (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU)) {
+            fprintf(stderr, "[device] GPU %d not found (run --list-devices)\n", gpu_idx);
+            delete m; return nullptr;
+        }
+if (!dev) { fprintf(stderr, "[gsv_refcode] no device\n"); delete m; return nullptr; }
         if (cfg.verbose) printf("[gsv_refcode] device: %s\n", ggml_backend_dev_name(dev));
     }
     s.backend = ggml_backend_dev_init(dev, nullptr);
