@@ -2,22 +2,24 @@
 
 Full pipeline (frontend → AR → cond → DiT → vocoder), same text / reference audio / seed.
 Times in milliseconds, median of three warm runs (rows 2–6). Rows 2–6 were re-measured on
-2026-11-02 with the CI build of `main` (RoPE/adaLN/mish fusion included); rows 1 and 4 are
-the unchanged torch reference.
+2026-11-03 with the v0.1.1 Windows build (ggml-only F32 HiFi-GAN vocoder, RoPE/adaLN/mish
+fusion included); rows 1 and 4 are the unchanged torch reference.
 
 | # | configuration | total | G2P/frontend | cond | AR | DiT | vocoder | cache |
 |---|---|---|---|---|---|---|---|---|
 | 1 | v5turbo torch | **3142** | 162 | 251 | ~2103* | 561 | 65 | — |
-| 2 | v5turbo ggml (AR fp16) | **1045** | 102 | 97 | 370 | 295 | 114 | — |
-| 3 | v5turbo ggml (AR q8) | **989** | 103 | 92 | 348 | 298 | 115 | — |
+| 2 | v5turbo ggml (AR fp16) | **1239** | 102 | 98 | 578 | 287 | 140 | — |
+| 3 | v5turbo ggml (AR q8) | **1196** | 101 | 101 | 510 | 290 | 141 | — |
 | 4 | v5dev torch | **11716** | 163 | 247 | ~2326* | 8924 | 56 | — |
-| 5 | v5dev ggml | **5366** | 101 | 118 | 422 | 4524 | 114 | — |
-| 6 | v5dev ggml + cache-dit | **4837** | 102 | 114 | 343 | 4128 | 115 | **24/64 = 37.5%** |
+| 5 | v5dev ggml | **5686** | 97 | 123 | 546 | 4710 | 139 | — |
+| 6 | v5dev ggml + cache-dit | **4619** | 102 | 124 | 375 | 3853 | 140 | **24/64 = 37.5%** |
 
-The vocoder column above was measured with the old ONNX Runtime vocoder. With the ggml F32
-HiFi-GAN (src/gsv_vocoder_ggml.cpp) the same request spends **~35 ms** in the vocoder on Vulkan
-instead of ~114 ms, so subtract roughly 75 ms from those totals when comparing with the current
-build.
+The vocoder is now the ggml F32 HiFi-GAN and its cost scales with output length: ~140 ms for the
+3.4 s clip in this table (the old ONNX vocoder was ~114 ms here), ~35 ms for a 0.7 s clip. The
+earlier "ggml is 3x faster" reading compared different clip lengths; for equal-length audio the
+F32 ggml vocoder is currently slightly slower than ONNX, which is the remaining optimization
+target (subpixel/direct-conv upsampling). Note that AR varies by roughly +/-20% between runs on this
+machine (CPU sidecar + GPU sharing), which dominates the spread of the totals.
 
 \* torch's AR loop is captured as a single CUDA graph and cannot be timed separately; this
 column is `total − (frontend + cond + DiT + vocoder)` (AR + scheduling overhead).
