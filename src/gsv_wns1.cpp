@@ -113,7 +113,7 @@ static ggml_tensor * conv1d_pick(ggml_context * c, ggml_tensor * w, ggml_tensor 
     return ggml_conv_1d(c, w, x, 1, pad, 1);
 }
 
-static void build_graph(gsv_wns1::impl & s){
+void wns1_build_graph(gsv_wns1::impl & s){
     ggml_init_params ip = { ggml_tensor_overhead() * 4096, NULL, true };
     s.gctx = ggml_init(ip);
     ggml_context * c = s.gctx;
@@ -259,7 +259,7 @@ gsv_wns1 * gsv_wns1::load(const std::string & gguf_path, const gsv_wns1_cfg & cf
         ggml_backend_tensor_set(tt, buf.data(), 0, nb);
     }
     fclose(fp);
-    build_graph(s);
+    wns1_build_graph(s);
     if(s.verbose) printf("[gsv_wns1] loaded %s\n", gguf_path.c_str());
     return m;
 }
@@ -273,7 +273,7 @@ bool gsv_wns1::encode(const float * fea, const float * ge, int T, int len, std::
         if(s.gctx){ ggml_free(s.gctx); s.gctx = nullptr; }
         s.g = nullptr; s.g_in = s.g_ge = s.g_mask = s.g_out = nullptr;
         s.T = T;
-        build_graph(s);
+        wns1_build_graph(s);
         if(s.verbose) printf("[gsv_wns1] graph rebuilt for T=%d\n", T);
     }
     std::vector<float> mk((size_t)s.T);

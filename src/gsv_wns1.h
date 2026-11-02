@@ -1,4 +1,4 @@
-﻿// wns1 (VITS WN Encoder: 8-layer WaveNet k=5 d=1 pad=2, gin=512) ggml impl.
+// wns1 (VITS WN Encoder: 8-layer WaveNet k=5 d=1 pad=2, gin=512) ggml impl.
 // fea[T,512](t-major) + ge[512] + len -> out[T,512]; weights models/gsv-cond-f32.gguf.
 #pragma once
 #include <cstdint>
@@ -20,6 +20,6 @@ private:
     gsv_wns1();
     struct impl;
     impl * p;
-    friend void build_graph(impl & s);
+    friend void wns1_build_graph(impl & s);
 };
 
