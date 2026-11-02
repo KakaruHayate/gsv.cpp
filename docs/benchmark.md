@@ -14,8 +14,8 @@ the unchanged torch reference.
 | 5 | v5dev ggml | **5366** | 101 | 118 | 422 | 4524 | 114 | — |
 | 6 | v5dev ggml + cache-dit | **4837** | 102 | 114 | 343 | 4128 | 115 | **24/64 = 37.5%** |
 
-The vocoder column above was measured with the ONNX Runtime vocoder. Since the switch to the ggml
-HiFi-GAN (src/gsv_vocoder_ggml.cpp) the same request spends **~37 ms** in the vocoder on Vulkan
+The vocoder column above was measured with the old ONNX Runtime vocoder. With the ggml F32
+HiFi-GAN (src/gsv_vocoder_ggml.cpp) the same request spends **~35 ms** in the vocoder on Vulkan
 instead of ~114 ms, so subtract roughly 75 ms from those totals when comparing with the current
 build.
 
@@ -29,7 +29,7 @@ column is `total − (frontend + cond + DiT + vocoder)` (AR + scheduling overhea
 - OS: Windows 10 x64
 - ggml: Vulkan backend (`--device vulkan`), weights as described per row
   (AR fp16 = `gsv-ar-f16.gguf`, AR q8 = `gsv-ar-q8.gguf`; cond/DiT F16; refcode F16)
-- vocoder: ONNX Runtime 1.27, WebGPU execution provider (`vocoder_fp32.onnx`)
+- vocoder: ggml HiFi-GAN, F32 weights (`gsv-vocoder-f32.gguf`), Vulkan backend
 - torch: 2.12.1 + CUDA 13.0, fp16, `use_cuda_graph=True`, batch size 1, text split `cut0`
 - sample steps: v5turbo 4 / cfg 0.0; v5dev 32 / cfg 1.30
 - cache-dit: DBCache `Fn=8`, threshold 0.02, warmup 8, downsample 4

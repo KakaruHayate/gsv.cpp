@@ -24,8 +24,7 @@ jobs:
           python -m py_compile tools/text_sidecar.py
           python -m py_compile tools/frontend/frontend.py
           python -m py_compile tools/export_gguf/export.py
-          python -m py_compile tools/export_vocoder_onnx.py
-          python -m py_compile tools/export_resampy_filter.py
+              python -m py_compile tools/export_resampy_filter.py
 
       - name: License files present
         run: |

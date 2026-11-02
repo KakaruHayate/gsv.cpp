@@ -16,7 +16,6 @@
 
 struct gsv_engine_cfg {
     std::string device;        // ggml 后端: "" = CPU, "vulkan"/"gpu" = 第一个 GPU
-    std::string voc_device;    // ORT EP: "" = 自动 (WebGPU > DML > CPU), 或 cpu/dml/webgpu
     std::string model_dir;     // 模型目录 (models/)
     // 可选: 逐模型显式路径 (voice manifest 用)。空 = 取 model_dir 下的默认文件名。
     std::string ar_file, cond_file, dit_file, bert_file, hubert_file, refcode_file, vocoder_file;

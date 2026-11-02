@@ -10,7 +10,7 @@ struct gsv_vocoder_ggml_cfg {
 };
 
 // HiFi-GAN generator (GPT-SoVITS V5 vocoder) in ggml: 100-bin mel -> 48 kHz waveform.
-// Replaces the ONNX Runtime vocoder; weights come from tools/export_vocoder_gguf.py.
+// Weights come from tools/export_vocoder_gguf.py (F32).
 class gsv_vocoder_ggml {
 public:
     static gsv_vocoder_ggml * load(const std::string & gguf_path, const gsv_vocoder_ggml_cfg & cfg);

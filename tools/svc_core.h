@@ -489,7 +489,6 @@ inline bool switch_voice(State & st, const std::string & name, std::string & err
     st.reloading = true;
     gsv_engine_cfg cfg = v.cfg;
     cfg.device = st.base.device;
-    cfg.voc_device = st.base.voc_device;
     cfg.n_threads = st.base.n_threads;
     cfg.verbose = st.base.verbose;
     if (cfg.model_dir.empty()) cfg.model_dir = st.base.model_dir;

@@ -8,8 +8,8 @@ The checkpoint is the plain 48 kHz HiFi-GAN generator used by V5 (no NSF source)
   conv_post (16 -> 1, k=7) -> tanh
 
 Usage:
-  python tools/export_vocoder_gguf.py --ckpt models/vocoder.pth --out models/gsv-vocoder-f16.gguf
-  python tools/export_vocoder_gguf.py --ckpt models/vocoder.pth --out models/gsv-vocoder-f32.gguf --f32
+  python tools/export_vocoder_gguf.py --ckpt models/vocoder.pth --out models/gsv-vocoder-f32.gguf
+  python tools/export_vocoder_gguf.py --ckpt models/vocoder.pth --out models/gsv-vocoder-f32.gguf
 """
 
 import argparse
@@ -26,7 +26,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="models/vocoder.pth")
     ap.add_argument("--out", default="models/gsv-vocoder-f16.gguf")
-    ap.add_argument("--f32", action="store_true", help="store weights as F32 instead of F16")
+
     args = ap.parse_args()
 
     try:
@@ -41,7 +41,7 @@ def main() -> int:
     if not any(k.startswith("conv_pre.") for k in sd):
         sd = {k.split(".", 1)[1]: v for k, v in sd.items() if k.startswith("generator.")}
 
-    fl = np.float32 if args.f32 else np.float16
+    fl = np.float32
 
     def w(name: str) -> np.ndarray:
         return sd[name].detach().float().cpu().numpy().astype(fl)
@@ -71,7 +71,7 @@ def main() -> int:
     gw.add_array("gsv.voc.res_k", [3, 3, 3])
     gw.add_array("gsv.voc.res_dil", [1, 3, 5])
     gw.add_uint32("gsv.voc.res_blocks", 3)
-    gw.add_bool("gsv.voc.f32", bool(args.f32))
+    gw.add_bool("gsv.voc.f32", True)
 
     gw.add_tensor("voc.conv_pre.weight", conv_w("conv_pre.weight"))
     gw.add_tensor("voc.conv_pre.bias", b("conv_pre.bias"))
@@ -93,7 +93,7 @@ def main() -> int:
     gw.close()
 
     print(f"[export] wrote {args.out} ({os.path.getsize(args.out) / 1e6:.1f} MB, "
-          f"{'f32' if args.f32 else 'f16'} weights)")
+          "f32 weights)")
     return 0
 
 

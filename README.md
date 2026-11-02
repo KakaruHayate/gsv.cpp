@@ -49,9 +49,7 @@ Converted models: <https://huggingface.co/KakaruHayate/GSV.CPP> (all GGUF, AR in
 - MSVC 2019+ (Windows) or GCC/Clang (Linux), C++17.
 - Python 3.10+ for the text sidecar (`tools/text_sidecar.py`, installs with
   `tools/text_sidecar_requirements.txt`).
-- No ONNX Runtime needed by default: the HiFi-GAN vocoder runs on ggml too. ONNX Runtime is only
-  used when a voice points at `vocoder_fp32.onnx`; `third_party/onnxruntime/` keeps the C headers
-  for that fallback.
+- No ONNX Runtime: the HiFi-GAN vocoder runs on ggml and is the only vocoder backend.
 
 ## Build
 
@@ -82,14 +80,12 @@ cmake --build build --config Release --target gsv_server
 ```
 
 On Windows the ggml DLLs found next to the libraries are copied next to the executable.
-The ggml vocoder needs no extra runtime; for the optional ONNX path, `onnxruntime.dll` (plus the
-WebGPU EP if present) must be on `PATH` or next to the executable.
+The vocoder is pure ggml: no ONNX Runtime DLL is needed at run time.
 
 ### MSVC script (Windows alternative)
 
-`scripts\build-server.bat` builds the same target with `cl.exe` and copies the ONNX Runtime
-DLLs it finds in `.venv-wg\...` when present (only needed for the optional ONNX vocoder path;
-set `GSV_VCRT_DIR` if `onnxruntime.dll` fails to load with error 1114).
+`scripts\build-server.bat` builds the same target with `cl.exe` and copies a newer MSVC runtime
+when it can find one (set `GSV_VCRT_DIR` if the executable fails to load it).
 
 ## Models
 
@@ -104,11 +100,11 @@ python tools\export_gguf\export.py --kind dit    --ckpt s2Gv5turbo.pth --out mod
 python tools\export_gguf\export.py --kind refcode --ckpt s2Gv5turbo.pth --out models\gsv-refcode.gguf
 python tools\export_gguf\export.py --kind bert   --ckpt ... --out models\gsv-bert-f16.gguf
 python tools\export_gguf\export.py --kind hubert --ckpt ... --out models\gsv-hubert-f16.gguf
-python tools\export_vocoder_gguf.py --ckpt models\vocoder.pth --out models\gsv-vocoder-f16.gguf
+python tools\export_vocoder_gguf.py --ckpt models\vocoder.pth --out models\gsv-vocoder-f32.gguf
 ```
 
 The model directory should contain `gsv-ar-*.gguf`, `gsv-cond-*.gguf`, `gsv-dit-*.gguf`,
-`gsv-refcode.gguf`, `gsv-bert-*.gguf`, `gsv-hubert-*.gguf`, `gsv-vocoder-f16.gguf` and
+`gsv-refcode.gguf`, `gsv-bert-*.gguf`, `gsv-hubert-*.gguf`, `gsv-vocoder-f32.gguf` and
 `resampy_kaiser_best.bin` (see `tools/export_resampy_filter.py`).
 Extra voices can be described with `models/voices/<name>/manifest.json`.
 

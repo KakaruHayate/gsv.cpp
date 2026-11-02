@@ -18,11 +18,7 @@ the Releases page once published).
 
 Runtime requirements:
 
-- A Vulkan 1.2+ driver. CPU-only works too: `--device cpu --voc-device cpu`.
-- Optional: ONNX Runtime with the WebGPU execution provider, only if you keep the ONNX vocoder. Either put
-  `onnxruntime.dll` (Windows) / `libonnxruntime.so` (Linux) plus the EP libraries next to the
-  executable, or make them visible on `PATH` / `LD_LIBRARY_PATH`. On Windows the WebGPU EP
-  also needs `dxcompiler.dll` and `dxil.dll`.
+- A Vulkan 1.2+ driver. CPU-only works too: `--device cpu`.
 - Python 3.10+ for the text sidecar (`tools/text_sidecar.py`).
 
 ## 2. Get models
@@ -41,7 +37,7 @@ Converted models are published at **<https://huggingface.co/KakaruHayate/GSV.CPP
 | `gsv-v5dev-refcode.gguf` | reference encoder | v5dev |
 | `gsv-bert-f16.gguf` | BERT (Chinese RoBERTa) | shared |
 | `gsv-hubert-f16.gguf` | CN-HuBERT | shared |
-| `gsv-vocoder-f16.gguf` | HiFi-GAN vocoder (48 kHz, ggml) | shared |
+| `gsv-vocoder-f32.gguf` | HiFi-GAN vocoder (48 kHz, ggml) | shared |
 | `resampy_kaiser_best.bin` | resampling filter table | shared |
 
 AR is published in two precisions; pick one (q8 is the default choice). The v5dev files are
@@ -55,7 +51,7 @@ models/
   gsv-refcode.gguf
   gsv-bert-f16.gguf
   gsv-hubert-f16.gguf
-  gsv-vocoder-f16.gguf
+  gsv-vocoder-f32.gguf
   resampy_kaiser_best.bin
 ```
 
@@ -71,7 +67,7 @@ Extra voices (e.g. v5dev or a fine-tuned checkpoint) can be described with a man
   "refcode": "gsv-v5dev-refcode.gguf",
   "bert": "gsv-bert-f16.gguf",
   "hubert": "gsv-hubert-f16.gguf",
-  "vocoder": "gsv-vocoder-f16.gguf"
+  "vocoder": "gsv-vocoder-f32.gguf"
 }
 ```
 
@@ -102,7 +98,7 @@ python tools/export_gguf/export.py --kind bert   --ckpt chinese-roberta-wwm-ext-
 python tools/export_gguf/export.py --kind hubert --ckpt chinese-hubert-base          --out models/gsv-hubert-f16.gguf
 
 # vocoder (vocoder.pth -> GGUF, F16 weights; F32 transposed-conv kernels for Vulkan)
-python tools/export_vocoder_gguf.py --ckpt models/vocoder.pth --out models/gsv-vocoder-f16.gguf
+python tools/export_vocoder_gguf.py --ckpt models/vocoder.pth --out models/gsv-vocoder-f32.gguf
 
 # resampling filter table
 python tools/export_resampy_filter.py --out models/resampy_kaiser_best.bin
@@ -129,7 +125,7 @@ python -m venv .venv-sidecar
 
 # engine + HTTP service
 ./gsv_server --device vulkan --port 9880
-# CPU-only: ./gsv_server --device cpu --voc-device cpu
+# CPU-only: ./gsv_server --device cpu
 ```
 
 ### Choosing a GPU

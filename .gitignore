@@ -12,7 +12,6 @@ tests/relcpu/*.obj
 # models and exported weights
 models/
 *.gguf
-*.onnx
 *.bin
 *.npy
 

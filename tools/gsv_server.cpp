@@ -15,7 +15,7 @@
 //   GET  /health /metrics
 //
 // 用法:
-//   gsv_server [--models models] [--device vulkan|vulkan:N|cpu] [--voc-device auto]
+//   gsv_server [--models models] [--device vulkan|vulkan:N|cpu]
 //              [--host 127.0.0.1] [--port 9880] [--sidecar 127.0.0.1:9882]
 //              [--log-dir logs] [--threads N] [--verbose]
 
@@ -52,7 +52,7 @@
 
 #include "ggml-backend.h"
 
-#define GSV_VERSION "0.1.0"
+#define GSV_VERSION "0.1.1"
 
 #include "svc_core.h"
 
@@ -333,7 +333,6 @@ int main(int argc, char ** argv) {
         };
         if (a == "--models") st.base.model_dir = next("--models");
         else if (a == "--device") st.base.device = next("--device");
-        else if (a == "--voc-device") st.base.voc_device = next("--voc-device");
         else if (a == "--threads") st.base.n_threads = std::atoi(next("--threads").c_str());
         else if (a == "--host") host = next("--host");
         else if (a == "--port") port = std::atoi(next("--port").c_str());
@@ -349,7 +348,7 @@ int main(int argc, char ** argv) {
         else if (a == "--mock-sidecar") g_mock_sidecar = true;
         else if (a == "--verbose") verbose = true;
         else if (a == "-h" || a == "--help") {
-            std::printf("usage: gsv_server [--models DIR] [--device cpu|vulkan|vulkan:N|N] [--voc-device auto|cpu|webgpu]\n"
+            std::printf("usage: gsv_server [--models DIR] [--device cpu|vulkan|vulkan:N|N]\n"
                         "                  [--host 127.0.0.1] [--port 9880] [--sidecar 127.0.0.1:9882]\n"
                         "                  [--log-dir logs] [--threads N] [--verbose] [--list-devices] [--version]\n");
             return 0;

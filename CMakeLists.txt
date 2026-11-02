@@ -70,7 +70,6 @@ file(GLOB GSV_ENGINE_SOURCES CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_refcode.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_refenc.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_sampler.cpp"
-     "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_vocoder.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_vocoder_ggml.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_wns1.cpp")
 
@@ -81,7 +80,6 @@ target_include_directories(gsv_engine
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib"
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann"
-        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime"
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/xxhash"
     PUBLIC
         ${GSV_GGML_INCLUDES})
