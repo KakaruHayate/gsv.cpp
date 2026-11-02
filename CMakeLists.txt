@@ -65,7 +65,6 @@ file(GLOB GSV_ENGINE_SOURCES CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_dit.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_encp.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_engine.cpp"
-     "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_g2pw.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_hubert.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_mel.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_refcode.cpp"
@@ -90,6 +89,9 @@ if(MSVC)
     target_compile_options(gsv_engine PUBLIC /utf-8 /W1)
     target_compile_options(gsv_engine PRIVATE /openmp)
 else()
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        target_compile_options(gsv_engine PRIVATE -mavx2 -mfma)
+    endif()
     find_package(OpenMP)
     if(OpenMP_CXX_FOUND)
         target_link_libraries(gsv_engine PRIVATE OpenMP::OpenMP_CXX)
