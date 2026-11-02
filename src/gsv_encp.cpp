@@ -107,12 +107,27 @@ struct gsv_encp::impl {
             ggml_tensor * sc = ggml_scale(c, ggml_mul_mat(c, kh, qh), scale);
             // rel_k: torch _rel_to_abs 复刻 — 见文件头注释
             ggml_tensor * ek = W1("emb_rel_k");   // ne=(DK, 2WIN+1) F32, flat[d + w*DK]
+            // Short sequences (T <= WIN): the original pad width T-WIN-1 is negative. torch's
+            // _get_relative_embeddings clamps it to 0 and slices the embedding instead, so take
+            // the [WIN+1-T, WIN+1-T+2T-1) row window here and skip the zero padding.
+            const bool short_seq = (T < WIN + 1);
+            const int rel_off = short_seq ? (WIN + 1 - T) : 0;
+            ggml_tensor * ek_use = ek;
+            if (short_seq) {
+                ek_use = ggml_cont(c, ggml_view_2d(c, ek, DK, 2 * T - 1, ek->nb[1],
+                                                   (size_t) rel_off * ek->nb[1]));
+            }
             // R = mul_mat(ek, qh): ek flat[d + w*DK] = [K=dk, M=win2] mul_mat 布局 (a[i=w, l=d])
-            ggml_tensor * R = ggml_scale(c, ggml_mul_mat(c, ek, qh), scale);    // [WIN2, T]: R[w, tq]
+            ggml_tensor * R = ggml_scale(c, ggml_mul_mat(c, ek_use, qh), scale); // [WIN2, T]: R[w, tq]
             // pad 两侧 (T-WIN-1) 行零 → x_g [2T-1, T] (torch 行主 x[tq, w])
-            ggml_tensor * zl = ggml_new_tensor_2d(c, GGML_TYPE_F32, T - WIN - 1, T);
-            ggml_set_name(zl, zname("zl", seg, li).c_str()); ggml_set_input(zl);
-            ggml_tensor * xg = ggml_concat(c, zl, ggml_concat(c, R, zl, 0), 0);  // [2T-1, T]
+            ggml_tensor * xg;
+            if (short_seq) {
+                xg = R;                                                      // [2T-1, T], no pad
+            } else {
+                ggml_tensor * zl = ggml_new_tensor_2d(c, GGML_TYPE_F32, T - WIN - 1, T);
+                ggml_set_name(zl, zname("zl", seg, li).c_str()); ggml_set_input(zl);
+                xg = ggml_concat(c, zl, ggml_concat(c, R, zl, 0), 0);        // [2T-1, T]
+            }
             // _rel_to_abs: pad 尾 1 → flatten → pad 尾 T-1 → reshape [2T-1, T+1] → [:T, T-1:]
             ggml_tensor * z1 = ggml_new_tensor_2d(c, GGML_TYPE_F32, 1, T);
             ggml_set_name(z1, zname("z1", seg, li).c_str()); ggml_set_input(z1);
@@ -143,9 +158,16 @@ struct gsv_encp::impl {
             // flat[w' + d*(2T-1)] 其中中心区 = evT flat[w + d*9] → w' 平移后: 
             // concat(z, evT, z, 0) 在 ne0 方向拼接: 每行 d 的 [zeros; ev 行; zeros] → flat[w' + d*(2T-1)] ✓
             ggml_tensor * evT = ggml_cont(c, ggml_transpose(c, ev));             // [WIN2, DK] 真实重排
-            ggml_tensor * zp2 = ggml_new_tensor_2d(c, GGML_TYPE_F32, T - WIN - 1, DK);
-            ggml_set_name(zp2, zname("zp2", seg, li).c_str()); ggml_set_input(zp2);
-            ggml_tensor * evp = ggml_concat(c, zp2, ggml_concat(c, evT, zp2, 0), 0);   // [2T-1, DK] cont
+            ggml_tensor * evp;
+            if (short_seq) {
+                // same slice as rel_k: rows [rel_off, rel_off + 2T-1) of evT, no zero padding
+                evp = ggml_cont(c, ggml_view_2d(c, evT, 2 * T - 1, DK, evT->nb[1],
+                                                (size_t) rel_off * evT->nb[1]));
+            } else {
+                ggml_tensor * zp2 = ggml_new_tensor_2d(c, GGML_TYPE_F32, T - WIN - 1, DK);
+                ggml_set_name(zp2, zname("zp2", seg, li).c_str()); ggml_set_input(zp2);
+                evp = ggml_concat(c, zp2, ggml_concat(c, evT, zp2, 0), 0);   // [2T-1, DK] cont
+            }
             // p flat[ki + tq*T] = torch p_t[tq, ki] 行主 flat[tq*T + ki] ✓ 直接复刻
             // _abs_to_rel: pad right (T-1) → flatten → pad left T → reshape [2T, T] → [:, 1:]
             ggml_tensor * zp = ggml_new_tensor_2d(c, GGML_TYPE_F32, T - 1, T);
