@@ -45,6 +45,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Service unit tests (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: scripts\run-svc-tests.bat
+
       - name: Install Vulkan SDK
         uses: jakoch/install-vulkan-sdk-action@v1
         with:
