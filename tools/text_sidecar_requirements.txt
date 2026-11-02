@@ -1,0 +1,28 @@
+# Sidecar (text frontend) 依赖 —— 不装 torch / transformers 之外的训练栈。
+#   python -m venv .venv-sidecar
+#   .venv-sidecar\Scripts\python.exe -m pip install -r tools\text_sidecar_requirements.txt
+# 注意：包内**不能有 torch**（transformers 会因此 import torch，冷启动 +10~20 s）。
+numpy>=1.26
+onnxruntime>=1.20
+transformers>=4.40,<5
+tokenizers
+pypinyin
+jieba_fast
+cn2an
+OpenCC
+nltk
+g2p_en
+inflect
+wordsegment
+requests
+# 多语言（repo 的 requirements 同样需要；zh/en 可以不装）
+jieba
+fast-langdetect>=0.3.1
+split-lang
+pyopenjtalk>=0.4.1
+ToJyutping
+jamo
+g2pk2
+ko_pron
+# g2pk2 在 Windows 走 eunjeon 分支；用 python-mecab-ko 顶替（见 frontend.py）
+python-mecab-ko

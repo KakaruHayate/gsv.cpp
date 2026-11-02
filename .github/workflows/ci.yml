@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Service unit tests (svc_core.h)
+        run: cmd /c scripts\run-svc-tests.bat
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python syntax check
+        run: |
+          python -m py_compile tools/text_sidecar.py tools/frontend/frontend.py tools/export_gguf/export.py
+          python -m py_compile tools/convert_ar.py tools/convert_cond.py tools/convert_dit.py tools/convert_refcode.py

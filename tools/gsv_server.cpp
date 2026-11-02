@@ -1,0 +1,945 @@
+// gsv_server — GPT-SoVITS 兼容 HTTP 服务
+//
+//   GAG(fork) --HTTP--> gsv_server(C++) --HTTP--> text_sidecar(Python, 仅 G2P)
+//                            └── gsv_engine (进程内, 可换 voice)
+//
+// 核心逻辑在 tools/svc_core.h（voice 注册 / LRU / 合成 / 日志），本文件只做路由与生命周期。
+//
+// 端点:
+//   POST /tts, GET /tts        合成（切句 + 拼接）
+//   POST /batch                多条 -> job；GET /jobs/{id}[/result/{i}]；DELETE /jobs/{id}
+//   POST /reference            上传参考音频（raw body, ?name=）
+//   GET  /models               列出 voices / 当前 voice / reloading
+//   GET  /set_gpt_weights /set_sovits_weights?weights_path=<voice>
+//   GET  /control?command=exit|restart
+//   GET  /health /metrics
+//
+// 用法:
+//   gsv_server [--models models] [--device vulkan] [--voc-device auto]
+//              [--host 127.0.0.1] [--port 9880] [--sidecar 127.0.0.1:9882]
+//              [--log-dir logs] [--threads N] [--verbose]
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+#endif
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <deque>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "httplib.h"
+#include "json.hpp"
+
+#include "svc_core.h"
+
+using namespace svc;
+
+namespace {
+
+constexpr int kMaxWaiters = 32;          // 超过就 503（背压）
+constexpr double kQueueTimeoutSec = 300; // 单请求排队上限
+
+// ---------------- crash dump (M1/M5)
+#if defined(_WIN32)
+static LONG WINAPI on_crash(EXCEPTION_POINTERS * ep) {
+    char path[MAX_PATH];
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    std::snprintf(path, sizeof(path), "logs\\crash-%04d%02d%02d-%02d%02d%02d-%08lx.dmp",
+                  st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+                  (unsigned long) ep->ExceptionRecord->ExceptionCode);
+    std::fprintf(stderr, "[gsv_server] CRASH code=0x%08lx addr=%p -> %s\n",
+                 (unsigned long) ep->ExceptionRecord->ExceptionCode,
+                 ep->ExceptionRecord->ExceptionAddress, path);
+    CreateDirectoryA("logs", nullptr);
+    HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION mi{GetCurrentThreadId(), ep, FALSE};
+        MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), h, MiniDumpWithThreadInfo,
+                          &mi, nullptr, nullptr);
+        CloseHandle(h);
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+#endif
+
+// 安全相关（g_token / g_allow / path_allowed / authorized）在 svc_core.h
+
+struct TtsOutcome {
+    int code = 200;
+    std::string error_code;   // bad_request / busy / timeout / engine / sidecar / internal
+    std::string message;
+    std::string wav;
+    json meta;
+};
+
+json jerror(int code, const std::string & ec, const std::string & msg) {
+    return json{{"message", msg}, {"code", ec}};
+}
+
+// JSON 取值：兼容 GET 的字符串形式和 POST 的数字形式
+std::string jstr(const json & b, const char * k, const std::string & def) {
+    if (!b.contains(k) || b[k].is_null()) return def;
+    try {
+        if (b[k].is_string()) return b[k].get<std::string>();
+        return b[k].dump();
+    } catch (...) { return def; }
+}
+
+double jnum(const json & b, const char * k, double def) {
+    if (!b.contains(k) || b[k].is_null()) return def;
+    try {
+        if (b[k].is_number()) return b[k].get<double>();
+        if (b[k].is_string()) return std::stod(b[k].get<std::string>());
+    } catch (...) {}
+    return def;
+}
+
+bool jbool(const json & b, const char * k, bool def) {
+    if (!b.contains(k) || b[k].is_null()) return def;
+    try {
+        if (b[k].is_boolean()) return b[k].get<bool>();
+        if (b[k].is_number()) return b[k].get<double>() != 0;
+        if (b[k].is_string()) {
+            const std::string s = b[k].get<std::string>();
+            return s == "true" || s == "1" || s == "True";
+        }
+    } catch (...) {}
+    return def;
+}
+
+void parse_params(const json & b, SynthParams & p) {
+    p.text = jstr(b, "text", "");
+    p.text_lang = jstr(b, "text_lang", "zh");
+    p.ref_path = jstr(b, "ref_audio_path", "");
+    p.prompt_text = jstr(b, "prompt_text", "");
+    p.prompt_lang = jstr(b, "prompt_lang", "zh");
+    p.voice = jstr(b, "voice", "");
+    p.steps = (int) jnum(b, "sample_steps", -1);
+    p.cfg = (float) jnum(b, "cfg_rate", -1.0);
+    // cache-dit：dbcache=off|auto|f4|f8|f16（auto = 步数>=16 时 F8/.12）；也可显式给四个参数
+    {
+        const std::string db = jstr(b, "dbcache", "auto");
+        if (db == "off" || db == "0") p.dbcache_fn = 0;
+        else if (db == "on") p.dbcache_fn = 8;
+        else if (db.size() > 1 && (db[0] == 'f' || db[0] == 'F'))
+            p.dbcache_fn = std::atoi(db.c_str() + 1);
+        p.dbcache_fn = (int) jnum(b, "dbcache_fn", p.dbcache_fn);
+        p.dbcache_thr = (float) jnum(b, "dbcache_threshold", p.dbcache_thr);
+        p.dbcache_warmup = (int) jnum(b, "dbcache_warmup", p.dbcache_warmup);
+        p.dbcache_ds = (int) jnum(b, "dbcache_downsample", p.dbcache_ds);
+    }
+    p.seed = (int) jnum(b, "seed", -1);
+    p.max_steps = (int) jnum(b, "max_steps", 1500);
+    p.early_stop = (int) jnum(b, "early_stop", 400);
+    p.speed = jnum(b, "speed_factor", 1.0);
+    p.skip_steps = (int) jnum(b, "skip_first_step", 0);
+    p.split_method = jstr(b, "text_split_method", "cut5");
+    p.fragment_interval = (float) jnum(b, "fragment_interval", 0.3);
+    p.sampler.top_k = (int) jnum(b, "top_k", p.sampler.top_k);
+    p.sampler.top_p = (float) jnum(b, "top_p", p.sampler.top_p);
+    p.sampler.temperature = (float) jnum(b, "temperature", p.sampler.temperature);
+    p.sampler.repetition_penalty = (float) jnum(b, "repetition_penalty", p.sampler.repetition_penalty);
+}
+
+// 底层合成：切 voice（如需）-> 快照引擎 -> 排队/计时 -> synth_text
+bool perform_synth(State & st, const SidecarCfg & side, const SynthParams & p, std::vector<float> & wav,
+                   SynthTiming & tm, std::string & err, std::string & ec) {
+    if (const char * dbg = std::getenv("GSV_DEBUG_SYNTH")) {
+        std::fprintf(stderr,
+                     "[perform_synth] steps=%d cfg=%.3f seed=%d max=%d early=%d speed=%.2f "
+                     "voice='%s' ref='%s' prompt=%zu flen=%zu split=%s\n",
+                     p.steps, p.cfg, p.seed, p.max_steps, p.early_stop, p.speed, p.voice.c_str(),
+                     p.ref_path.c_str(), p.prompt_text.size(), p.text.size(), p.split_method.c_str());
+    }
+    if (!p.voice.empty() && p.voice != st.voice) {
+        double ms = 0;
+        if (!switch_voice(st, p.voice, err, ms)) { ec = "engine"; return false; }
+    }
+    if (!st.mock_engine && !snapshot(st)) { err = "engine not ready"; ec = "engine"; return false; }
+
+    if (st.waiters.fetch_add(1) >= kMaxWaiters) {
+        st.waiters.fetch_sub(1);
+        st.n_busy++;
+        err = "server busy (too many waiting requests)";
+        ec = "busy";
+        return false;
+    }
+    // AR 走跨请求聚合队列；DiT/vocoder 在函数内部各自取短锁，不再全程占 compute_mu
+    SynthParams pp = p;
+    resolve_auto_params(st, pp);
+    // 请求级聚合：提交给调度器，与同时到达的 /tts、/batch 文本一起分组
+    if (st.sched) {
+        auto fut = st.sched->submit(pp, pp.text);
+        if (fut.wait_for(std::chrono::seconds(300)) != std::future_status::ready) {
+            st.waiters.fetch_sub(1);
+            st.n_timeouts++;
+            err = "scheduler timeout";
+            ec = "timeout";
+            return false;
+        }
+        SynthResult r = fut.get();
+        st.waiters.fetch_sub(1);
+        if (!r.err.empty()) { err = r.err; ec = "engine"; return false; }
+        wav = std::move(r.wav);
+        tm = r.tm;
+        return true;
+    }
+    const bool ok = synth_text_q(st, side, pp, wav, tm, err);
+    st.waiters.fetch_sub(1);
+    if (!ok && ec.empty()) ec = "engine";
+    return ok;
+}
+
+TtsOutcome run_tts(State & st, const SidecarCfg & side, ReqLog & rlog, const json & body,
+                   const std::string & rid) {
+    TtsOutcome o;
+    SynthParams p;
+    parse_params(body, p);
+    const std::string media_type = jstr(body, "media_type", "wav");
+    const double t0 = now_s();
+
+    if (p.text.empty()) { o.code = 400; o.error_code = "bad_request"; o.message = "text is required"; return o; }
+    if (p.ref_path.empty()) { o.code = 400; o.error_code = "bad_request"; o.message = "ref_audio_path is required"; return o; }
+    if (p.prompt_text.empty()) {
+        o.code = 400;
+        o.error_code = "bad_request";
+        o.message = "prompt_text is required (V3/V4/V5 do not support reference-text-free mode)";
+        return o;
+    }
+    if (media_type != "wav") {
+        o.code = 400; o.error_code = "bad_request"; o.message = "only media_type=wav is supported";
+        return o;
+    }
+    if (p.speed <= 0.0 || p.speed > 4.0) {
+        o.code = 400; o.error_code = "bad_request"; o.message = "speed_factor must be in (0, 4]";
+        return o;
+    }
+    if (!path_allowed(p.ref_path)) {
+        o.code = 403;
+        o.error_code = "forbidden";
+        o.message = "ref_audio_path is not under an allowed directory (see --allow-path)";
+        return o;
+    }
+
+    st.n_tts++;
+    std::vector<float> wav;
+    SynthTiming tm;
+    std::string err, ec;
+    const bool ok = perform_synth(st, side, p, wav, tm, err, ec);
+    const double total_ms = (now_s() - t0) * 1000;
+
+    if (!ok) {
+        st.n_errors++;
+        o.code = (ec == "busy") ? 503 : (ec == "timeout") ? 504 : (ec == "sidecar") ? 503 : 500;
+        o.error_code = ec.empty() ? "internal" : ec;
+        o.message = err;
+    } else {
+        normalize(wav);
+        o.wav = wav_bytes(wav);
+        st.last_total_ms = total_ms;
+        o.meta = json{{"audio_s", (double) wav.size() / kSampleRate},
+                      {"segments", tm.segments},
+                      {"phones", tm.phones},
+                      {"ms", total_ms}};
+        std::printf("[tts %s] voice=%s segs=%d phones=%d audio=%.2fs | g2p %.0f prep %.0f bert %.0f "
+                    "ar %.0f cond %.0f dit %.0f voc %.0f synth %.0f | cache %d/%d | total %.0f ms\n",
+                    rid.c_str(), st.voice.c_str(), tm.segments, tm.phones,
+                    (double) wav.size() / kSampleRate, tm.g2p_ms, tm.prep_ms, tm.bert_ms, tm.ar_ms,
+                    tm.cond_ms, tm.dit_ms, tm.voc_ms, tm.synth_ms, tm.cache_hits,
+                    tm.cache_hits + tm.cache_misses, total_ms);
+    }
+
+    rlog.write(json{{"ts", now_s()},
+                    {"id", rid},
+                    {"kind", "tts"},
+                    {"voice", st.voice},
+                    {"text_chars", (int) utf8_len(p.text)},
+                    {"status", o.code},
+                    {"error", o.message},
+                    {"total_ms", total_ms},
+                    {"g2p_ms", tm.g2p_ms},
+                    {"prep_ms", tm.prep_ms},
+                    {"bert_ms", tm.bert_ms},
+                    {"ar_ms", tm.ar_ms},
+                    {"synth_ms", tm.synth_ms},
+                    {"segments", tm.segments},
+                    {"phones", tm.phones}});
+    return o;
+}
+
+}  // namespace
+
+int main(int argc, char ** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+#if defined(_WIN32)
+    // 控制台默认是 GBK；源码里的中文是 UTF-8，不切码页会显示成"鏈◆鏊"之类的乱码
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+    SetUnhandledExceptionFilter(on_crash);
+#endif
+    std::set_terminate([]() {
+        try {
+            if (std::current_exception()) std::rethrow_exception(std::current_exception());
+        } catch (const std::exception & e) {
+            std::fprintf(stderr, "[gsv_server] std::terminate: %s\n", e.what());
+        } catch (...) {
+            std::fprintf(stderr, "[gsv_server] std::terminate: unknown\n");
+        }
+        std::abort();
+    });
+
+    std::string host = "127.0.0.1";
+    int port = 9880;
+    SidecarCfg side;
+    std::string log_dir = "logs";
+    bool verbose = false;
+    double job_ttl_arg = 3600.0;
+    State st;
+    st.base.model_dir = "models";
+
+    for (int i = 1; i < argc; i++) {
+        const std::string a = argv[i];
+        auto next = [&](const char * what) -> std::string {
+            if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", what); std::exit(2); }
+            return argv[++i];
+        };
+        if (a == "--models") st.base.model_dir = next("--models");
+        else if (a == "--device") st.base.device = next("--device");
+        else if (a == "--voc-device") st.base.voc_device = next("--voc-device");
+        else if (a == "--threads") st.base.n_threads = std::atoi(next("--threads").c_str());
+        else if (a == "--host") host = next("--host");
+        else if (a == "--port") port = std::atoi(next("--port").c_str());
+        else if (a == "--sidecar") { if (!parse_host_port(next("--sidecar"), side)) {
+            std::fprintf(stderr, "bad --sidecar\n"); return 2; } }
+        else if (a == "--log-dir") log_dir = next("--log-dir");
+        else if (a == "--token") g_token = next("--token");
+        else if (a == "--allow-path") g_allow.push_back(next("--allow-path"));
+        else if (a == "--job-ttl") job_ttl_arg = std::atof(next("--job-ttl").c_str());
+        else if (a == "--mock-engine") st.mock_engine = true;
+        else if (a == "--mock-sidecar") g_mock_sidecar = true;
+        else if (a == "--verbose") verbose = true;
+        else if (a == "-h" || a == "--help") {
+            std::printf("usage: gsv_server [--models DIR] [--device cpu|vulkan] [--voc-device auto|cpu|dml|webgpu]\n"
+                        "                  [--host 127.0.0.1] [--port 9880] [--sidecar 127.0.0.1:9882]\n"
+                        "                  [--log-dir logs] [--threads N] [--verbose]\n");
+            return 0;
+        } else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
+    }
+    if (port <= 0 || port > 65535) { std::fprintf(stderr, "bad --port\n"); return 2; }
+    if (!is_loopback(host) && g_token.empty()) {
+        std::fprintf(stderr,
+                     "[gsv_server] refusing to bind %s without --token "
+                     "(non-loopback access requires auth)\n",
+                     host.c_str());
+        return 2;
+    }
+    if (g_allow.empty()) {
+        g_allow.push_back(fs::current_path().string());
+        g_allow.push_back((fs::temp_directory_path() / "gsv_refs").string());
+    }
+    st.base.verbose = verbose;
+
+    ReqLog rlog;
+    rlog.init(log_dir);
+
+    st.voices.init(st.base.model_dir);
+    if (st.mock_engine) {
+        std::printf("[gsv_server] mock engine mode (no models/GPU); sidecar mock=%d\n",
+                    (int) g_mock_sidecar);
+    } else {
+        std::string err;
+        double ms = 0;
+        std::printf("[gsv_server] loading default voice from %s (device=%s)...\n",
+                    st.base.model_dir.c_str(), st.base.device.empty() ? "cpu" : st.base.device.c_str());
+        if (!switch_voice(st, "default", err, ms)) {
+            std::fprintf(stderr, "[gsv_server] %s\n", err.c_str());
+            return 1;
+        }
+        std::printf("[gsv_server] engine ready (%s, %.0f ms)\n", st.voice.c_str(), ms);
+    }
+    // 跨请求聚合：
+    //  - SynthScheduler：请求级（/tts 与 /batch 的每个文本），同参考/参数自动攒组；
+    //  - ArBatcher：组内各 segment 的 AR 再攒批。
+    ArBatcher ar_batcher;
+    ar_batcher.start(&st);
+    st.ar_batcher = &ar_batcher;
+    SynthScheduler sched;
+    sched.start(&st, side);
+    st.sched = &sched;
+
+    if (!g_mock_sidecar && !sidecar_alive(side)) {
+        std::fprintf(stderr, "[gsv_server] warning: text sidecar not reachable at %s:%d\n"
+                             "             start it with: python tools/text_sidecar.py --port %d\n",
+                     side.host.c_str(), side.port, side.port);
+    } else if (!g_mock_sidecar) {
+        std::printf("[gsv_server] text sidecar ok (%s:%d)\n", side.host.c_str(), side.port);
+    }
+
+    // ---- job queue ----
+    struct JobItem {
+        std::string text;
+        std::string wav;
+        double audio_s = 0;
+        double ms = 0;
+        std::string error;
+    };
+    struct Job {
+        std::string id;
+        SynthParams base;
+        std::vector<JobItem> items;
+        int state = 0;   // 0 queued 1 running 2 done 3 canceled 4 failed
+        std::string fatal;
+        bool cancel = false;
+        double created = now_s();
+        std::mutex m;
+    };
+    std::deque<std::shared_ptr<Job>> queue;
+    std::mutex qm;
+    std::condition_variable qcv;
+    std::mutex jobs_m;
+    std::map<std::string, std::shared_ptr<Job>> jobs;
+    std::atomic<bool> stopping{false};
+    std::atomic<uint64_t> job_seq{0};
+
+    auto gen_job_id = [&]() {
+        char buf[48];
+        std::snprintf(buf, sizeof(buf), "job-%lld-%llu", (long long) (now_s() * 1000),
+                      (unsigned long long) job_seq++);
+        return std::string(buf);
+    };
+
+    // ---- job 持久化 / TTL ----
+    double job_ttl = job_ttl_arg;
+    const fs::path jobs_root = fs::path(log_dir) / "jobs";
+    { std::error_code ec; fs::create_directories(jobs_root, ec); }
+    auto job_dir = [&](const std::string & id) { return jobs_root / id; };
+    auto state_name = [](int s) {
+        static const char * n[] = {"queued", "running", "done", "canceled", "failed"};
+        return std::string(n[std::max(0, std::min(4, s))]);
+    };
+    auto persist_job = [&](const std::shared_ptr<Job> & job) {
+        std::error_code ec;
+        const fs::path d = job_dir(job->id);
+        fs::create_directories(d, ec);
+        json items = json::array();
+        std::lock_guard<std::mutex> jl(job->m);
+        for (size_t i = 0; i < job->items.size(); i++) {
+            const auto & it = job->items[i];
+            const bool has = !it.wav.empty();
+            if (has) {
+                std::ofstream f(d / (std::to_string(i) + ".wav"), std::ios::binary);
+                if (f) f.write(it.wav.data(), (std::streamsize) it.wav.size());
+            }
+            items.push_back(json{{"text", it.text}, {"audio_s", it.audio_s}, {"ms", it.ms},
+                                 {"error", it.error}, {"done", has}});
+        }
+        json meta{{"job_id", job->id},
+                  {"state", state_name(job->state)},
+                  {"fatal", job->fatal},
+                  {"created", job->created},
+                  {"items", items}};
+        std::ofstream f(d / "meta.json");
+        if (f) f << meta.dump();
+    };
+
+    std::thread worker([&]() {
+        try {
+        for (;;) {
+            std::shared_ptr<Job> job;
+            {
+                std::unique_lock<std::mutex> lk(qm);
+                qcv.wait(lk, [&] { return !queue.empty() || stopping.load(); });
+                if (stopping.load()) return;
+                job = queue.front();
+                queue.pop_front();
+            }
+            {
+                std::lock_guard<std::mutex> jl(job->m);
+                job->state = 1;
+            }
+            // 批量 AR：把每条文本按切句方式拆成 segment，所有 segment 一起做 AR
+            //（每 8 条一批），再逐条 synthesize，最后按 item 拼回（cut0/cut5 都适用）
+            {
+                std::vector<std::string> texts;
+                texts.reserve(job->items.size());
+                for (const auto & it : job->items) texts.push_back(it.text);
+                std::vector<std::vector<float>> wavs;
+                std::vector<SynthTiming> tms;
+                std::vector<std::string> errs;
+                std::string err, ec;
+                const double t0 = now_s();
+                bool ok = false;
+                try {
+                    ok = synth_batch_texts_q(st, side, job->base, texts, wavs, tms, errs, err, ec);
+                } catch (const std::exception & e) {
+                    err = std::string("exception: ") + e.what();
+                    ec = "engine";
+                }
+                {
+                    std::lock_guard<std::mutex> jl(job->m);
+                    for (size_t i = 0; i < job->items.size(); i++) {
+                        if (!ok) { job->items[i].error = err; continue; }
+                        if (wavs[i].empty()) {
+                            job->items[i].error = errs[i];
+                            continue;
+                        }
+                        normalize(wavs[i]);
+                        job->items[i].wav = wav_bytes(wavs[i]);
+                        job->items[i].audio_s = (double) wavs[i].size() / kSampleRate;
+                        job->items[i].ms = (now_s() - t0) * 1000;
+                    }
+                    if (job->state == 1) job->state = 2;
+                }
+                std::printf("[%s] ar-batch %zu items in %.0f ms\n", job->id.c_str(), texts.size(),
+                            (now_s() - t0) * 1000);
+                persist_job(job);
+                continue;
+            }
+            for (size_t i = 0; i < job->items.size(); i++) {
+                {
+                    std::lock_guard<std::mutex> jl(job->m);
+                    if (job->cancel) { job->state = 3; break; }
+                }
+                SynthParams p = job->base;
+                p.text = job->items[i].text;
+                std::vector<float> wav;
+                SynthTiming tm;
+                std::string err, ec;
+                const double t0 = now_s();
+                bool ok = false;
+                try {
+                    ok = perform_synth(st, side, p, wav, tm, err, ec);
+                } catch (const std::exception & e) {
+                    err = std::string("exception: ") + e.what();
+                    ec = "engine";
+                }
+                std::lock_guard<std::mutex> jl(job->m);
+                if (!ok) {
+                    job->items[i].error = err;
+                    job->items[i].ms = (now_s() - t0) * 1000;
+                } else {
+                    normalize(wav);
+                    job->items[i].wav = wav_bytes(wav);
+                    job->items[i].audio_s = (double) wav.size() / kSampleRate;
+                    job->items[i].ms = (now_s() - t0) * 1000;
+                }
+                std::printf("[%s] %zu/%zu %s %.2fs (%.0f ms)%s\n", job->id.c_str(), i + 1,
+                            job->items.size(),
+                            job->items[i].text.substr(0, 16).c_str(), job->items[i].audio_s,
+                            job->items[i].ms, job->items[i].error.empty() ? "" : " ERR");
+            }
+            {
+                std::lock_guard<std::mutex> jl(job->m);
+                if (job->state == 1) job->state = 2;
+            }
+            persist_job(job);
+        }
+        } catch (const std::exception & e) {
+            std::fprintf(stderr, "[gsv_server] worker exception: %s\n", e.what());
+        } catch (...) {
+            std::fprintf(stderr, "[gsv_server] worker exception: unknown\n");
+        }
+    });
+
+    // TTL 清理：终态 job 超过 --job-ttl 后从内存和磁盘删除
+    std::thread janitor([&]() {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+            if (stopping.load()) return;
+            std::vector<std::string> dead;
+            {
+                std::lock_guard<std::mutex> jl(jobs_m);
+                for (auto it = jobs.begin(); it != jobs.end();) {
+                    bool terminal = false;
+                    double created = 0;
+                    {
+                        std::lock_guard<std::mutex> jj(it->second->m);
+                        terminal = it->second->state >= 2;
+                        created = it->second->created;
+                    }
+                    if (terminal && now_s() - created > job_ttl) {
+                        dead.push_back(it->first);
+                        it = jobs.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+            for (const auto & id : dead) {
+                std::error_code ec;
+                fs::remove_all(job_dir(id), ec);
+            }
+        }
+    });
+
+    // ---- HTTP ----
+    httplib::Server svr;
+    svr.set_pre_routing_handler([&](const httplib::Request & req, httplib::Response & res) {
+        if (req.path == "/health") return httplib::Server::HandlerResponse::Unhandled;
+        if (authorized(req)) return httplib::Server::HandlerResponse::Unhandled;
+        res.status = 401;
+        res.set_content(jerror(401, "unauthorized", "missing or invalid token").dump(),
+                        "application/json");
+        return httplib::Server::HandlerResponse::Handled;
+    });
+    svr.set_payload_max_length(16 * 1024 * 1024);
+    svr.set_logger([](const httplib::Request & req, const httplib::Response & res) {
+        std::printf("[http] %s %s -> %d\n", req.method.c_str(), req.path.c_str(), res.status);
+    });
+    svr.set_exception_handler([](const httplib::Request &, httplib::Response & res, std::exception_ptr ep) {
+        std::string msg = "internal error";
+        try { std::rethrow_exception(ep); }
+        catch (const std::exception & e) { msg = e.what(); }
+        catch (...) {}
+        res.status = 500;
+        res.set_content(jerror(500, "internal", msg).dump(), "application/json");
+    });
+
+    auto jerr = [](httplib::Response & res, int code, const std::string & ec, const std::string & msg) {
+        res.status = code;
+        res.set_content(jerror(code, ec, msg).dump(), "application/json");
+    };
+
+    svr.Get("/health", [&](const httplib::Request &, httplib::Response & res) {
+        size_t pending;
+        { std::lock_guard<std::mutex> lk(qm); pending = queue.size(); }
+        bool ready;
+        { std::lock_guard<std::mutex> lk(st.eng_mu); ready = (bool) st.eng || st.mock_engine; }
+        res.set_content(json{{"ok", true},
+                             {"engine", ready ? "ready" : "loading"},
+                             {"voice", st.voice},
+                             {"reloading", st.reloading.load()},
+                             {"sidecar", g_mock_sidecar || sidecar_alive(side)},
+                             {"queue", pending},
+                             {"waiters", st.waiters.load()}}.dump(),
+                        "application/json");
+    });
+
+    svr.Get("/metrics", [&](const httplib::Request &, httplib::Response & res) {
+        size_t pending;
+        { std::lock_guard<std::mutex> lk(qm); pending = queue.size(); }
+        res.set_content(json{{"tts_requests", st.n_tts.load()},
+                             {"errors", st.n_errors.load()},
+                             {"jobs", st.n_jobs.load()},
+                             {"timeouts", st.n_timeouts.load()},
+                             {"busy", st.n_busy.load()},
+                             {"reloads", st.n_reloads.load()},
+                             {"ar_batches", st.ar_batcher ? (uint64_t) st.ar_batcher->n_batches.load() : 0},
+                             {"ar_tasks", st.ar_batcher ? (uint64_t) st.ar_batcher->n_tasks.load() : 0},
+                             {"sched_batches", st.sched ? (uint64_t) st.sched->n_batches.load() : 0},
+                             {"sched_texts", st.sched ? (uint64_t) st.sched->n_texts.load() : 0},
+                             {"queue", pending},
+                             {"waiters", st.waiters.load()},
+                             {"last_total_ms", st.last_total_ms.load()}}.dump(),
+                        "application/json");
+    });
+
+    svr.Get("/models", [&](const httplib::Request & req, httplib::Response & res) {
+        if (req.has_param("rescan")) st.voices.init(st.base.model_dir);
+        json arr = json::array();
+        for (const auto & v : st.voices.list()) {
+            arr.push_back(json{{"name", v.name},
+                               {"dir", v.dir},
+                               {"ar", v.cfg.ar_file},
+                               {"cond", v.cfg.cond_file},
+                               {"dit", v.cfg.dit_file}});
+        }
+        res.set_content(json{{"voices", arr},
+                             {"current", st.voice},
+                             {"reloading", st.reloading.load()},
+                             {"models_dir", st.base.model_dir}}.dump(),
+                        "application/json");
+    });
+
+    for (const char * p : {"/set_gpt_weights", "/set_sovits_weights"}) {
+        svr.Get(p, [&](const httplib::Request & req, httplib::Response & res) {
+            const std::string want = req.has_param("weights_path")
+                                         ? req.get_param_value("weights_path")
+                                         : (req.has_param("voice") ? req.get_param_value("voice") : "");
+            if (want.empty()) return jerr(res, 400, "bad_request", "weights_path is required");
+            Voice v;
+            if (!st.voices.get(want, v)) {
+                st.voices.init(st.base.model_dir);   // 热加载新导入的 voice
+                if (!st.voices.get(want, v)) {
+                    return jerr(res, 400, "bad_request",
+                                "unknown voice '" + want +
+                                    "'; export your V5 model to GGUF and register it under models/voices/<name>/");
+                }
+            }
+            std::string err;
+            double ms = 0;
+            if (!switch_voice(st, want, err, ms)) return jerr(res, 500, "engine", err);
+            res.set_content(json{{"voice", st.voice}, {"load_ms", ms}}.dump(), "application/json");
+        });
+    }
+    svr.Get("/set_refer_audio", [](const httplib::Request &, httplib::Response & res) {
+        res.set_content(json{{"message", "ok (pass ref_audio_path per /tts request)"}}.dump(),
+                        "application/json");
+    });
+
+    svr.Get("/control", [&](const httplib::Request & req, httplib::Response & res) {
+        const std::string cmd = req.has_param("command") ? req.get_param_value("command") : "";
+        res.set_content(json{{"message", cmd.empty() ? "ok" : ("ok: " + cmd)}}.dump(), "application/json");
+        if (cmd == "exit") {
+            std::printf("[gsv_server] exit requested\n");
+            std::thread([&]() {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                svr.stop();
+            }).detach();
+        } else if (cmd == "restart") {
+            std::printf("[gsv_server] restart requested (reloading voice '%s')\n", st.voice.c_str());
+            std::thread([&]() {
+                const std::string name = st.voice;
+                std::string err;
+                double ms = 0;
+                if (!switch_voice(st, name, err, ms)) std::fprintf(stderr, "[gsv_server] restart: %s\n", err.c_str());
+            }).detach();
+        }
+    });
+
+    svr.Post("/reference", [&](const httplib::Request & req, httplib::Response & res) {
+        if (req.body.empty()) return jerr(res, 400, "bad_request", "empty body (send raw wav bytes)");
+        std::string name = req.has_param("name") ? req.get_param_value("name") : "ref.wav";
+        for (char & c : name) if (c == '/' || c == '\\' || c == ':') c = '_';
+        try {
+            fs::path dir = fs::temp_directory_path() / "gsv_refs";
+            fs::create_directories(dir);
+            // TTL 清理：24 h 之前的上传
+            {
+                std::error_code ce;
+                const auto now = fs::file_time_type::clock::now();
+                for (const auto & e : fs::directory_iterator(dir, ce)) {
+                    auto t = fs::last_write_time(e.path(), ce);
+                    if (!ce && now - t > std::chrono::hours(24)) fs::remove(e.path(), ce);
+                }
+            }
+            fs::path path = dir / (std::to_string((long long) (now_s() * 1000)) + "_" + name);
+            std::ofstream f(path, std::ios::binary);
+            f.write(req.body.data(), (std::streamsize) req.body.size());
+            f.close();
+            res.set_content(json{{"path", path.string()}, {"bytes", req.body.size()}}.dump(),
+                            "application/json");
+        } catch (const std::exception & e) {
+            jerr(res, 500, "internal", std::string("save failed: ") + e.what());
+        }
+    });
+
+    auto handle_tts = [&](const httplib::Request & req, httplib::Response & res, const json & body) {
+        std::string rid = req.get_header_value("X-Request-Id");
+        if (rid.empty()) rid = rlog.new_id();
+        res.set_header("X-Request-Id", rid);
+        TtsOutcome o = run_tts(st, side, rlog, body, rid);
+        if (o.code != 200) return jerr(res, o.code, o.error_code, o.message);
+        res.set_content(o.wav, "audio/wav");
+    };
+
+    svr.Post("/tts", [&](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try { body = json::parse(req.body); }
+        catch (const std::exception & e) { return jerr(res, 400, "bad_request", std::string("bad json: ") + e.what()); }
+        handle_tts(req, res, body);
+    });
+
+    svr.Get("/tts", [&](const httplib::Request & req, httplib::Response & res) {
+        static const char * keys[] = {"text", "text_lang", "ref_audio_path", "prompt_text", "prompt_lang",
+                                      "voice", "text_split_method", "media_type", "sample_steps", "cfg_rate",
+                                      "seed", "top_k", "top_p", "temperature", "repetition_penalty",
+                                      "fragment_interval", "max_steps", "early_stop", "speed_factor", "skip_first_step",
+                                      "dbcache", "dbcache_fn", "dbcache_threshold", "dbcache_warmup",
+                                      "dbcache_downsample"};
+        json body = json::object();
+        for (const char * k : keys) if (req.has_param(k)) body[k] = req.get_param_value(k);
+        handle_tts(req, res, body);
+    });
+
+    svr.Post("/batch", [&](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try { body = json::parse(req.body); }
+        catch (const std::exception & e) { return jerr(res, 400, "bad_request", std::string("bad json: ") + e.what()); }
+        std::vector<std::string> texts;
+        if (body.contains("texts") && body["texts"].is_array()) {
+            for (const auto & v : body["texts"]) if (v.is_string()) texts.push_back(v.get<std::string>());
+        } else if (body.contains("text") && body["text"].is_string()) {
+            texts.push_back(body["text"].get<std::string>());
+        }
+        if (texts.empty()) return jerr(res, 400, "bad_request", "texts[] is required");
+
+        auto job = std::make_shared<Job>();
+        job->id = gen_job_id();
+        parse_params(body, job->base);
+        if (job->base.ref_path.empty()) return jerr(res, 400, "bad_request", "ref_audio_path is required");
+        if (!path_allowed(job->base.ref_path))
+            return jerr(res, 403, "forbidden",
+                        "ref_audio_path is not under an allowed directory (see --allow-path)");
+        if (job->base.prompt_text.empty()) return jerr(res, 400, "bad_request", "prompt_text is required");
+        job->items.resize(texts.size());
+        for (size_t i = 0; i < texts.size(); i++) job->items[i].text = texts[i];
+        {
+            std::lock_guard<std::mutex> jl(jobs_m);
+            jobs[job->id] = job;
+        }
+        {
+            std::lock_guard<std::mutex> lk(qm);
+            queue.push_back(job);
+        }
+        qcv.notify_one();
+        st.n_jobs++;
+        std::printf("[batch] %s: %zu items\n", job->id.c_str(), texts.size());
+        res.set_content(json{{"job_id", job->id}, {"total", texts.size()}}.dump(), "application/json");
+    });
+
+    svr.Get(R"(/jobs/([^/]+))", [&](const httplib::Request & req, httplib::Response & res) {
+        const std::string id = req.matches[1];
+        std::shared_ptr<Job> job;
+        {
+            std::lock_guard<std::mutex> jl(jobs_m);
+            auto it = jobs.find(id);
+            if (it != jobs.end()) job = it->second;
+        }
+        if (!job) {
+            // 进程重启后从磁盘恢复（只读）
+            std::ifstream f(job_dir(id) / "meta.json");
+            if (!f) return jerr(res, 404, "not_found", "no such job");
+            json meta;
+            try { f >> meta; }
+            catch (...) { return jerr(res, 500, "internal", "bad job meta"); }
+            res.set_content(meta.dump(), "application/json");
+            return;
+        }
+        std::lock_guard<std::mutex> jl(job->m);
+        json items = json::array();
+        int done = 0;
+        for (const auto & it : job->items) {
+            if (!it.wav.empty()) done++;
+            items.push_back(json{{"text", it.text}, {"audio_s", it.audio_s}, {"ms", it.ms},
+                                 {"done", !it.wav.empty()}, {"error", it.error}});
+        }
+        const char * states[] = {"queued", "running", "done", "canceled", "failed"};
+        res.set_content(json{{"job_id", job->id},
+                             {"state", states[std::max(0, std::min(4, job->state))]},
+                             {"done", done},
+                             {"total", (int) job->items.size()},
+                             {"fatal", job->fatal},
+                             {"items", items}}.dump(),
+                        "application/json");
+    });
+
+    svr.Get(R"(/jobs/([^/]+)/events)", [&](const httplib::Request & req, httplib::Response & res) {
+        const std::string id = req.matches[1];
+        std::shared_ptr<Job> job;
+        {
+            std::lock_guard<std::mutex> jl(jobs_m);
+            auto it = jobs.find(id);
+            if (it != jobs.end()) job = it->second;
+        }
+        if (!job) return jerr(res, 404, "not_found", "no such job");
+        res.set_header("Cache-Control", "no-cache");
+        res.set_chunked_content_provider(
+            "text/event-stream",
+            [job](size_t, httplib::DataSink & sink) {
+                json j;
+                {
+                    std::lock_guard<std::mutex> jl(job->m);
+                    int done = 0;
+                    for (const auto & it : job->items) if (!it.wav.empty()) done++;
+                    static const char * states[] = {"queued", "running", "done", "canceled", "failed"};
+                    j = json{{"job_id", job->id},
+                             {"state", states[std::max(0, std::min(4, job->state))]},
+                             {"done", done},
+                             {"total", (int) job->items.size()}};
+                }
+                const std::string s = "data: " + j.dump() + "\n\n";
+                if (!sink.write(s.data(), s.size())) return false;
+                {
+                    std::lock_guard<std::mutex> jl(job->m);
+                    if (job->state >= 2) return false;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                return true;
+            });
+    });
+
+    svr.Get(R"(/jobs/([^/]+)/result/(\d+))", [&](const httplib::Request & req, httplib::Response & res) {
+        const std::string id = req.matches[1];
+        const int idx = std::atoi(req.matches[2].str().c_str());
+        std::shared_ptr<Job> job;
+        {
+            std::lock_guard<std::mutex> jl(jobs_m);
+            auto it = jobs.find(id);
+            if (it != jobs.end()) job = it->second;
+        }
+        if (!job) {
+            std::ifstream f(job_dir(id) / (std::to_string(idx) + ".wav"), std::ios::binary);
+            if (!f) return jerr(res, 404, "not_found", "no such job");
+            std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            res.set_content(bytes, "audio/wav");
+            return;
+        }
+        std::lock_guard<std::mutex> jl(job->m);
+        if (idx < 0 || idx >= (int) job->items.size()) return jerr(res, 404, "not_found", "bad index");
+        if (job->items[idx].wav.empty()) return jerr(res, 409, "not_ready", "not ready");
+        res.set_content(job->items[idx].wav, "audio/wav");
+    });
+
+    svr.Delete(R"(/jobs/([^/]+))", [&](const httplib::Request & req, httplib::Response & res) {
+        const std::string id = req.matches[1];
+        std::shared_ptr<Job> job;
+        {
+            std::lock_guard<std::mutex> jl(jobs_m);
+            auto it = jobs.find(id);
+            if (it == jobs.end()) return jerr(res, 404, "not_found", "no such job");
+            job = it->second;
+        }
+        {
+            std::lock_guard<std::mutex> jl(job->m);
+            job->cancel = true;
+        }
+        res.set_content(json{{"message", "cancel requested"}}.dump(), "application/json");
+    });
+
+    std::printf("[gsv_server] listening on http://%s:%d\n", host.c_str(), port);
+    if (!svr.listen(host, port)) {
+        std::fprintf(stderr, "[gsv_server] listen failed on %s:%d (port in use?)\n", host.c_str(), port);
+        stopping = true;
+        qcv.notify_all();
+        st.sched = nullptr;
+        sched.shutdown();
+        st.ar_batcher = nullptr;
+        ar_batcher.shutdown();
+        worker.join();
+        return 1;
+    }
+    std::printf("[gsv_server] shutting down\n");
+    stopping = true;
+    qcv.notify_all();
+    st.sched = nullptr;
+    sched.shutdown();
+    st.ar_batcher = nullptr;
+    ar_batcher.shutdown();
+    worker.join();
+    janitor.join();
+    return 0;
+}

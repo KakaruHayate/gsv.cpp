@@ -1,0 +1,121 @@
+// 引擎门面: 把 demo_e2e.cpp 里写死的链提炼成可复用接口, 供 gsv_ggml_cli (server) 调用。
+// 所有推理都复用 src/gsv_*.cpp 里已对拍通过的模块, 这里只做编排与布局转换。
+//
+// 阶段划分与 repo 的 TTS.py 一致:
+//   set_ref_audio  -> prep_reference (参考音频三链, 可缓存)
+//   get_phones_and_bert -> Python 前端 (phones / word2ph / bert_ids)
+//   T2S (AR)       -> ar_generate   (语义 token)
+//   decode_encp + synthesize_v5_mel + vocoder -> synthesize (wav)
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "gsv_sampler.h"
+
+struct gsv_engine_cfg {
+    std::string device;        // ggml 后端: "" = CPU, "vulkan"/"gpu" = 第一个 GPU
+    std::string voc_device;    // ORT EP: "" = 自动 (WebGPU > DML > CPU), 或 cpu/dml/webgpu
+    std::string model_dir;     // 模型目录 (models/)
+    // 可选: 逐模型显式路径 (voice manifest 用)。空 = 取 model_dir 下的默认文件名。
+    std::string ar_file, cond_file, dit_file, bert_file, hubert_file, refcode_file, vocoder_file;
+    std::string filter_file;   // resampy kaiser_best 表 (空 = model_dir/resampy_kaiser_best.bin)
+    int  n_threads = 0;        // CPU 后端线程数 (0 = 默认)
+    bool verbose    = false;
+};
+
+class gsv_engine {
+public:
+    static gsv_engine * load(const gsv_engine_cfg & cfg);
+    ~gsv_engine();
+
+    // ---- 参考音频三链 (repo TTS.py::set_ref_audio) ----
+    //   (a) 16k + 0.3s 零尾 -> HuBERT -> ssl_proj -> RVQ -> prompt_codes [T]
+    //   (b) 32k + maxx 归一化 -> spectrogram_torch(2048/640) -> [:, :704] -> ref_enc -> ge [512]
+    //   (c) 32k -> mel_fn_v4 -> norm_spec -> mel2 [100, Tm] (torch 布局 idx = m*Tm + t)
+    bool prep_reference(const std::string & wav_path,
+                        std::vector<int32_t> & prompt_codes,
+                        std::vector<float> & ge,
+                        std::vector<float> & mel2, int & mel2_T);
+
+    // ---- BERT 特征 (repo TextPreprocessor.get_bert_feature) ----
+    //   ids -> gsv_bert::encode_feat (hidden_states[-3], 去 CLS/SEP) -> [1024, L-2]
+    //   -> 按 word2ph 逐字重复 -> [1024, P] 行主 (P = Σword2ph = phones.size())
+    bool bert_feature(const std::vector<int32_t> & ids,
+                      const std::vector<int32_t> & word2ph,
+                      std::vector<float> & feat1024);
+
+    // ---- AR (repo TTS.py 的 T2S 段) ----
+    //   repo 的 AR 输入 x = **参考文本音素 ++ 目标文本音素** (TTS.py:1017 `all_phones =
+    //   prompt_data["phones"] + item["phones"]`), bert 同理沿 dim=1 拼接; 语义 prompt 用参考码。
+    //   只喂目标那一半会让条件缺一半 -> 模型早早判 EOS。
+    //   prompt_bert 为空表示两半都用全零 (非 zh 口径)。
+    bool ar_generate(const std::vector<int32_t> & phones,
+                     const std::vector<float> & bert,           // [1024, Pt] 行主
+                     const std::vector<int32_t> & prompt_phones,
+                     const std::vector<float> & prompt_bert,    // [1024, Pp] 行主 (可空)
+                     const std::vector<int32_t> & prompt_codes,
+                     int max_steps, int early_stop, uint64_t seed,
+                     std::vector<int32_t> & sem,
+                     const gsv_sampler_cfg * sampler = nullptr); // 为空则用 repo 默认 (15/1/1/1.35)
+
+    // 批量 AR：同一参考 (prompt_phones/prompt_bert/prompt_codes) 下并行解多条目标文本，
+    // 与 repo 的 parallel_infer/batch 语义一致（内部 pad + mask，长度可不同）。
+    struct ar_batch_item {
+        std::vector<int32_t> phones;   // 目标文本音素
+        std::vector<float>   bert;     // [1024, phones.size()]，空 = 全零
+    };
+    bool ar_generate_batch(const std::vector<ar_batch_item> & items,
+                           const std::vector<int32_t> & prompt_phones,
+                           const std::vector<float> & prompt_bert,
+                           const std::vector<int32_t> & prompt_codes,
+                           int max_steps, int early_stop, uint64_t seed,
+                           std::vector<std::vector<int32_t>> & sems,
+                           const std::vector<uint64_t> * seeds = nullptr,
+                           const gsv_sampler_cfg * sampler = nullptr);
+
+    // ---- 主链 (repo decode_encp + synthesize_v5_mel + vocoder) ----
+    //   prompt_codes + **prompt_phones** -> 参考侧 fea_ref   (repo: decode_encp(prompt_sem,
+    //       prompt_phones, ...) —— 参考侧用的是**参考音频对应文本**的音素, 不是目标文本的!)
+    //   sem + phones                       -> 目标侧 fea_todo
+    //   -> DiT synthesize_v5_mel (分块 rolling) -> denorm_spec -> vocoder -> wav [32k]
+    bool synthesize(const std::vector<int32_t> & sem,
+                    const std::vector<int32_t> & phones,
+                    const std::vector<int32_t> & prompt_codes,
+                    const std::vector<int32_t> & prompt_phones,
+                    const std::vector<float> & ge,
+                    const std::vector<float> & mel2, int mel2_T,
+                    int steps, float cfg, uint64_t seed,
+                    std::vector<float> & wav,
+                    double speed = 1.0, int skip_steps = 0);
+
+    // 流水线用：DiT 段与 vocoder 段拆开（数值与 synthesize 完全一致）
+    bool synthesize_mel(const std::vector<int32_t> & sem,
+                        const std::vector<int32_t> & phones,
+                        const std::vector<int32_t> & prompt_codes,
+                        const std::vector<int32_t> & prompt_phones,
+                        const std::vector<float> & ge,
+                        const std::vector<float> & mel2, int mel2_T,
+                        int steps, float cfg, uint64_t seed,
+                        std::vector<float> & mel, int & mel_T,
+                        double speed = 1.0, int skip_steps = 0);
+    bool vocode_mel(const std::vector<float> & mel, int mel_T, std::vector<float> & wav);
+
+    // cache-dit 运行时配置（fn<=0 关闭；仅影响 DiT，调用方需持有 engine 锁）
+    void set_dbcache(int fn, float threshold, int warmup, int downsample);
+    int  dbcache_fn() const;
+    // 最近一次 DiT 采样的 cache-dit 命中统计（pos+neg 合计）
+    void dbcache_stats(int & hits, int & misses) const;
+    // 最近一次 synthesize_mel 内部耗时：cond(decode_encp 参考+目标) / DiT
+    void last_stage_ms(double & cond_ms, double & dit_ms) const;
+
+    int  mel_dim()  const;      // 100
+    int  text_dim() const;      // 512
+    int  ar_vocab() const;
+
+private:
+    gsv_engine();
+    struct impl;
+    impl * p;
+};

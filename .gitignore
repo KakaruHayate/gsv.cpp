@@ -1,0 +1,29 @@
+# build outputs
+build-*/
+llama.cpp/
+tests/rel/
+tests/relcpu/*.exe
+tests/relcpu/*.obj
+*.exe
+*.obj
+*.dll
+
+# models and exported weights
+models/
+*.gguf
+*.onnx
+*.bin
+*.npy
+
+# python
+__pycache__/
+*.pyc
+.venv*/
+.nltk_data/
+
+# runtime artifacts
+*.log
+logs/
+tests/golden/
+tests/_dump/
+tests/e2e_out/
