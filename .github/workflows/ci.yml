@@ -45,6 +45,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: x64
+
       - name: Service unit tests (Windows)
         if: runner.os == 'Windows'
         shell: cmd
@@ -68,16 +73,33 @@ jobs:
           git -C llama.cpp checkout "$LLAMA_CPP_COMMIT"
           git -C llama.cpp apply "${{ github.workspace }}/patches/0001-ggml-audio-patch-port-on-llamacpp.patch"
 
+      - name: Vulkan diagnostics
+        shell: bash
+        run: |
+          (glslc --version 2>&1 | head -3) || true
+          (vulkaninfo --summary 2>&1 | head -20) || true
+
       - name: Build ggml (Vulkan)
         shell: bash
         run: |
+          set -o pipefail
           cmake -S llama.cpp -B llama.cpp/build-vk-rel \
             -DGGML_VULKAN=ON \
             -DGGML_BUILD_TESTS=OFF -DGGML_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF \
-            -DCMAKE_BUILD_TYPE=Release
-          cmake --build llama.cpp/build-vk-rel --config Release -j 2
+            -DCMAKE_BUILD_TYPE=Release 2>&1 | tee ggml-configure.log
+          cmake --build llama.cpp/build-vk-rel --config Release -j 2 2>&1 | tee ggml-build.log
+
+      - name: Upload ggml logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gsv-buildlog-${{ runner.os }}
+          path: |
+            ggml-configure.log
+            ggml-build.log
+          if-no-files-found: ignore
 
       - name: Build gsv_server
         shell: bash
