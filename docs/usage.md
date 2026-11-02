@@ -132,6 +132,21 @@ python -m venv .venv-sidecar
 # CPU-only: ./gsv_server --device cpu --voc-device cpu
 ```
 
+### Choosing a GPU
+
+With more than one Vulkan device (multi-GPU, or an iGPU next to a dGPU), list them first:
+
+```bash
+./gsv_server --list-devices
+# ggml devices (2):
+#   #0  GPU   Vulkan0     NVIDIA GeForce RTX 2070  (7.2/7.9 GiB free)
+#   --   CPU   CPU         Intel(R) Xeon(R) CPU @ 1.80GHz
+# use --device vulkan:N (or --device N) for GPU #N, --device cpu for CPU
+```
+
+Then pass the index: `--device 1` or `--device vulkan:1`. An index that does not exist fails
+with `[device] GPU N not found` instead of silently falling back to CPU.
+
 ```bash
 curl -X POST http://127.0.0.1:9880/tts -H "Content-Type: application/json" -d @request.json -o out.wav
 ```
