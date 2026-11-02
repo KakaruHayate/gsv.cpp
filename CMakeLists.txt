@@ -31,10 +31,12 @@ if(GSV_GGML_LIB_DIR)
     file(GLOB_RECURSE _ggml_candidates
          "${GSV_GGML_LIB_DIR}/*.lib"
          "${GSV_GGML_LIB_DIR}/*.so"
+         "${GSV_GGML_LIB_DIR}/*.so.*"
          "${GSV_GGML_LIB_DIR}/*.a")
     foreach(_name ggml-base ggml-cpu ggml-vulkan ggml)
         foreach(_cand ${_ggml_candidates})
             get_filename_component(_stem "${_cand}" NAME_WE)
+            string(REGEX REPLACE "^lib" "" _stem "${_stem}")
             if(_stem STREQUAL _name)
                 list(APPEND GSV_GGML_LIBS "${_cand}")
                 break()
