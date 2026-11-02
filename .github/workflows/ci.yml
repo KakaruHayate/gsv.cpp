@@ -119,6 +119,11 @@ jobs:
             echo "lavapipe ICD: $ICD"
             unset VK_LAYER_PATH VK_INSTANCE_LAYERS
             VK_DRIVER_FILES="$ICD" VK_ICD_FILENAMES="$ICD" vulkaninfo --summary 2>&1 | head -60 || true
+            echo "--- ldd ---"
+            ldd ./build/test_add_act | grep -i vulkan || true
+            echo "--- run with default loader path ---"
+            VK_DRIVER_FILES="$ICD" VK_ICD_FILENAMES="$ICD" ./build/test_add_act --require-gpu || true
+            echo "--- run with LD_LIBRARY_PATH override ---"
             VK_DRIVER_FILES="$ICD" VK_ICD_FILENAMES="$ICD" \
             LD_LIBRARY_PATH=llama.cpp/build-vk-rel/bin:llama.cpp/build-vk-rel/ggml/src:build \
             ./build/test_add_act --require-gpu
