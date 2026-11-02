@@ -14,7 +14,7 @@ text ──► Python text sidecar (G2P + BERT) ─┐
                           DiT (CFM, v5turbo 4 steps / v5dev 32 steps)
                                            │
                                            ▼
-                          vocoder (HiFi-GAN, ONNX Runtime WebGPU)
+                          vocoder (HiFi-GAN, ggml)
                                            │
                                            ▼
                                          48 kHz WAV
@@ -23,7 +23,7 @@ text ──► Python text sidecar (G2P + BERT) ─┐
 ## Features
 
 - **ggml backends**: Vulkan (NVIDIA/AMD/Intel) and CPU; no CUDA dependency.
-- **Quantized weights**: Q8_0 attention/FFN for AR, F16 for the rest; F32 vocoder.
+- **Quantized weights**: Q8_0 attention/FFN for AR, F16 for the rest; F16 vocoder.
 - **Batched AR**: several texts/segments share one decode pass (fallback to per-sequence).
 - **cache-dit** (DBCache) for the 32-step v5dev model: ~20% faster with near-lossless audio.
 - **Request scheduler**: concurrent `/tts` calls are grouped; DiT and vocoder run as a pipeline.
@@ -39,7 +39,7 @@ not supported.
 - [docs/benchmark.md](docs/benchmark.md) — full-pipeline timings (torch vs ggml, turbo/dev)
 - [tools/export_gguf/README.md](tools/export_gguf/README.md) — exporter/quantizer reference
 
-Converted models: <https://huggingface.co/KakaruHayate/GSV.CPP> (GGUF + ONNX, AR in fp16 and q8).
+Converted models: <https://huggingface.co/KakaruHayate/GSV.CPP> (all GGUF, AR in fp16 and q8).
 
 ## Requirements
 
@@ -49,8 +49,9 @@ Converted models: <https://huggingface.co/KakaruHayate/GSV.CPP> (GGUF + ONNX, AR
 - MSVC 2019+ (Windows) or GCC/Clang (Linux), C++17.
 - Python 3.10+ for the text sidecar (`tools/text_sidecar.py`, installs with
   `tools/text_sidecar_requirements.txt`).
-- ONNX Runtime with the WebGPU EP (for the vocoder) — either system-installed or placed next
-  to the executable. `third_party/onnxruntime/` contains only the C headers.
+- No ONNX Runtime needed by default: the HiFi-GAN vocoder runs on ggml too. ONNX Runtime is only
+  used when a voice points at `vocoder_fp32.onnx`; `third_party/onnxruntime/` keeps the C headers
+  for that fallback.
 
 ## Build
 
@@ -81,18 +82,18 @@ cmake --build build --config Release --target gsv_server
 ```
 
 On Windows the ggml DLLs found next to the libraries are copied next to the executable.
-ONNX Runtime (`onnxruntime.dll` + the WebGPU EP) must be on `PATH` or placed next to the
-executable; the headers are vendored under `third_party/onnxruntime/`.
+The ggml vocoder needs no extra runtime; for the optional ONNX path, `onnxruntime.dll` (plus the
+WebGPU EP if present) must be on `PATH` or next to the executable.
 
 ### MSVC script (Windows alternative)
 
 `scripts\build-server.bat` builds the same target with `cl.exe` and copies the ONNX Runtime
-DLLs it finds in `.venv-wg\...` (optional; set `GSV_VCRT_DIR` if `onnxruntime.dll` fails to
-load with error 1114).
+DLLs it finds in `.venv-wg\...` when present (only needed for the optional ONNX vocoder path;
+set `GSV_VCRT_DIR` if `onnxruntime.dll` fails to load with error 1114).
 
 ## Models
 
-Converted weights: <https://huggingface.co/KakaruHayate/GSV.CPP> (GGUF + ONNX, AR in fp16 and
+Converted weights: <https://huggingface.co/KakaruHayate/GSV.CPP> (all GGUF, AR in fp16 and
 q8; see [docs/usage.md](docs/usage.md) for the file list and manifests). To convert your own
 fine-tuned checkpoints:
 
@@ -103,11 +104,11 @@ python tools\export_gguf\export.py --kind dit    --ckpt s2Gv5turbo.pth --out mod
 python tools\export_gguf\export.py --kind refcode --ckpt s2Gv5turbo.pth --out models\gsv-refcode.gguf
 python tools\export_gguf\export.py --kind bert   --ckpt ... --out models\gsv-bert-f16.gguf
 python tools\export_gguf\export.py --kind hubert --ckpt ... --out models\gsv-hubert-f16.gguf
-python tools\export_vocoder_onnx.py --ckpt vocoder.pth --out models\vocoder_fp32.onnx
+python tools\export_vocoder_gguf.py --ckpt models\vocoder.pth --out models\gsv-vocoder-f16.gguf
 ```
 
 The model directory should contain `gsv-ar-*.gguf`, `gsv-cond-*.gguf`, `gsv-dit-*.gguf`,
-`gsv-refcode.gguf`, `gsv-bert-*.gguf`, `gsv-hubert-*.gguf`, `vocoder_fp32.onnx` and
+`gsv-refcode.gguf`, `gsv-bert-*.gguf`, `gsv-hubert-*.gguf`, `gsv-vocoder-f16.gguf` and
 `resampy_kaiser_best.bin` (see `tools/export_resampy_filter.py`).
 Extra voices can be described with `models/voices/<name>/manifest.json`.
 

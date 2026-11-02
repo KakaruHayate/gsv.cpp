@@ -14,6 +14,11 @@ the unchanged torch reference.
 | 5 | v5dev ggml | **5366** | 101 | 118 | 422 | 4524 | 114 | — |
 | 6 | v5dev ggml + cache-dit | **4837** | 102 | 114 | 343 | 4128 | 115 | **24/64 = 37.5%** |
 
+The vocoder column above was measured with the ONNX Runtime vocoder. Since the switch to the ggml
+HiFi-GAN (src/gsv_vocoder_ggml.cpp) the same request spends **~37 ms** in the vocoder on Vulkan
+instead of ~114 ms, so subtract roughly 75 ms from those totals when comparing with the current
+build.
+
 \* torch's AR loop is captured as a single CUDA graph and cannot be timed separately; this
 column is `total − (frontend + cond + DiT + vocoder)` (AR + scheduling overhead).
 
