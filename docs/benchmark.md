@@ -33,3 +33,22 @@ Notes:
 - Reference: 16 kHz Chinese prompt, ~3.4 s output audio in every row.
 - Timings vary by a few percent between runs; the torch numbers include CUDA graph replay
   (two warm-up runs with the same text are done before the measured run).
+
+## DiT fusion (RoPE + adaLN)
+
+`gsv_dit.cpp` builds the DiT step graph with a fused RoPE (`ggml_rope_ext`, head 0 only, with a
+`pos` tensor and freq factors that reproduce the checkpoint `inv_freq`) and a fused
+`LN(x)·(1+scale)+shift` (`ggml_layernorm_affine` with `wb = [1+scale, shift]`), replacing the
+per-block cos/sin multiply chain and the `norm → add → mul → add` sequence.
+
+Same machine, turbo-q8, same text / seed, warm:
+
+| DiT | before | after | delta |
+|---|---|---|---|
+| v5turbo DiT | 333 ms | 291 ms | −12.6% |
+| v5turbo total | 1130 ms | 1033 ms | −8.6% |
+
+Audio correlation against the pre-fusion build is 0.9955; two runs with the same seed are
+bit-identical (corr 1.000000), so determinism is preserved. The `mish` epilogue fusion (A4 in
+the DiT report) was evaluated but not landed: it needs a new `ggml_add_act` activation kernel
+(CPU + Vulkan) for a measured effect below 0.2%.
