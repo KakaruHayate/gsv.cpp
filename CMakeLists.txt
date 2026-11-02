@@ -82,7 +82,7 @@ target_include_directories(gsv_engine
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann"
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime"
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/xxhash"
-    PRIVATE
+    PUBLIC
         ${GSV_GGML_INCLUDES})
 target_link_libraries(gsv_engine PUBLIC ${GSV_GGML_LIBS})
 if(MSVC)
