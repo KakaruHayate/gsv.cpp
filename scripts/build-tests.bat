@@ -5,14 +5,15 @@ REM NOTE: /utf-8 is required (sources contain Chinese comments)
 REM NOTE: this file must stay ASCII-only (cmd + UTF-8 comments break parsing)
 setlocal
 where cl >nul 2>&1
-if errorlevel 1 (
-  if not defined VCVARS set VCVARS="%ProgramFiles(x86)%\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-  if not exist %VCVARS% (
-    echo [error] vcvars64.bat not found, set VCVARS or edit this script
-    exit /b 1
-  )
-  call %VCVARS% >nul 2>&1
-)
+if not errorlevel 1 goto gsv_have_cl
+if not defined VCVARS set "VCVARS=%ProgramFiles(x86)%\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+if not exist "%VCVARS%" goto gsv_no_vcvars
+call "%VCVARS%" >nul 2>&1
+goto gsv_have_cl
+:gsv_no_vcvars
+echo [error] vcvars64.bat not found, set VCVARS or edit this script
+exit /b 1
+:gsv_have_cl
 
 if not exist llama.cpp\build-cpu\CMakeCache.txt (
   cmake -S llama.cpp -B llama.cpp\build-cpu -DGGML_NATIVE=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF
