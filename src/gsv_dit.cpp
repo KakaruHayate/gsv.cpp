@@ -52,7 +52,8 @@ struct gsv_dit::impl {
     ggml_context * pctx = nullptr;        // 持久张量 (T 相关, prepare 时重建)
     ggml_backend_buffer_t pbuf = nullptr;
     ggml_tensor * p_static = nullptr, * p_neg = nullptr, * p_maskrow = nullptr,
-                * p_amask = nullptr, * p_cos = nullptr, * p_sin = nullptr;
+                * p_amask = nullptr, * p_cos = nullptr, * p_sin = nullptr,
+                * p_pos = nullptr, * p_ff = nullptr;
 
     ggml_context * gctx = nullptr;        // cache + step 图共用 (张量元数据)
     // 三张图 (cache/pos/neg) 各自独立 allotter:
@@ -153,18 +154,23 @@ struct gsv_dit::impl {
                                   ggml_tensor * shift, ggml_tensor * ones) {
         return ggml_add(c, ggml_mul(c, x, ggml_add(c, scale, ones)), shift);
     }
+    // LN(x) * (1 + scale) + shift in one pass (patch op layernorm_affine, wb = [w, b]).
+    static ggml_tensor * modulate_ln(ggml_context * c, ggml_tensor * x, ggml_tensor * scale,
+                                     ggml_tensor * shift, ggml_tensor * ones) {
+        ggml_tensor * w  = ggml_add(c, scale, ones);
+        ggml_tensor * wb = ggml_concat(c, w, shift, 0);
+        return ggml_layernorm_affine(c, x, nullptr, nullptr, wb, NORM_EPS);
+    }
     // RoPE (只作用于 head 0 = q/k 的前 64 维): q [64, T] 稠密, cos/sin [32, T] -> [64, T]
     // torch: t*cos + rotate_half(t)*sin (交错配对), 角度 = n * inv_freq[i] 且同对相邻维共享
-    static ggml_tensor * rope64(ggml_context * c, ggml_tensor * q, ggml_tensor * cos_t,
-                                ggml_tensor * sin_t, int Tt) {
-        ggml_tensor * q3 = ggml_reshape_3d(c, q, 2, 32, Tt);
-        ggml_tensor * xe = ggml_view_3d(c, q3, 1, 32, Tt, q3->nb[1], q3->nb[2], 0);
-        ggml_tensor * xo = ggml_view_3d(c, q3, 1, 32, Tt, q3->nb[1], q3->nb[2], q3->nb[0]);
-        ggml_tensor * c3 = ggml_reshape_3d(c, cos_t, 1, 32, Tt);
-        ggml_tensor * s3 = ggml_reshape_3d(c, sin_t, 1, 32, Tt);
-        ggml_tensor * e = ggml_sub(c, ggml_mul(c, xe, c3), ggml_mul(c, xo, s3));
-        ggml_tensor * o = ggml_add(c, ggml_mul(c, xe, s3), ggml_mul(c, xo, c3));
-        return ggml_reshape_2d(c, ggml_concat(c, e, o, 0), 64, Tt);
+    static ggml_tensor * rope64(ggml_context * c, ggml_tensor * q, ggml_tensor * pos,
+                                ggml_tensor * ff, int Tt) {
+        // head 0 only (first 64 channels). The view uses nb[1] for BOTH the row and the token
+        // stride: q is [64,T], so one token step is one row. freq_factors reproduce the ckpt inv_freq.
+        ggml_tensor * v = ggml_view_3d(c, q, 64, 1, Tt, q->nb[1], q->nb[1], 0);
+        ggml_tensor * r = ggml_rope_ext(c, v, pos, ff, 64, GGML_ROPE_TYPE_NORMAL, 0,
+                                        10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        return ggml_reshape_2d(c, r, 64, Tt);
     }
     // 分组 conv1d (k=31, groups=16, pad=15): Domain B 输入/输出.
     //   每组一次 im2col (x 的通道切片在 Domain A 下是连续 [T, 64] view, 零拷贝;
@@ -249,7 +255,7 @@ struct gsv_dit::impl {
     }
     // 16 头注意力 (每头独立投影, 权重按输出行块切稠密 view) + head0 的 RoPE
     ggml_tensor * attention(ggml_context * c, ggml_tensor * x, int li,
-                            ggml_tensor * amask, ggml_tensor * cos_t, ggml_tensor * sin_t, int Tt) {
+                            ggml_tensor * amask, ggml_tensor * pos, ggml_tensor * ff, int Tt) {
         char nm[160];
         snprintf(nm, sizeof(nm), "dit.transformer_blocks.%d.attn.to_q.weight", li);
         ggml_tensor * wq = need(nm);
@@ -279,8 +285,8 @@ struct gsv_dit::impl {
                                           ggml_view_1d(c, bv, DH, (size_t) h * DH * 4), x);
                 if (h == 0) {                                     // RoPE 只在第 0 号头
                     if (li == 0 && mark_on) { mark(qh, "dbg_q0_raw"); }
-                    qh = rope64(c, qh, cos_t, sin_t, Tt);
-                    kh = rope64(c, kh, cos_t, sin_t, Tt);
+                    qh = rope64(c, qh, pos, ff, Tt);
+                    kh = rope64(c, kh, pos, ff, Tt);
                     if (li == 0 && mark_on) { mark(qh, "dbg_q0_roped"); mark(kh, "dbg_k0_roped"); }
                 }
                 ggml_tensor * vT = ggml_cont(c, ggml_permute(c, vh, 1, 0, 2, 3));   // [T_k, 64]
@@ -301,8 +307,8 @@ struct gsv_dit::impl {
             ggml_tensor * q0 = ggml_cont(c, ggml_view_2d(c, q, DH, Tt, q->nb[1], 0));
             ggml_tensor * k0 = ggml_cont(c, ggml_view_2d(c, k, DH, Tt, k->nb[1], 0));
             if (li == 0 && mark_on) { mark(q0, "dbg_q0_raw"); }
-            ggml_tensor * q0r = rope64(c, q0, cos_t, sin_t, Tt);
-            ggml_tensor * k0r = rope64(c, k0, cos_t, sin_t, Tt);
+            ggml_tensor * q0r = rope64(c, q0, pos, ff, Tt);
+            ggml_tensor * k0r = rope64(c, k0, pos, ff, Tt);
             if (li == 0 && mark_on) { mark(q0r, "dbg_q0_roped"); mark(k0r, "dbg_k0_roped"); }
             ggml_tensor * qf = ggml_concat(c, q0r,
                     ggml_cont(c, ggml_view_2d(c, q, DIM - DH, Tt, q->nb[1], (size_t) DH * 4)), 0);
@@ -337,7 +343,7 @@ struct gsv_dit::impl {
     }
     // DiTBlock: AdaLN(x, t) -> attn -> +gate_msa*attn -> AdaLN -> ffn -> +gate_mlp*ff
     ggml_tensor * dit_block(ggml_context * c, ggml_tensor * x, ggml_tensor * t_emb, int li,
-                            ggml_tensor * amask, ggml_tensor * cos_t, ggml_tensor * sin_t, int Tt) {
+                            ggml_tensor * amask, ggml_tensor * pos, ggml_tensor * ff, int Tt) {
         char nm[160];
         snprintf(nm, sizeof(nm), "dit.transformer_blocks.%d.attn_norm.linear.weight", li);
         ggml_tensor * wa = need(nm);
@@ -347,14 +353,14 @@ struct gsv_dit::impl {
         ggml_tensor * m[6];
         for (int i = 0; i < 6; i++)
             m[i] = ggml_view_2d(c, emb, DIM, 1, emb->nb[1], (size_t) i * DIM * 4);
-        ggml_tensor * xn = modulate(c, ggml_norm(c, x, NORM_EPS), m[1], m[0], c_ones);
+        ggml_tensor * xn = modulate_ln(c, x, m[1], m[0], c_ones);
         if (li == 0 && mark_on) { mark(xn, "dbg_b0_norm"); mark(m[1], "dbg_b0_scale_msa"); mark(m[0], "dbg_b0_shift_msa");
                        mark(m[2], "dbg_b0_gate_msa"); mark(m[3], "dbg_b0_shift_mlp");
                        mark(m[4], "dbg_b0_scale_mlp"); mark(m[5], "dbg_b0_gate_mlp"); }
-        ggml_tensor * a = attention(c, xn, li, amask, cos_t, sin_t, Tt);
+        ggml_tensor * a = attention(c, xn, li, amask, pos, ff, Tt);
         if (li == 0 && mark_on) { mark(a, "dbg_b0_attn"); }
         x = ggml_add(c, x, ggml_mul(c, a, m[2]));   // 广播要求大张量在前 (gate: [1024,1])
-        ggml_tensor * xn2 = modulate(c, ggml_norm(c, x, NORM_EPS), m[4], m[3], c_ones);
+        ggml_tensor * xn2 = modulate_ln(c, x, m[4], m[3], c_ones);
         ggml_tensor * f = ffn(c, xn2, li);
         if (li == 0 && mark_on) { mark(f, "dbg_b0_ff"); }
         ggml_tensor * bo = ggml_add(c, x, ggml_mul(c, f, m[5]));
@@ -411,6 +417,8 @@ bool gsv_dit::impl::make_persistents() {
     s->p_amask   = ggml_new_tensor_2d(p, GGML_TYPE_F16, T, T);
     s->p_cos     = ggml_new_tensor_2d(p, GGML_TYPE_F32, 32, T);
     s->p_sin     = ggml_new_tensor_2d(p, GGML_TYPE_F32, 32, T);
+    s->p_pos     = ggml_new_tensor_1d(p, GGML_TYPE_I32, T);
+    s->p_ff      = ggml_new_tensor_1d(p, GGML_TYPE_F32, 32);
     s->pbuf = ggml_backend_alloc_ctx_tensors(s->pctx, s->backend);
     if (!s->pbuf) { fprintf(stderr, "[gsv_dit] persistent buffer alloc failed\n"); return false; }
 
@@ -428,6 +436,15 @@ bool gsv_dit::impl::make_persistents() {
 
     ggml_backend_tensor_set(s->p_cos, s->cos_host.data(), 0, s->cos_host.size() * 4);
     ggml_backend_tensor_set(s->p_sin, s->sin_host.data(), 0, s->sin_host.size() * 4);
+
+    // RoPE pos + freq_factors (reproduce the checkpoint inv_freq exactly)
+    std::vector<int32_t> pos((size_t) T);
+    for (int t = 0; t < T; t++) pos[(size_t) t] = t;
+    ggml_backend_tensor_set(s->p_pos, pos.data(), 0, pos.size() * 4);
+    std::vector<float> ff((size_t) s->inv_freq.size());
+    for (size_t i = 0; i < ff.size(); i++)
+        ff[i] = powf(10000.0f, -2.0f * (float) i / 64.0f) / s->inv_freq[i];
+    ggml_backend_tensor_set(s->p_ff, ff.data(), 0, ff.size() * 4);
     return true;
 }
 
@@ -506,7 +523,7 @@ ggml_tensor * gsv_dit::impl::build_blocks(ggml_context * c, ggml_tensor * x, ggm
                                           int l0, int l1, int Tt) {
     for (int li = l0; li < l1; li++) {
         if (getenv("GSV_DIT_BUILD_TRACE")) { printf("[bt] block %d\n", li); fflush(stdout); }
-        x = dit_block(c, x, t_emb, li, p_amask, p_cos, p_sin, Tt);
+        x = dit_block(c, x, t_emb, li, p_amask, p_pos, p_ff, Tt);
     }
     return x;
 }
@@ -517,7 +534,7 @@ ggml_tensor * gsv_dit::impl::build_head(ggml_context * c, ggml_tensor * x, ggml_
                                 ggml_silu(c, t_emb));                   // [2048, 1]
     ggml_tensor * scale = ggml_view_2d(c, emb2, DIM, 1, emb2->nb[1], 0);
     ggml_tensor * shift = ggml_view_2d(c, emb2, DIM, 1, emb2->nb[1], (size_t) DIM * 4);
-    x = modulate(c, ggml_norm(c, x, NORM_EPS), scale, shift, c_ones);
+    x = modulate_ln(c, x, scale, shift, c_ones);
     mark(x, "dbg_norm_out");
     ggml_tensor * out = lin(c, need("dit.proj_out.weight"), need("dit.proj_out.bias"), x);   // [100, T]
     ggml_tensor * out_t = to_a(c, out);                                 // [T, 100] = torch [1,100,T] 字节
