@@ -1,0 +1,123 @@
+cmake_minimum_required(VERSION 3.20)
+project(gsv_cpp LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+option(GSV_BUILD_TESTS "Build the service unit tests" ON)
+enable_testing()
+
+# ---------------------------------------------------------------- llama.cpp/ggml
+# Two modes:
+#   1) prebuilt libs: point GSV_GGML_LIB_DIR at a directory containing ggml*.lib/.so/.a
+#   2) source tree: set GSV_GGML_LIB_DIR to "" and the llama.cpp tree is added as a subproject
+set(GSV_LLAMA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp" CACHE PATH "llama.cpp source tree")
+set(GSV_GGML_LIB_DIR "${GSV_LLAMA_DIR}/build-vk-rel" CACHE PATH "directory with prebuilt ggml libraries (empty = build llama.cpp as a subproject)")
+
+if(NOT EXISTS "${GSV_LLAMA_DIR}/ggml/include/ggml.h")
+    message(FATAL_ERROR "llama.cpp not found at '${GSV_LLAMA_DIR}'. Clone it and pass -DGSV_LLAMA_DIR=...")
+endif()
+
+set(GSV_GGML_INCLUDES
+    "${GSV_LLAMA_DIR}/ggml/include"
+    "${GSV_LLAMA_DIR}/ggml/src"
+    "${GSV_LLAMA_DIR}/include"
+    "${GSV_LLAMA_DIR}/src"
+)
+
+set(GSV_GGML_LIBS "")
+if(GSV_GGML_LIB_DIR)
+    file(GLOB_RECURSE _ggml_candidates
+         "${GSV_GGML_LIB_DIR}/*.lib"
+         "${GSV_GGML_LIB_DIR}/*.so"
+         "${GSV_GGML_LIB_DIR}/*.a")
+    foreach(_name ggml-base ggml-cpu ggml-vulkan ggml)
+        foreach(_cand ${_ggml_candidates})
+            get_filename_component(_stem "${_cand}" NAME_WE)
+            if(_stem STREQUAL _name)
+                list(APPEND GSV_GGML_LIBS "${_cand}")
+                break()
+            endif()
+        endforeach()
+    endforeach()
+    if(NOT GSV_GGML_LIBS)
+        message(FATAL_ERROR "no ggml libraries under '${GSV_GGML_LIB_DIR}' (set GSV_GGML_LIB_DIR or clear it to build llama.cpp as a subproject)")
+    endif()
+else()
+    set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+    set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${GSV_LLAMA_DIR}" "${CMAKE_BINARY_DIR}/llama.cpp" EXCLUDE_FROM_ALL)
+    set(GSV_GGML_LIBS ggml ggml-base ggml-cpu)
+    if(GGML_VULKAN)
+        list(APPEND GSV_GGML_LIBS ggml-vulkan)
+    endif()
+endif()
+
+# ---------------------------------------------------------------- engine
+file(GLOB GSV_ENGINE_SOURCES CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_ar.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_bert.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_cond.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_dit.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_encp.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_engine.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_g2pw.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_hubert.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_mel.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_refcode.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_refenc.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_sampler.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_vocoder.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_wns1.cpp")
+
+add_library(gsv_engine STATIC ${GSV_ENGINE_SOURCES})
+target_include_directories(gsv_engine
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/xxhash"
+    PRIVATE
+        ${GSV_GGML_INCLUDES})
+target_link_libraries(gsv_engine PUBLIC ${GSV_GGML_LIBS})
+if(MSVC)
+    target_compile_options(gsv_engine PUBLIC /utf-8 /W1)
+    target_compile_options(gsv_engine PRIVATE /openmp)
+else()
+    find_package(OpenMP)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(gsv_engine PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+endif()
+
+# ---------------------------------------------------------------- server
+add_executable(gsv_server "${CMAKE_CURRENT_SOURCE_DIR}/tools/gsv_server.cpp")
+target_link_libraries(gsv_server PRIVATE gsv_engine)
+if(WIN32)
+    target_link_libraries(gsv_server PRIVATE ws2_32)
+    # ggml is usually built as a DLL: copy the DLLs next to the executable
+    if(GSV_GGML_LIB_DIR)
+        file(GLOB_RECURSE GSV_GGML_DLLS "${GSV_GGML_LIB_DIR}/*.dll")
+        if(GSV_GGML_DLLS)
+            add_custom_command(TARGET gsv_server POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different ${GSV_GGML_DLLS} "$<TARGET_FILE_DIR:gsv_server>")
+        endif()
+    endif()
+endif()
+
+# ---------------------------------------------------------------- tests
+if(GSV_BUILD_TESTS)
+    add_executable(test_svc "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_svc.cpp")
+    target_include_directories(test_svc PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann")
+    target_link_libraries(test_svc PRIVATE gsv_engine)
+    add_test(NAME test_svc COMMAND test_svc)
+endif()

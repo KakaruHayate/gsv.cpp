@@ -342,7 +342,7 @@ int main(int argc, char ** argv) {
         else if (a == "--mock-sidecar") g_mock_sidecar = true;
         else if (a == "--verbose") verbose = true;
         else if (a == "-h" || a == "--help") {
-            std::printf("usage: gsv_server [--models DIR] [--device cpu|vulkan] [--voc-device auto|cpu|dml|webgpu]\n"
+            std::printf("usage: gsv_server [--models DIR] [--device cpu|vulkan] [--voc-device auto|cpu|webgpu]\n"
                         "                  [--host 127.0.0.1] [--port 9880] [--sidecar 127.0.0.1:9882]\n"
                         "                  [--log-dir logs] [--threads N] [--verbose]\n");
             return 0;

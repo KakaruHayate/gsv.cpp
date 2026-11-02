@@ -43,24 +43,43 @@ V5 only: v2/v3/v4 checkpoints are intentionally not supported.
 - ONNX Runtime with the WebGPU EP (for the vocoder) — either system-installed or placed next
   to the executable. `third_party/onnxruntime/` contains only the C headers.
 
-## Build (Windows, MSVC)
+## Build
 
-```bat
-REM 1) put llama.cpp next to this repo and apply the patch
+The engine builds against [llama.cpp](https://github.com/ggml-org/llama.cpp) (for ggml) with the
+audio-ops patch in `patches/`. Clone it next to this repo and apply the patch:
+
+```bash
 git clone https://github.com/ggml-org/llama.cpp
-git -C llama.cpp apply ..\patches\0001-ggml-audio-patch-port-on-llamacpp.patch
-REM 2) build ggml with Vulkan (produces llama.cpp\build-vk-rel\...)
-cmake -S llama.cpp -B llama.cpp\build-vk-rel -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build llama.cpp\build-vk-rel --config Release -j
-REM 3) build the server
-scripts\build-server.bat
+git -C llama.cpp apply ../patches/0001-ggml-audio-patch-port-on-llamacpp.patch
 ```
 
-`scripts\build-server.bat` links against `llama.cpp\build-vk-rel` and copies the ONNX Runtime
-DLLs it finds in `.venv-wg\...` (optional; adjust the path or set `GSV_VCRT_DIR` for the VC
-runtime if `onnxruntime.dll` fails to load with error 1114).
+### CMake (Windows / Linux)
 
-Linux/CMake build is on the roadmap (see `docs/` in the development branch).
+Build ggml first (Vulkan recommended, CPU-only also works):
+
+```bash
+cmake -S llama.cpp -B llama.cpp/build-vk-rel -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build llama.cpp/build-vk-rel --config Release -j
+```
+
+Then build this project, pointing `GSV_GGML_LIB_DIR` at the ggml build output
+(`find_library`-style search, or leave empty to add llama.cpp as a subproject):
+
+```bash
+cmake -S . -B build -DGSV_GGML_LIB_DIR=llama.cpp/build-vk-rel
+cmake --build build --config Release --target gsv_server
+# binary: build/Release/gsv_server.exe (Windows) or build/gsv_server (Linux)
+```
+
+On Windows the ggml DLLs found next to the libraries are copied next to the executable.
+ONNX Runtime (`onnxruntime.dll` + the WebGPU EP) must be on `PATH` or placed next to the
+executable; the headers are vendored under `third_party/onnxruntime/`.
+
+### MSVC script (Windows alternative)
+
+`scripts\build-server.bat` builds the same target with `cl.exe` and copies the ONNX Runtime
+DLLs it finds in `.venv-wg\...` (optional; set `GSV_VCRT_DIR` if `onnxruntime.dll` fails to
+load with error 1114).
 
 ## Models
 
