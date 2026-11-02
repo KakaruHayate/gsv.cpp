@@ -2,7 +2,19 @@
 
 #include "onnxruntime_c_api.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#define GSV_DLL_NAME "onnxruntime.dll"
+#define GSV_PATH_SEP "\\"
+#else
+#include <dlfcn.h>
+#include <unistd.h>
+#include <limits.h>
+#define GSV_DLL_NAME "libonnxruntime.so"
+#define GSV_PATH_SEP "/"
+#endif
+
+#include <sys/stat.h>
 
 #include <algorithm>
 #include <cmath>
@@ -10,6 +22,67 @@
 #include <cstring>
 #include <string>
 #include <vector>
+
+static void * gsv_lib_open(const char * p) {
+#ifdef _WIN32
+    return (void *) LoadLibraryA(p);
+#else
+    return dlopen(p, RTLD_NOW | RTLD_LOCAL);
+#endif
+}
+static void * gsv_lib_sym(void * h, const char * sym) {
+#ifdef _WIN32
+    return (void *) GetProcAddress((HMODULE) h, sym);
+#else
+    return dlsym(h, sym);
+#endif
+}
+static void gsv_lib_close(void * h) {
+    if (!h) return;
+#ifdef _WIN32
+    FreeLibrary((HMODULE) h);
+#else
+    dlclose(h);
+#endif
+}
+static bool gsv_path_exists(const std::string & p) {
+#ifdef _WIN32
+    return GetFileAttributesA(p.c_str()) != INVALID_FILE_ATTRIBUTES;
+#else
+    struct stat st;
+    return stat(p.c_str(), &st) == 0;
+#endif
+}
+static bool gsv_path_is_dir(const std::string & p) {
+#ifdef _WIN32
+    const DWORD a = GetFileAttributesA(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+#else
+    struct stat st;
+    return stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+static std::string gsv_dirname(const std::string & p) {
+    const size_t slash = p.find_last_of("\\/");
+    return slash == std::string::npos ? std::string(".") : p.substr(0, slash);
+}
+static std::string gsv_join(const std::string & d, const std::string & f) {
+    if (d.empty()) return f;
+    const char last = d.back();
+    if (last == '\\' || last == '/') return d + f;
+    return d + GSV_PATH_SEP + f;
+}
+static std::string gsv_self_dir() {
+#ifdef _WIN32
+    char self[MAX_PATH] = {0};
+    if (GetModuleFileNameA(nullptr, self, MAX_PATH)) return gsv_dirname(self);
+#else
+    char self[PATH_MAX] = {0};
+    const ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
+    if (n > 0) { self[n] = '\0'; return gsv_dirname(self); }
+#endif
+    return ".";
+}
 
 static const int MEL_DIM  = 100;
 static const int UPSAMPLE = 480;    // 10*6*2*2*2 = prod(upsample_rates)
@@ -19,7 +92,7 @@ static const int UPSAMPLE = 480;    // 10*6*2*2*2 = prod(upsample_rates)
 // 在同一个可执行文件里同时支持 DML 包与 WebGPU 包 (NuGet 只有 DML, WebGPU 只发 pip wheel),
 // 故运行时按路径/目录找 DLL 并 GetProcAddress。
 struct gsv_vocoder::impl {
-    HMODULE               dll = nullptr;
+    void *                dll = nullptr;
     const OrtApi *        api = nullptr;
     const OrtApiBase *    base = nullptr;
     OrtEnv *              env = nullptr;
@@ -44,7 +117,7 @@ struct gsv_vocoder::impl {
         if (sess && api)    api->ReleaseSession(sess);
         if (so && api)      api->ReleaseSessionOptions(so);
         if (env && api)     api->ReleaseEnv(env);
-        if (dll)            FreeLibrary(dll);
+        if (dll)            gsv_lib_close(dll);
     }
 };
 
@@ -55,22 +128,21 @@ static void ort_check(const OrtApi * api, OrtStatus * st, const char * what) {
     api->ReleaseStatus(st);
 }
 
-// 新插件 EP：onnxruntime_providers_webgpu.dll 的位置（环境变量 / ORT DLL 同目录）
+// plugin EP: onnxruntime_providers_webgpu.{dll,so} (env var / plugin dir / exe dir)
 static std::string find_webgpu_plugin() {
     const char * env_dll = std::getenv("GSV_ORT_WEBGPU_DLL");
-    if (env_dll && *env_dll && GetFileAttributesA(env_dll) != INVALID_FILE_ATTRIBUTES) return env_dll;
+    if (env_dll && *env_dll && gsv_path_exists(env_dll)) return env_dll;
+#ifdef _WIN32
+    const char * name = "onnxruntime_providers_webgpu.dll";
+#else
+    const char * name = "onnxruntime_providers_webgpu.so";
+#endif
     std::vector<std::string> dirs;
     if (const char * d = std::getenv("GSV_ORT_PLUGIN_DIR")) dirs.push_back(d);
-    char self[MAX_PATH] = {0};
-    HMODULE h = GetModuleHandleA("onnxruntime.dll");
-    if (h && GetModuleFileNameA(h, self, MAX_PATH)) {
-        std::string sp(self);
-        const size_t slash = sp.find_last_of("\\/");
-        if (slash != std::string::npos) dirs.push_back(sp.substr(0, slash));
-    }
+    dirs.push_back(gsv_self_dir());
     for (const auto & d : dirs) {
-        const std::string p = d + "\\onnxruntime_providers_webgpu.dll";
-        if (GetFileAttributesA(p.c_str()) != INVALID_FILE_ATTRIBUTES) return p;
+        const std::string p = gsv_join(d, name);
+        if (gsv_path_exists(p)) return p;
     }
     return "";
 }
@@ -89,60 +161,52 @@ gsv_vocoder * gsv_vocoder::load(const std::string & onnx_path, const gsv_vocoder
     s.verbose = cfg.verbose;
     s.n_threads = cfg.n_threads;
 
-    // ---- 1) 找并加载 onnxruntime.dll ----
+    // ---- 1) locate and load the onnxruntime library ----
     std::vector<std::string> cands;
     auto add_cand = [&](const std::string & d) {
         if (d.empty()) return;
-        std::string full = d;
-        // 传的是目录 -> 拼 DLL 名
-        const DWORD a = GetFileAttributesA(d.c_str());
-        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) full = d + "\\onnxruntime.dll";
-        cands.push_back(full);
+        cands.push_back(gsv_path_is_dir(d) ? gsv_join(d, GSV_DLL_NAME) : d);
     };
     if (!cfg.ort_dll.empty()) add_cand(cfg.ort_dll);
     else {
-        // 默认: 先找本仓库 venv 里的 WebGPU 版 (更快), 再系统路径 (可能是 DML 版)
-        add_cand(".venv-wg\\Lib\\site-packages\\onnxruntime\\capi");
-        add_cand(".venv-ort\\Lib\\site-packages\\onnxruntime\\capi");
+        // prefer a local WebGPU build, then anything on the system search path
+        add_cand(".venv-wg/Lib/site-packages/onnxruntime/capi");
+        add_cand(".venv-ort/Lib/site-packages/onnxruntime/capi");
         add_cand("tools");
+        add_cand(gsv_self_dir());
     }
+    std::string loaded;
     for (const std::string & c : cands) {
-        s.dll = LoadLibraryA(c.c_str());
-        if (s.dll) { if (s.verbose) printf("[gsv_vocoder] loaded %s\n", c.c_str()); break; }
+        s.dll = gsv_lib_open(c.c_str());
+        if (s.dll) { loaded = c; break; }
     }
     if (!s.dll) {
-        // 最后退到系统搜索路径 (PATH / 当前目录)
-        s.dll = LoadLibraryA("onnxruntime.dll");
-        if (s.dll && s.verbose) printf("[gsv_vocoder] loaded onnxruntime.dll (from PATH)\n");
+        s.dll = gsv_lib_open(GSV_DLL_NAME);
+        if (s.dll) loaded = GSV_DLL_NAME;
     }
     if (!s.dll) {
-        fprintf(stderr, "[gsv_vocoder] onnxruntime.dll 未找到 (试过 %zu 个路径)\n", cands.size());
+        fprintf(stderr, "[gsv_vocoder] %s not found (tried %zu paths)\n", GSV_DLL_NAME, cands.size());
         for (const std::string & c : cands) fprintf(stderr, "    %s\n", c.c_str());
         delete m; return nullptr;
     }
-    // WebGPU EP 的 dxcompiler.dll/dxil.dll 必须与 onnxruntime.dll 同目录 (或 PATH),
-    // 从同一目录加载它们, 否则 WebGPU 初始化会静默失败
+    if (s.verbose) printf("[gsv_vocoder] loaded %s\n", loaded.c_str());
+#ifdef _WIN32
+    // WebGPU EP needs dxcompiler.dll/dxil.dll next to onnxruntime.dll (or on PATH)
     {
-        char self[MAX_PATH] = {0};
-        GetModuleFileNameA(s.dll, self, MAX_PATH);
-        std::string dir(self);
-        const size_t slash = dir.find_last_of("\\/");
-        if (slash != std::string::npos) {
-            const std::string d = dir.substr(0, slash);
-            for (const char * dep : { "dxcompiler.dll", "dxil.dll" }) {
-                const std::string dp = d + "\\" + dep;
-                if (GetFileAttributesA(dp.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                    // 只影响后续 LoadLibrary 的同目录解析; 显式加载一次确保在位
-                    HMODULE h = LoadLibraryA(dp.c_str());
-                    if (!h && s.verbose)
-                        fprintf(stderr, "[gsv_vocoder] note: %s load failed (WebGPU 可能不可用)\n", dep);
-                }
+        const std::string d = gsv_dirname(loaded);
+        for (const char * dep : { "dxcompiler.dll", "dxil.dll" }) {
+            const std::string dp = gsv_join(d, dep);
+            if (gsv_path_exists(dp)) {
+                void * h = gsv_lib_open(dp.c_str());
+                if (!h && s.verbose)
+                    fprintf(stderr, "[gsv_vocoder] note: %s load failed (WebGPU may be unavailable)\n", dep);
             }
         }
     }
+#endif
 
     using GetApiBaseFn = const OrtApiBase * (ORT_API_CALL *)();
-    auto get_base = (GetApiBaseFn) GetProcAddress(s.dll, "OrtGetApiBase");
+    auto get_base = (GetApiBaseFn) gsv_lib_sym(s.dll, "OrtGetApiBase");
     if (!get_base) { fprintf(stderr, "[gsv_vocoder] OrtGetApiBase 未导出\n"); delete m; return nullptr; }
     s.base = get_base();
     if (!s.base) { fprintf(stderr, "[gsv_vocoder] OrtGetApiBase 返回 null\n"); delete m; return nullptr; }
@@ -177,8 +241,12 @@ gsv_vocoder * gsv_vocoder::load(const std::string & onnx_path, const gsv_vocoder
     if (want_gpu && (cfg.device.empty() || cfg.device == "webgpu" || cfg.device == "WebGPU")) {
         const std::string plugin = find_webgpu_plugin();
         if (!plugin.empty()) {
+#ifdef _WIN32
             std::wstring wplugin(plugin.begin(), plugin.end());
             OrtStatus * st = A->RegisterExecutionProviderLibrary(s.env, "webgpu", wplugin.c_str());
+#else
+            OrtStatus * st = A->RegisterExecutionProviderLibrary(s.env, "webgpu", plugin.c_str());
+#endif
             if (st) {
                 if (s.verbose)
                     fprintf(stderr, "[gsv_vocoder] register plugin EP failed: %s\n", A->GetErrorMessage(st));
