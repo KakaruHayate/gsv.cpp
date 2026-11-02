@@ -57,7 +57,9 @@ jobs:
 
       - name: Vulkan build dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libvulkan-dev glslang-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libvulkan-dev vulkan-tools glslang-tools glslc
 
       - name: Fetch llama.cpp and apply ggml patch
         shell: bash
@@ -75,7 +77,7 @@ jobs:
             -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF \
             -DCMAKE_BUILD_TYPE=Release
-          cmake --build llama.cpp/build-vk-rel --config Release -j 4
+          cmake --build llama.cpp/build-vk-rel --config Release -j 2
 
       - name: Build gsv_server
         shell: bash
