@@ -8,7 +8,7 @@
 //   4. top_k: pivot = 第 k 大值; logits < pivot -> -inf（相等保留，故可能多于 k 个）
 //   5. softmax
 //   采样: idx = argmax(probs / q), q ~ Exp(1)（torch multinomial_sample_one_no_sync 的等价形式）
-#pragma once
+#pragma once`r`n`r`n#include <cmath>
 
 #include <cstdint>
 #include <vector>
