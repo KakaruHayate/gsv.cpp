@@ -114,8 +114,10 @@ jobs:
             ./build/Release/test_add_act.exe --cpu
           else
             ls -l /usr/share/vulkan/icd.d || true
-            VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json vulkaninfo --summary 2>&1 | head -25 || true
-            VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
+            ICD=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1)
+            echo "lavapipe ICD: $ICD"
+            VK_ICD_FILENAMES="$ICD" vulkaninfo --summary 2>&1 | head -25 || true
+            VK_ICD_FILENAMES="$ICD" \
             LD_LIBRARY_PATH=llama.cpp/build-vk-rel/bin:llama.cpp/build-vk-rel/ggml/src:build \
             ./build/test_add_act --require-gpu
           fi
