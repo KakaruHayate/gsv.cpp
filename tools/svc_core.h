@@ -963,7 +963,11 @@ public:
         const auto now = std::chrono::system_clock::now();
         const std::time_t t = std::chrono::system_clock::to_time_t(now);
         std::tm tm{};
+#ifdef _WIN32
         localtime_s(&tm, &t);
+#else
+        localtime_r(&t, &tm);
+#endif
         char day[16];
         std::snprintf(day, sizeof(day), "%04d%02d%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
         std::ofstream f(fs::path(dir_) / (std::string("requests-") + day + ".jsonl"), std::ios::app);
