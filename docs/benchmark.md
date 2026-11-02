@@ -1,16 +1,18 @@
 # Benchmark
 
-Full pipeline (frontend → AR → cond → DiT → vocoder), one warm run per configuration,
-same text / reference audio / seed. Times in milliseconds.
+Full pipeline (frontend → AR → cond → DiT → vocoder), same text / reference audio / seed.
+Times in milliseconds, median of three warm runs (rows 2–6). Rows 2–6 were re-measured on
+2026-11-02 with the CI build of `main` (RoPE/adaLN/mish fusion included); rows 1 and 4 are
+the unchanged torch reference.
 
 | # | configuration | total | G2P/frontend | cond | AR | DiT | vocoder | cache |
 |---|---|---|---|---|---|---|---|---|
 | 1 | v5turbo torch | **3142** | 162 | 251 | ~2103* | 561 | 65 | — |
-| 2 | v5turbo ggml (AR fp16) | **1136** | 101 | 103 | 394 | 361 | 141 | — |
-| 3 | v5turbo ggml (AR q8) | **1127** | 103 | 112 | 421 | 318 | 133 | — |
+| 2 | v5turbo ggml (AR fp16) | **1045** | 102 | 97 | 370 | 295 | 114 | — |
+| 3 | v5turbo ggml (AR q8) | **989** | 103 | 92 | 348 | 298 | 115 | — |
 | 4 | v5dev torch | **11716** | 163 | 247 | ~2326* | 8924 | 56 | — |
-| 5 | v5dev ggml | **6785** | 110 | 106 | 390 | 5999 | 144 | — |
-| 6 | v5dev ggml + cache-dit | **5393** | 94 | 103 | 377 | 4637 | 147 | **24/64 = 37.5%** |
+| 5 | v5dev ggml | **5366** | 101 | 118 | 422 | 4524 | 114 | — |
+| 6 | v5dev ggml + cache-dit | **4837** | 102 | 114 | 343 | 4128 | 115 | **24/64 = 37.5%** |
 
 \* torch's AR loop is captured as a single CUDA graph and cannot be timed separately; this
 column is `total − (frontend + cond + DiT + vocoder)` (AR + scheduling overhead).

@@ -52,6 +52,8 @@
 
 #include "ggml-backend.h"
 
+#define GSV_VERSION "0.1.0"
+
 #include "svc_core.h"
 
 using namespace svc;
@@ -342,13 +344,14 @@ int main(int argc, char ** argv) {
         else if (a == "--allow-path") g_allow.push_back(next("--allow-path"));
         else if (a == "--job-ttl") job_ttl_arg = std::atof(next("--job-ttl").c_str());
         else if (a == "--list-devices") list_devices = true;
+        else if (a == "--version") { std::printf("gsv_server %s\n", GSV_VERSION); return 0; }
         else if (a == "--mock-engine") st.mock_engine = true;
         else if (a == "--mock-sidecar") g_mock_sidecar = true;
         else if (a == "--verbose") verbose = true;
         else if (a == "-h" || a == "--help") {
             std::printf("usage: gsv_server [--models DIR] [--device cpu|vulkan|vulkan:N|N] [--voc-device auto|cpu|webgpu]\n"
                         "                  [--host 127.0.0.1] [--port 9880] [--sidecar 127.0.0.1:9882]\n"
-                        "                  [--log-dir logs] [--threads N] [--verbose] [--list-devices]\n");
+                        "                  [--log-dir logs] [--threads N] [--verbose] [--list-devices] [--version]\n");
             return 0;
         } else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
