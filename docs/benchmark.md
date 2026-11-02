@@ -49,6 +49,9 @@ Same machine, turbo-q8, same text / seed, warm:
 | v5turbo total | 1130 ms | 1033 ms | −8.6% |
 
 Audio correlation against the pre-fusion build is 0.9955; two runs with the same seed are
-bit-identical (corr 1.000000), so determinism is preserved. The `mish` epilogue fusion (A4 in
-the DiT report) was evaluated but not landed: it needs a new `ggml_add_act` activation kernel
-(CPU + Vulkan) for a measured effect below 0.2%.
+bit-identical (corr 1.000000), so determinism is preserved. The `mish` epilogue fusion (A4 in the
+DiT report) is also in: `ggml_add_act` gained an `act=3` (mish) branch on CPU and in the Vulkan
+shader, and `conv_pos` folds bias + mish into one node. Its effect is below the 0.2% noise floor,
+so the numbers above do not change. `tests/test_add_act.cpp` checks all four activations against
+a host reference on CPU and on every GPU backend; CI runs it under Mesa lavapipe, which exercises
+the Vulkan shader branch (max|diff| 2.4e-7).
