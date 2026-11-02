@@ -89,7 +89,7 @@ jobs:
             -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF \
             -DCMAKE_BUILD_TYPE=Release 2>&1 | tee ggml-configure.log
-          cmake --build llama.cpp/build-vk-rel --config Release -j 2 2>&1 | tee ggml-build.log
+          cmake --build llama.cpp/build-vk-rel --config Release --target ggml ggml-base ggml-cpu ggml-vulkan -j 2 2>&1 | tee ggml-build.log
 
       - name: Upload ggml logs on failure
         if: failure()
