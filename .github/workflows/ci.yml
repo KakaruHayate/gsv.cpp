@@ -64,7 +64,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libvulkan-dev vulkan-tools glslang-tools glslc
+          sudo apt-get install -y build-essential libvulkan-dev vulkan-tools glslang-tools glslc mesa-vulkan-drivers
 
       - name: Fetch llama.cpp and apply ggml patch
         shell: bash
@@ -105,7 +105,18 @@ jobs:
         shell: bash
         run: |
           cmake -S . -B build -DGSV_GGML_LIB_DIR=llama.cpp/build-vk-rel -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --config Release --target gsv_server -j 4
+          cmake --build build --config Release --target gsv_server test_add_act -j 4
+
+      - name: add_act kernel test (CPU + Vulkan)
+        shell: bash
+        run: |
+          if [ "" = "Windows" ]; then
+            ./build/Release/test_add_act.exe --cpu
+          else
+            VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
+            LD_LIBRARY_PATH=llama.cpp/build-vk-rel/bin:llama.cpp/build-vk-rel/ggml/src:build \
+            ./build/test_add_act --require-gpu
+          fi
 
       - name: Package artifact
         shell: bash

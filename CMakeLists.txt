@@ -124,4 +124,10 @@ if(GSV_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann")
     target_link_libraries(test_svc PRIVATE gsv_engine)
     add_test(NAME test_svc COMMAND test_svc)
+
+    # add_act kernel (CPU + Vulkan) incl. the mish activation used by the DiT trunk
+    add_executable(test_add_act "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_add_act.cpp")
+    target_include_directories(test_add_act PRIVATE ${GSV_GGML_INCLUDES})
+    target_link_libraries(test_add_act PRIVATE ${GSV_GGML_LIBS})
+    add_test(NAME test_add_act COMMAND test_add_act --cpu)
 endif()

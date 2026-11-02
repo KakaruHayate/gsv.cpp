@@ -1,4 +1,4 @@
-From c8d37ae5a9e497f528b25334b6aacde4bf28be34 Mon Sep 17 00:00:00 2001
+From 51991e0ac748262fce9038995bbe9884f57be2b4 Mon Sep 17 00:00:00 2001
 From: KakaruHayate <kakaru@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 20:49:32 +0800
 Subject: [PATCH] ggml: port ggml-audio-patch learned-ops + qvac-ops + vulkan
@@ -15,10 +15,10 @@ Subject: [PATCH] ggml: port ggml-audio-patch learned-ops + qvac-ops + vulkan
   VK_EXT_shader_atomic_float probing, disk-backed persistent pipeline cache
 - CPU/CUDA/Metal dispatch + supports_op updated; ggml op count 116 -> 118
 ---
- ggml/include/ggml.h                           |  343 +++++
+ ggml/include/ggml.h                           |  344 +++++
  ggml/src/ggml-backend-meta.cpp                |   17 +-
  ggml/src/ggml-cpu/ggml-cpu.c                  |  104 +-
- ggml/src/ggml-cpu/ops.cpp                     | 1304 ++++++++++++++++-
+ ggml/src/ggml-cpu/ops.cpp                     | 1308 ++++++++++++++++-
  ggml/src/ggml-cpu/ops.h                       |   19 +
  ggml/src/ggml-cuda/conv-transpose-1d.cu       |   29 +-
  ggml/src/ggml-cuda/ggml-cuda.cu               |    2 +
@@ -29,7 +29,7 @@ Subject: [PATCH] ggml: port ggml-audio-patch learned-ops + qvac-ops + vulkan
  .../ggml-vulkan/ggml-vulkan-push-constants.h  |   62 +
  ggml/src/ggml-vulkan/ggml-vulkan-types.h      |  149 ++
  ggml/src/ggml-vulkan/ggml-vulkan.cpp          |  555 ++++++-
- .../ggml-vulkan/vulkan-shaders/add_act.comp   |   55 +
+ .../ggml-vulkan/vulkan-shaders/add_act.comp   |   58 +
  .../vulkan-shaders/affine_prelu.comp          |   40 +
  .../vulkan-shaders/channel_shuffle.comp       |   33 +
  .../vulkan-shaders/conv_direct_1d.comp        |  418 ++++++
@@ -41,12 +41,12 @@ Subject: [PATCH] ggml: port ggml-audio-patch learned-ops + qvac-ops + vulkan
  .../vulkan-shaders/scatter_elements.comp      |   67 +
  .../vulkan-shaders/vulkan-shaders-gen.cpp     |   24 +
  .../vulkan-shaders/zero_upsample.comp         |   30 +
- ggml/src/ggml.c                               |  734 +++++++++-
+ ggml/src/ggml.c                               |  734 ++++++++-
  tests-learned/bench_learned_ops.c             |  347 +++++
  tests-learned/bench_qvac_ops.c                |  616 ++++++++
  tests-learned/test_learned_ops.c              |  647 ++++++++
  tests-learned/test_qvac_ops.c                 |  887 +++++++++++
- 31 files changed, 6767 insertions(+), 45 deletions(-)
+ 31 files changed, 6775 insertions(+), 45 deletions(-)
  create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/add_act.comp
  create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/affine_prelu.comp
  create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/channel_shuffle.comp
@@ -63,7 +63,7 @@ Subject: [PATCH] ggml: port ggml-audio-patch learned-ops + qvac-ops + vulkan
  create mode 100644 tests-learned/test_qvac_ops.c
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 224bdef..966469f 100644
+index 224bdef..bc2f938 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -601,6 +601,63 @@ extern "C" {
@@ -215,7 +215,7 @@ index 224bdef..966469f 100644
      GGML_API struct ggml_tensor * ggml_conv_2d(
              struct ggml_context * ctx,
              struct ggml_tensor  * a,   // convolution kernel
-@@ -2587,6 +2708,228 @@ extern "C" {
+@@ -2587,6 +2708,229 @@ extern "C" {
              struct ggml_tensor  * pw,
              struct ggml_tensor  * ph);
  
@@ -418,6 +418,7 @@ index 224bdef..966469f 100644
 +        GGML_ACT_NONE     = 0,
 +        GGML_ACT_RELU     = 1,
 +        GGML_ACT_GELU_ERF = 2,
++        GGML_ACT_MISH     = 3,
 +    };
 +
 +    // Fused LayerNorm(x + r + bias)*w + b over ne0 (AR/BERT transformer blocks):
@@ -434,7 +435,7 @@ index 224bdef..966469f 100644
 +            float                 eps);
 +
 +    // Fused activation of (a + b) with b a per-ne0 vector broadcast over the rows
-+    // (ggml_add1 semantics).  act: 0 = none, 1 = relu, 2 = gelu(erf).
++    // (ggml_add1 semantics).  act: 0 = none, 1 = relu, 2 = gelu(erf), 3 = mish.
 +    GGML_API struct ggml_tensor * ggml_add_act(
 +            struct ggml_context * ctx,
 +            struct ggml_tensor  * a,
@@ -661,7 +662,7 @@ index 7c274c0..802d1ce 100644
                      {
                          if (node->src[0]->type == GGML_TYPE_F16 && node->type != GGML_TYPE_F16) {
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 16a916d..4b45ef7 100644
+index 16a916d..21bdb7f 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -11,6 +11,7 @@
@@ -1015,7 +1016,7 @@ index 16a916d..4b45ef7 100644
  // ggml_compute_forward_im2col_back_f32
  
  void ggml_compute_forward_im2col_back_f32(
-@@ -10636,6 +10879,1041 @@ void ggml_compute_forward_add_rel_pos(
+@@ -10636,6 +10879,1045 @@ void ggml_compute_forward_add_rel_pos(
      }
  }
  
@@ -1612,6 +1613,10 @@ index 16a916d..4b45ef7 100644
 +            o = v > 0.0f ? v : 0.0f;
 +        } else if (act == 2) {
 +            o = 0.5f * v * (1.0f + erff(v * 0.70710678118654752440f));
++        } else if (act == 3) {
++            // mish(v) = v * tanh(softplus(v)); softplus is linear above 20 for float
++            const float sp = v > 20.0f ? v : log1pf(expf(v));
++            o = v * tanhf(sp);
 +        }
 +        dd[i] = o;
 +    }
@@ -3265,17 +3270,17 @@ index 5587dfc..70b8abc 100644
              continue;
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/add_act.comp b/ggml/src/ggml-vulkan/vulkan-shaders/add_act.comp
 new file mode 100644
-index 0000000..9940ce2
+index 0000000..b7600fb
 --- /dev/null
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/add_act.comp
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,58 @@
 +#version 450
 +
 +#include "types.glsl"
 +
 +// Fused activation of (a + b) with b a per-ne0 vector broadcast over the rows
 +// (ggml_add1 shape).  Collapses add + activation into one pass.
-+// act: 0 = none, 1 = relu, 2 = gelu(erf).  a, b contiguous F32.
++// act: 0 = none, 1 = relu, 2 = gelu(erf), 3 = mish.  a, b contiguous F32.
 +layout (push_constant) uniform parameter
 +{
 +    uint ne;   // total elements
@@ -3320,6 +3325,9 @@ index 0000000..9940ce2
 +        o = max(v, 0.0f);
 +    } else if (p.act == 2u) {
 +        o = 0.5f * v * (1.0f + erf_approx(v * SQRT_2_INV));
++    } else if (p.act == 3u) {
++        const float sp = v > 20.0f ? v : log(1.0f + exp(v));
++        o = v * tanh(sp);
 +    }
 +
 +    data_d[i] = o;
@@ -4333,7 +4341,7 @@ index 0000000..925ebe0
 +    data_d[idx] = (f % p.s == 0u) ? D_TYPE(data_a[r * p.F + f / p.s]) : D_TYPE(0.0f);
 +}
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 9bcabdb..bd61c12 100644
+index 9bcabdb..e9823ae 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1099,9 +1099,30 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -4993,7 +5001,7 @@ index 9bcabdb..bd61c12 100644
 +    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32);
 +    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(b));
 +    GGML_ASSERT(b->ne[0] == a->ne[0] && ggml_nelements(b) == a->ne[0]);
-+    GGML_ASSERT(act >= 0 && act <= 2);
++    GGML_ASSERT(act >= 0 && act <= 3);
 +
 +    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
 +

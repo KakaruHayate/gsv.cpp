@@ -177,7 +177,7 @@ struct gsv_dit::impl {
     //   输出的行序 r = ic*K + kw = 权重 [ICG*K, OCG] 块的展平序, 与 wns1 的 [K,IC,OC] 一致).
     //   几何张量用权重的 view (ne0=K, ne1=ICG 满足 im2col 断言; 该 view 数据不会被读).
     ggml_tensor * conv_pos(ggml_context * c, ggml_tensor * x, const char * wname,
-                           const char * bname, int Tt) {
+                           const char * bname, int Tt, int act = 0) {
         ggml_tensor * w = need(wname);
         ggml_tensor * xt = to_a(c, x);                                   // [T, 1024] 连续
         ggml_tensor * y = nullptr;
@@ -192,7 +192,8 @@ struct gsv_dit::impl {
             ggml_tensor * hg = mm(c, wg, im, "conv_pos_g");              // [64, T]
             y = y ? ggml_concat(c, y, hg, 0) : hg;
         }
-        return ggml_add(c, y, need(bname));                              // [1024, T]
+        return act ? ggml_add_act(c, y, need(bname), act)                // bias + activation in one pass
+                   : ggml_add(c, y, need(bname));                       // [1024, T]
     }
     // GRN (ConvNeXtV2): 沿时间轴求 L2 范数, 通道均值归一, gamma*(x*Nx)+beta+x
     ggml_tensor * grn(ggml_context * c, ggml_tensor * x, int bi) {
@@ -507,11 +508,9 @@ ggml_tensor * gsv_dit::impl::build_trunk(ggml_context * c, ggml_tensor * x_in, b
     mark(x, "dbg_x_lin");
     ggml_tensor * xm = ggml_mul(c, x, p_maskrow);
     ggml_tensor * cp = conv_pos(c, xm, "dit.input_embed.conv_pos_embed.conv1d.0.weight",
-                                "dit.input_embed.conv_pos_embed.conv1d.0.bias", Tt);
-    cp = mish(c, cp);
+                                "dit.input_embed.conv_pos_embed.conv1d.0.bias", Tt, GGML_ACT_MISH);
     cp = conv_pos(c, cp, "dit.input_embed.conv_pos_embed.conv1d.2.weight",
-                  "dit.input_embed.conv_pos_embed.conv1d.2.bias", Tt);
-    cp = mish(c, cp);                                                   // torch: Sequential 末尾还有一次 Mish, 后才 masked_fill
+                  "dit.input_embed.conv_pos_embed.conv1d.2.bias", Tt, GGML_ACT_MISH);                                                   // torch: Sequential 末尾还有一次 Mish, 后才 masked_fill
     cp = ggml_mul(c, cp, p_maskrow);
     mark(cp, "dbg_convpos");
     x = ggml_add(c, x, cp);
