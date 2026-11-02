@@ -11,6 +11,7 @@
 #include "gsv_refenc.h"
 #include "gsv_sampler.h"
 #include "gsv_vocoder.h"
+#include "gsv_vocoder_ggml.h"
 #include "gsv_wns1.h"
 
 #include <cmath>
@@ -38,6 +39,7 @@ struct gsv_engine::impl {
     gsv_wns1    * wns1 = nullptr;
     gsv_dit     * dit  = nullptr;
     gsv_vocoder * voc  = nullptr;
+    gsv_vocoder_ggml * vgm = nullptr;   // ggml HiFi-GAN (preferred when present)
     std::mutex   voc_mu;   // DML/WebGPU 都不保证并发安全：所有 vocoder 调用串行
 
     std::string md;                       // model_dir (带尾部 '/')
@@ -198,16 +200,33 @@ gsv_engine * gsv_engine::load(const gsv_engine_cfg & cfg) {
         s.dit = gsv_dit::load(s.pick(cfg.dit_file, "gsv-dit-f16all.gguf"), d);
         if (!s.dit) { fprintf(stderr, "[gsv_engine] DiT 加载失败\n"); delete m; return nullptr; }
     }
-    // vocoder (ORT; EP 由 gsv_vocoder 自己挑)
+    // vocoder: ggml HiFi-GAN when a .gguf is available/requested, else ONNX Runtime
     {
-        gsv_vocoder_cfg v; v.device = cfg.voc_device; v.verbose = vb;
-        s.voc = gsv_vocoder::load(s.pick(cfg.vocoder_file, "vocoder_fp32.onnx"), v);
-        if (!s.voc) { fprintf(stderr, "[gsv_engine] vocoder 加载失败\n"); delete m; return nullptr; }
+        std::string vname = cfg.vocoder_file;
+        if (vname.empty()) {
+            const std::string cand = s.md + "gsv-vocoder-f16.gguf";
+            FILE * f = fopen(cand.c_str(), "rb");
+            if (f) { fclose(f); vname = "gsv-vocoder-f16.gguf"; }
+        }
+        const std::string vpath = s.pick(vname, "vocoder_fp32.onnx");
+        const bool is_gguf = vpath.size() > 5 && vpath.compare(vpath.size() - 5, 5, ".gguf") == 0;
+        if (is_gguf) {
+            gsv_vocoder_ggml_cfg g; g.device = dev; g.n_threads = cfg.n_threads; g.verbose = vb;
+            s.vgm = gsv_vocoder_ggml::load(vpath, g);
+            if (!s.vgm) { fprintf(stderr, "[gsv_engine] ggml vocoder load failed\n"); delete m; return nullptr; }
+        } else {
+            gsv_vocoder_cfg v; v.device = cfg.voc_device; v.verbose = vb;
+            s.voc = gsv_vocoder::load(vpath, v);
+            if (!s.voc) { fprintf(stderr, "[gsv_engine] vocoder load failed\n"); delete m; return nullptr; }
+        }
     }
     s.ready = true;
-    if (vb)
-        printf("[gsv_engine] ready: ggml=%s vocoder_EP=%s\n",
-               dev.empty() ? "cpu" : dev.c_str(), s.voc->ep_name());
+    if (vb) {
+        if (s.vgm) printf("[gsv_engine] ready: ggml=%s vocoder=ggml(%s)\n",
+                          dev.empty() ? "cpu" : dev.c_str(), s.vgm->device_name());
+        else printf("[gsv_engine] ready: ggml=%s vocoder_EP=%s\n",
+                    dev.empty() ? "cpu" : dev.c_str(), s.voc->ep_name());
+    }
     return m;
 }
 
@@ -585,6 +604,13 @@ bool gsv_engine::vocode_mel(const std::vector<float> & mel, int mel_T, std::vect
     if (!s.ready || mel_T <= 0 || mel.size() != (size_t) MEL_DIM * (size_t) mel_T) return false;
     std::vector<float> mel_dn((size_t) MEL_DIM * (size_t) mel_T);
     for (int i = 0; i < MEL_DIM * mel_T; i++) mel_dn[(size_t) i] = gsv_denorm_spec(mel[(size_t) i]);
+    if (s.vgm) {
+        if (!s.vgm->forward(mel_dn.data(), mel_T, wav)) {
+            fprintf(stderr, "[gsv_engine] ggml vocoder failed\n");
+            return false;
+        }
+        return true;
+    }
     if (!s.voc->run(mel_dn.data(), mel_T, wav)) {
         fprintf(stderr, "[gsv_engine] vocoder failed\n");
         return false;

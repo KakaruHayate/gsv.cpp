@@ -71,6 +71,7 @@ file(GLOB GSV_ENGINE_SOURCES CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_refenc.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_sampler.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_vocoder.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_vocoder_ggml.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_wns1.cpp")
 
 add_library(gsv_engine STATIC ${GSV_ENGINE_SOURCES})
