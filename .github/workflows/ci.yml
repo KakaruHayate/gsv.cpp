@@ -124,12 +124,8 @@ jobs:
             echo "--- run with default loader path ---"
             VK_DRIVER_FILES="$ICD" VK_ICD_FILENAMES="$ICD" ./build/test_add_act --require-gpu || true
             echo "--- run with LD_LIBRARY_PATH override ---"
-            VK_DRIVER_FILES="$ICD" VK_ICD_FILENAMES="$ICD" \
+            VK_DRIVER_FILES="$ICD" VK_ICD_FILENAMES="$ICD" GGML_VK_VISIBLE_DEVICES=0 \
             LD_LIBRARY_PATH=llama.cpp/build-vk-rel/bin:llama.cpp/build-vk-rel/ggml/src:build \
-            ./build/test_add_act --require-gpu || true
-            echo "--- run with the system loader preloaded ---"
-            VK_DRIVER_FILES="$ICD" VK_ICD_FILENAMES="$ICD" \
-            LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libvulkan.so.1 \
             ./build/test_add_act --require-gpu
           fi
 
