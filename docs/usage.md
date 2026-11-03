@@ -169,6 +169,15 @@ With more than one Vulkan device (multi-GPU, or an iGPU next to a dGPU), list th
 Then pass the index: `--device 1` or `--device vulkan:1`. An index that does not exist fails
 with `[device] GPU N not found` instead of silently falling back to CPU.
 
+### Windows one-click package
+
+`python scripts/package_windows.py --out dist/GSV.CPP-win64` assembles a portable folder:
+GAG sources, `runtime/gsv` (engine + DLLs + VC runtime), an embeddable Python with the GAG and
+frontend dependencies, `runtime/frontend` (sidecar + frontend code), `runtime/models` (GGUF,
+G2PW, tokenizer, nltk) and a `Start GAG.bat`. It expects a `GAG` checkout next to this repo.
+Useful flags: `--reuse-models` (keep an existing `runtime/models`), `--no-models`,
+`--skip-pip` (reuse the embedded Python).
+
 ```bash
 curl -X POST http://127.0.0.1:9880/tts -H "Content-Type: application/json" -d @request.json -o out.wav
 ```
