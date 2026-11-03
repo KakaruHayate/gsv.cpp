@@ -466,6 +466,16 @@ int main(int argc, char ** argv) {
             return 0;
         } else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
+    // CPU thread default: physical cores when SMT is present (hyperthreads add spin contention
+    // in ggml's barrier); --threads overrides it.
+    if (st.base.n_threads <= 0) {
+        const unsigned hw = std::thread::hardware_concurrency();
+        int nt = (int) (hw == 0 ? 4 : (hw > 8 ? hw / 2 : hw));
+        if (nt < 1) nt = 1;
+        st.base.n_threads = nt;
+        if (verbose)
+            std::printf("[gsv_server] --threads not set: using %d (hardware_concurrency=%u)\n", nt, hw);
+    }
     if (list_devices) {
         ggml_backend_load_all();
         const int n = (int) ggml_backend_dev_count();
@@ -822,6 +832,14 @@ int main(int argc, char ** argv) {
     };
     svr.Get("/asr", asr_not_supported);
     svr.Post("/asr", asr_not_supported);
+    svr.Get("/tts_ws", [](const httplib::Request &, httplib::Response & res) {
+        res.status = 501;
+        res.set_content(jerror(501, "not_implemented",
+                               "WebSocket streaming is not available in this build; use POST /tts "
+                               "with stream=true (HTTP chunked)")
+                            .dump(),
+                        "application/json");
+    });
 
     svr.Get("/openapi.json", [](const httplib::Request &, httplib::Response & res) {
         res.set_content(openapi_json(), "application/json");

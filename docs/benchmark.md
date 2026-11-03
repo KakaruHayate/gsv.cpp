@@ -67,3 +67,20 @@ shader, and `conv_pos` folds bias + mish into one node. Its effect is below the 
 so the numbers above do not change. `tests/test_add_act.cpp` checks all four activations against
 a host reference on CPU and on every GPU backend; CI runs it under Mesa lavapipe, which exercises
 the Vulkan shader branch (max|diff| 2.4e-7).
+
+## CPU backend threading
+
+ggml's barrier spins while waiting, so on SMT CPUs the default hardware_concurrency() (logical
+threads) oversubscribes and slows requests down. gsv_server now defaults to physical cores when
+--threads is not given (hardware_concurrency()/2 when > 8).
+
+Windows, Xeon E5-2675 v3 (16 cores / 32 threads, 1.8 GHz), turbo-q8, 4 steps, 3.04 s audio:
+
+| threads | total | DiT | cond | AR | vocoder |
+|---|---|---|---|---|---|
+| 32 (old default) | 39.9 s | 28.8 s | 1.80 s | 2.26 s | 3.07 s |
+| 16 (new default) | 35.4 s | 29.0 s | 1.20 s | 1.52 s | 1.62 s |
+| 8 | 35.9 s | 28.8 s | 1.15 s | 1.54 s | 1.93 s |
+
+DiT is memory-bound in this configuration and does not improve past 8 threads; the win is in the
+AR/cond/vocoder stages. --threads N overrides the default.
