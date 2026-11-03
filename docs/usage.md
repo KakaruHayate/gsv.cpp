@@ -37,8 +37,12 @@ Converted models are published at **<https://huggingface.co/KakaruHayate/GSV.CPP
 | `gsv-v5dev-refcode.gguf` | reference encoder | v5dev |
 | `gsv-bert-f16.gguf` | BERT (Chinese RoBERTa) | shared |
 | `gsv-hubert-f16.gguf` | CN-HuBERT | shared |
-| `gsv-vocoder-f32.gguf` | HiFi-GAN vocoder (48 kHz, ggml) | shared |
+| `gsv-vocoder-f32.gguf` | HiFi-GAN vocoder (48 kHz, ggml, sub-pixel) | shared, v0.1.2+ |
 | `resampy_kaiser_best.bin` | resampling filter table | shared |
+
+The vocoder is a GGUF file now: the ONNX vocoder (`vocoder_fp32.onnx`) is no longer published
+or supported. `gsv-vocoder-f32.gguf` uses the sub-pixel layout introduced in **v0.1.2**
+(phase-major `voc.upsub.*` tensors); v0.1.1 and earlier expect `voc.ups.*` and cannot load it.
 
 AR is published in two precisions; pick one (q8 is the default choice). The v5dev files are
 only needed if you want the 32-step model. All files go into the model directory:
@@ -97,7 +101,7 @@ python tools/export_gguf/export.py --kind refcode --ckpt s2Gv5turbo.pth --out mo
 python tools/export_gguf/export.py --kind bert   --ckpt chinese-roberta-wwm-ext-large --out models/gsv-bert-f16.gguf
 python tools/export_gguf/export.py --kind hubert --ckpt chinese-hubert-base          --out models/gsv-hubert-f16.gguf
 
-# vocoder (vocoder.pth -> GGUF, F16 weights; F32 transposed-conv kernels for Vulkan)
+# vocoder (vocoder.pth -> GGUF; F32 weights, phase-major sub-pixel upsampling)
 python tools/export_vocoder_gguf.py --ckpt models/vocoder.pth --out models/gsv-vocoder-f32.gguf
 
 # resampling filter table

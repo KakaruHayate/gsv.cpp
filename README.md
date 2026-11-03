@@ -14,7 +14,7 @@ text ──► Python text sidecar (G2P + BERT) ─┐
                           DiT (CFM, v5turbo 4 steps / v5dev 32 steps)
                                            │
                                            ▼
-                          vocoder (HiFi-GAN, ggml)
+                          vocoder (HiFi-GAN, ggml, sub-pixel)
                                            │
                                            ▼
                                          48 kHz WAV
@@ -23,7 +23,7 @@ text ──► Python text sidecar (G2P + BERT) ─┐
 ## Features
 
 - **ggml backends**: Vulkan (NVIDIA/AMD/Intel) and CPU; no CUDA dependency.
-- **Quantized weights**: Q8_0 attention/FFN for AR, F16 for the rest; F16 vocoder.
+- **Quantized weights**: Q8_0 attention/FFN for AR, F16 for the rest; F32 sub-pixel vocoder.
 - **Batched AR**: several texts/segments share one decode pass (fallback to per-sequence).
 - **cache-dit** (DBCache) for the 32-step v5dev model: ~20% faster with near-lossless audio.
 - **Request scheduler**: concurrent `/tts` calls are grouped; DiT and vocoder run as a pipeline.
