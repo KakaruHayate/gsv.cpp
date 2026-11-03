@@ -63,7 +63,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libvulkan-dev vulkan-tools glslang-tools glslc mesa-vulkan-drivers
+          sudo apt-get install -y build-essential libvulkan-dev vulkan-tools glslang-tools mesa-vulkan-drivers
 
       - name: Fetch llama.cpp and apply ggml patch
         shell: bash
