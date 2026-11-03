@@ -2,23 +2,23 @@
 
 Full pipeline (frontend → AR → cond → DiT → vocoder), same text / reference audio / seed.
 Times in milliseconds, median of three warm runs (rows 2–6). Rows 2–6 were re-measured on
-2026-11-03 with the v0.1.1 Windows build (ggml-only F32 HiFi-GAN vocoder, RoPE/adaLN/mish
-fusion included); rows 1 and 4 are the unchanged torch reference.
+2026-11-03 with the v0.1.2 build (ggml-only F32 HiFi-GAN vocoder with sub-pixel upsampling,
+RoPE/adaLN/mish fusion included); rows 1 and 4 are the unchanged torch reference.
 
 | # | configuration | total | G2P/frontend | cond | AR | DiT | vocoder | cache |
 |---|---|---|---|---|---|---|---|---|
 | 1 | v5turbo torch | **3142** | 162 | 251 | ~2103* | 561 | 65 | — |
-| 2 | v5turbo ggml (AR fp16) | **1239** | 102 | 98 | 578 | 287 | 140 | — |
-| 3 | v5turbo ggml (AR q8) | **1196** | 101 | 101 | 510 | 290 | 141 | — |
+| 2 | v5turbo ggml (AR fp16) | **1097** | 100 | 100 | 466 | 285 | 115 | — |
+| 3 | v5turbo ggml (AR q8) | **998** | 100 | 91 | 370 | 282 | 114 | — |
 | 4 | v5dev torch | **11716** | 163 | 247 | ~2326* | 8924 | 56 | — |
-| 5 | v5dev ggml | **5686** | 97 | 123 | 546 | 4710 | 139 | — |
-| 6 | v5dev ggml + cache-dit | **4619** | 102 | 124 | 375 | 3853 | 140 | **24/64 = 37.5%** |
+| 5 | v5dev ggml | **5688** | 105 | 135 | 530 | 4743 | 114 | — |
+| 6 | v5dev ggml + cache-dit | **4844** | 101 | 134 | 419 | 4037 | 117 | **17/64 = 26.6%** |
 
-The vocoder is now the ggml F32 HiFi-GAN and its cost scales with output length: ~140 ms for the
-3.4 s clip in this table (the old ONNX vocoder was ~114 ms here), ~35 ms for a 0.7 s clip. The
-earlier "ggml is 3x faster" reading compared different clip lengths; for equal-length audio the
-F32 ggml vocoder is currently slightly slower than ONNX, which is the remaining optimization
-target (subpixel/direct-conv upsampling). Note that AR varies by roughly +/-20% between runs on this
+The vocoder is the ggml F32 HiFi-GAN with **sub-pixel upsampling**: the five transposed
+convolutions are replaced by one 3-tap conv1d on the input grid plus a phase interleave
+(`src/gsv_vocoder_ggml.cpp::upsample_subpixel`). For the 3.4 s clip in this table the vocoder
+now takes ~115 ms, down from ~140 ms with `ggml_conv_transpose_1d` (~18%). The equivalent ONNX
+vocoder was ~114 ms, so ggml is now at parity. AR varies by roughly ±20% between runs on this
 machine (CPU sidecar + GPU sharing), which dominates the spread of the totals.
 
 \* torch's AR loop is captured as a single CUDA graph and cannot be timed separately; this

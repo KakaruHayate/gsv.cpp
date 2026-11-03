@@ -10,10 +10,12 @@
 int main(int argc, char ** argv) {
     if (argc < 2) { printf("usage: %s <vocoder.gguf> [T] [--cpu]\n", argv[0]); return 2; }
     int T = 40;
+    const char * out_path = nullptr;
     gsv_vocoder_ggml_cfg cfg;
     for (int i = 2; i < argc; i++) {
         if (std::strcmp(argv[i], "--cpu") == 0) cfg.device = "cpu";
         else if (std::strcmp(argv[i], "--vulkan") == 0) cfg.device = "vulkan";
+        else if (std::strcmp(argv[i], "--out") == 0 && i + 1 < argc) out_path = argv[++i];
         else if (argv[i][0] == '-' && argv[i][1] == '-') { /* ignore */ }
         else T = std::atoi(argv[i]);
     }
@@ -32,6 +34,10 @@ int main(int argc, char ** argv) {
     for (float x : wav) { sum += x; mx = fmax(mx, fabs(x)); }
     printf("wav=%zu expected=%d mean=%.5f max=%.5f\n", wav.size(), T * v->upsample(),
            sum / (double) wav.size(), mx);
+    if (out_path) {
+        FILE * fp = fopen(out_path, "wb");
+        if (fp) { fwrite(wav.data(), 4, wav.size(), fp); fclose(fp); }
+    }
     delete v;
     return 0;
 }

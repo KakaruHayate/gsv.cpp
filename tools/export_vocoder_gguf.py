@@ -62,6 +62,23 @@ def main() -> int:
 
     ups_k = [int(sd[f"ups.{i}.weight"].shape[2]) for i in range(len(UPS))]
 
+    # Sub-pixel decomposition of ConvTranspose1d(K=2s, padding=s/2): with taps m=0,1 and
+    # conv padding M-1, out[t*s+r] = sum_m W[m] * x[t-(1-m)], so W[m] = w[:, :, (1-m)*s + r + s/2].
+    def upsub(i):
+        wt = sd[f"ups.{i}.weight"].detach().float().cpu().numpy()   # [Cin, Cout, K]
+        cin, cout, k = wt.shape
+        st = UPS[i]
+        M = 3
+        W = np.zeros((M, cin, cout * st), dtype=np.float32)
+        pad = (k - st) // 2
+        for m in range(M):
+            for r in range(st):
+                kk = (1 - m) * st + r + pad
+                if 0 <= kk < k:
+                    W[m, :, r * cout:(r + 1) * cout] = wt[:, :, kk]
+        # ggml ne is reversed: emit (CS, Cin, M) so ggml sees [M, Cin, CS]
+        return np.ascontiguousarray(W.transpose(2, 1, 0))
+
     gw = GGUFWriter(args.out, "gsv-vocoder")
     gw.add_uint32("gsv.voc.mel", int(sd["conv_pre.weight"].shape[1]))
     gw.add_uint32("gsv.voc.sr", 48000)
@@ -76,8 +93,8 @@ def main() -> int:
     gw.add_tensor("voc.conv_pre.weight", conv_w("conv_pre.weight"))
     gw.add_tensor("voc.conv_pre.bias", b("conv_pre.bias"))
     for i in range(len(UPS)):
-        gw.add_tensor(f"voc.ups.{i}.weight", up_w(f"ups.{i}.weight"))
-        gw.add_tensor(f"voc.ups.{i}.bias", b(f"ups.{i}.bias"))
+        gw.add_tensor(f"voc.upsub.{i}.weight", upsub(i))
+        gw.add_tensor(f"voc.upsub.{i}.bias", np.tile(b(f"ups.{i}.bias"), UPS[i]))
     for j in range(15):
         for c in (1, 2):
             for k in range(3):

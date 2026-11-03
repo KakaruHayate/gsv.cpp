@@ -38,6 +38,7 @@ struct gsv_vocoder_ggml::impl {
     ggml_context *      wctx    = nullptr;
     gguf_context *      gf      = nullptr;
     std::map<std::string, ggml_tensor *> w;
+    std::vector<int> ups_strides;   // gsv.voc.ups metadata
     int  n_threads = 0;
     bool verbose   = false;
 
@@ -76,20 +77,40 @@ struct gsv_vocoder_ggml::impl {
         return y;
     }
 
-    // ConvTranspose1d with torch padding (K - stride) / 2: run p0=0 and crop from the left.
-    ggml_tensor * conv_t(ggml_context * c, const std::string & pre, ggml_tensor * x, int stride) {
-        ggml_tensor * ww = need(pre + ".weight");
+    // Plain conv1d (stride 1) without bias/activation, F32 im2col + mul_mat path.
+    ggml_tensor * conv1d_raw(ggml_context * c, ggml_tensor * ww, ggml_tensor * x, int pad) {
+        ggml_tensor * im = ggml_im2col_fast_1d(c, ww, x, 1, pad, 1, GGML_TYPE_F32, 16);
+        ggml_tensor * m0 = ggml_reshape_2d(c, im, im->ne[0], im->ne[1] * im->ne[2]);
+        ggml_tensor * wm = ggml_reshape_2d(c, ww, ww->ne[0] * ww->ne[1], ww->ne[2]);
+        ggml_tensor * r  = (ww->type == GGML_TYPE_F32)
+                               ? ggml_mul_mat(c, m0, wm)
+                               : ggml_cont(c, ggml_transpose(c, ggml_mul_mat(c, wm, m0)));
+        r = ggml_reshape_3d(c, r, im->ne[1], ww->ne[2], im->ne[2]);
+        return ggml_reshape_2d(c, r, r->ne[0], r->ne[1]);
+    }
+
+    // Sub-pixel upsampling: conv1d on the input grid (M taps) + phase interleave,
+    // exactly equivalent to ConvTranspose1d(K, stride) with padding (K-stride)/2.
+    ggml_tensor * upsample_subpixel(ggml_context * c, const std::string & pre, ggml_tensor * x,
+                                    int stride) {
+        ggml_tensor * ww = need(pre + ".weight");    // [M, Cin, Cout*stride] phase-major
         if (!ww) return nullptr;
-        const int64_t K = ww->ne[0];
-        ggml_tensor * y = ggml_conv_transpose_1d_ext(c, ww, x, stride, 0, 1, 0, 1);
-        y = ggml_reshape_2d(c, y, y->ne[0], y->ne[1]);
-        const int pad = (int) ((K - stride) / 2);
-        const int64_t target = x->ne[0] * stride;
-        if (pad > 0) {
-            y = ggml_cont(c, ggml_view_2d(c, y, target, y->ne[1], y->nb[1], (size_t) pad * y->nb[0]));
+        const int M   = (int) ww->ne[0];
+        const int CS  = (int) ww->ne[2];
+        const int cout = CS / stride;
+        const int64_t L = x->ne[0];
+        ggml_tensor * y = conv1d_raw(c, ww, x, M / 2);   // symmetric pad, keeps L outputs
+        ggml_tensor * b = ggml_reshape_2d(c, need(pre + ".bias"), 1, CS);
+        y = ggml_add(c, y, b);
+        if (y->ne[0] != L) {
+            // symmetric pad produced M-1 extra rows on the right; keep the first L
+            y = ggml_cont(c, ggml_view_2d(c, y, L, CS, y->nb[1], 0));
         }
-        ggml_tensor * b = ggml_reshape_2d(c, need(pre + ".bias"), 1, y->ne[1]);
-        return ggml_add(c, y, b);
+
+        ggml_tensor * y3 = ggml_reshape_3d(c, y, L, cout, stride);   // [L, Cout, s]
+        ggml_tensor * yp = ggml_permute(c, y3, 1, 2, 0, 3);          // [s, L, Cout]
+        ggml_tensor * yc = ggml_cont(c, yp);
+        return ggml_reshape_2d(c, yc, L * stride, cout);              // [L*s, Cout]
     }
 
     ggml_tensor * resblock(ggml_context * c, ggml_tensor * x, int idx) {
@@ -192,6 +213,15 @@ gsv_vocoder_ggml * gsv_vocoder_ggml::load(const std::string & gguf_path, const g
         fclose(fp);
     }
 
+    {
+        const int64_t k = gguf_find_key(s.gf, "gsv.voc.ups");
+        if (k >= 0) {
+            const int n = (int) gguf_get_arr_n(s.gf, k);
+            const uint32_t * d = (const uint32_t *) gguf_get_arr_data(s.gf, k);
+            for (int i = 0; i < n; i++) s.ups_strides.push_back((int) d[i]);
+        }
+    }
+
     if (s.verbose)
         printf("[gsv_voc_ggml] loaded %s (%zu tensors, device=%s)\n",
                gguf_path.c_str(), s.w.size(), ggml_backend_name(s.backend));
@@ -217,11 +247,9 @@ bool gsv_vocoder_ggml::forward(const float * mel, int T, std::vector<float> & wa
             x = ggml_leaky_relu(ctx, x, 0.1f, false);
         }
         char pre[64];
-        std::snprintf(pre, sizeof pre, "voc.ups.%d", i);
-        ggml_tensor * ww = s.need(std::string(pre) + ".weight");
-        if (!ww) { x = nullptr; break; }
-        const int stride = (int) (ww->ne[0] / 2);   // k = 2*stride for all five stages
-        x = s.conv_t(ctx, pre, x, stride);
+        std::snprintf(pre, sizeof pre, "voc.upsub.%d", i);
+        const int stride = i < (int) s.ups_strides.size() ? s.ups_strides[i] : 2;
+        x = s.upsample_subpixel(ctx, pre, x, stride);
         ggml_tensor * sum = nullptr;
         for (int j = 0; j < N_RB && x; j++) {
             ggml_tensor * rb = s.resblock(ctx, x, i * N_RB + j);
