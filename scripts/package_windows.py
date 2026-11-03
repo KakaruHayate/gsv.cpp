@@ -93,6 +93,25 @@ def copy_crt(*targets):
                 break
     log("VC runtime DLLs copied")
 
+
+def clean_pycache(root):
+    """Drop __pycache__ / *.pyc from the package: Python regenerates them on first run and they
+    only bloat the archive."""
+    removed = 0
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+        for name in list(dirnames):
+            if name == "__pycache__":
+                shutil.rmtree(os.path.join(dirpath, name), ignore_errors=True)
+                removed += 1
+        for name in filenames:
+            if name.endswith((".pyc", ".pyo")):
+                try:
+                    os.remove(os.path.join(dirpath, name))
+                    removed += 1
+                except OSError:
+                    pass
+    log("removed %d pycache entries" % removed)
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=os.path.join(GSV, "dist", "GSV.CPP-win64"))
@@ -181,6 +200,7 @@ def main():
         pip_install(site, FRONTEND_EXTRA)
 
     copy_crt(py_dir, gsv_dir)
+    clean_pycache(out)
     # 6. launcher, config, readme
     bat = os.path.join(out, "Start GAG.bat")
     with open(bat, "w", encoding="utf-8", newline="\r\n") as f:
