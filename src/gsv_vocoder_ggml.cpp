@@ -51,57 +51,30 @@ struct gsv_vocoder_ggml::impl {
         return it->second;
     }
 
-    // F32 im2col + mul_mat conv1d (stride 1): out[t, oc] = sum_{ic,kw} w[kw,ic,oc]*x[t+kw*dil-pad]
+    // Stride-1 conv1d with the whole epilogue fused: bias + leaky out, optional input
+    // scale/leaky (CONV_DIRECT_1D: no im2col buffer, CPU + Vulkan).
     ggml_tensor * conv_same(ggml_context * c, const std::string & pre, ggml_tensor * x,
-                            int dil, float leaky) {
+                            int dil, float leaky, float in_scale = 1.0f, float in_slope = 0.0f) {
         ggml_tensor * ww = need(pre + ".weight");
         if (!ww) return nullptr;
-        const int64_t K  = ww->ne[0];
+        const int64_t K   = ww->ne[0];
         const int64_t pad = (K / 2) * dil;
-        const int64_t OL = x->ne[0] + 2 * pad - dil * (K - 1);
-
-        ggml_tensor * im = ggml_im2col_fast_1d(c, ww, x, 1, (int) pad, dil, GGML_TYPE_F32, 16);
-        ggml_tensor * m0 = ggml_reshape_2d(c, im, im->ne[0], im->ne[1] * im->ne[2]);
-        ggml_tensor * wm = ggml_reshape_2d(c, ww, ww->ne[0] * ww->ne[1], ww->ne[2]);
-        ggml_tensor * r  = (ww->type == GGML_TYPE_F32)
-                               ? ggml_mul_mat(c, m0, wm)
-                               : ggml_cont(c, ggml_transpose(c, ggml_mul_mat(c, wm, m0)));
-        r = ggml_reshape_3d(c, r, im->ne[1], ww->ne[2], im->ne[2]);
-        r = ggml_reshape_2d(c, r, r->ne[0], r->ne[1]);
-        if (r->ne[0] != OL) {
-            r = ggml_cont(c, ggml_view_2d(c, r, OL, r->ne[1], r->nb[1], 0));
-        }
-        ggml_tensor * b = ggml_reshape_2d(c, need(pre + ".bias"), 1, r->ne[1]);
-        ggml_tensor * y = ggml_add(c, r, b);
-        if (leaky != 0.0f) y = ggml_leaky_relu(c, y, leaky, false);
-        return y;
-    }
-
-    // Plain conv1d (stride 1) without bias/activation, F32 im2col + mul_mat path.
-    ggml_tensor * conv1d_raw(ggml_context * c, ggml_tensor * ww, ggml_tensor * x, int pad) {
-        ggml_tensor * im = ggml_im2col_fast_1d(c, ww, x, 1, pad, 1, GGML_TYPE_F32, 16);
-        ggml_tensor * m0 = ggml_reshape_2d(c, im, im->ne[0], im->ne[1] * im->ne[2]);
-        ggml_tensor * wm = ggml_reshape_2d(c, ww, ww->ne[0] * ww->ne[1], ww->ne[2]);
-        ggml_tensor * r  = (ww->type == GGML_TYPE_F32)
-                               ? ggml_mul_mat(c, m0, wm)
-                               : ggml_cont(c, ggml_transpose(c, ggml_mul_mat(c, wm, m0)));
-        r = ggml_reshape_3d(c, r, im->ne[1], ww->ne[2], im->ne[2]);
-        return ggml_reshape_2d(c, r, r->ne[0], r->ne[1]);
+        return ggml_conv_direct_1d_fused(c, ww, x, need(pre + ".bias"), nullptr,
+                                         (int) pad, dil, leaky, in_scale, in_slope);
     }
 
     // Sub-pixel upsampling: conv1d on the input grid (M taps) + phase interleave,
     // exactly equivalent to ConvTranspose1d(K, stride) with padding (K-stride)/2.
     ggml_tensor * upsample_subpixel(ggml_context * c, const std::string & pre, ggml_tensor * x,
-                                    int stride) {
+                                    int stride, float in_scale = 1.0f, float in_slope = 0.0f) {
         ggml_tensor * ww = need(pre + ".weight");    // [M, Cin, Cout*stride] phase-major
         if (!ww) return nullptr;
         const int M   = (int) ww->ne[0];
         const int CS  = (int) ww->ne[2];
         const int cout = CS / stride;
         const int64_t L = x->ne[0];
-        ggml_tensor * y = conv1d_raw(c, ww, x, M / 2);   // symmetric pad, keeps L outputs
-        ggml_tensor * b = ggml_reshape_2d(c, need(pre + ".bias"), 1, CS);
-        y = ggml_add(c, y, b);
+        ggml_tensor * y = ggml_conv_direct_1d_fused(c, ww, x, need(pre + ".bias"), nullptr,
+                                                    M / 2, 1, 0.0f, in_scale, in_slope);
         if (y->ne[0] != L) {
             // symmetric pad produced M-1 extra rows on the right; keep the first L
             y = ggml_cont(c, ggml_view_2d(c, y, L, CS, y->nb[1], 0));
@@ -241,15 +214,15 @@ bool gsv_vocoder_ggml::forward(const float * mel, int T, std::vector<float> & wa
     ggml_set_input(xin);
 
     ggml_tensor * x = s.conv_same(ctx, "voc.conv_pre", xin, 1, 0.1f);
+    const float mean_scale = 1.0f / (float) N_RB;
     for (int i = 0; i < N_UPS && x; i++) {
-        if (i > 0) {
-            x = ggml_scale(ctx, x, 1.0f / (float) N_RB);
-            x = ggml_leaky_relu(ctx, x, 0.1f, false);
-        }
         char pre[64];
         std::snprintf(pre, sizeof pre, "voc.upsub.%d", i);
         const int stride = i < (int) s.ups_strides.size() ? s.ups_strides[i] : 2;
-        x = s.upsample_subpixel(ctx, pre, x, stride);
+        // entering level i>0 the previous resblock mean still needs /3 and LeakyReLU(0.1);
+        // both fold into this convolution's input packing
+        x = s.upsample_subpixel(ctx, pre, x, stride,
+                                i > 0 ? mean_scale : 1.0f, i > 0 ? 0.1f : 0.0f);
         ggml_tensor * sum = nullptr;
         for (int j = 0; j < N_RB && x; j++) {
             ggml_tensor * rb = s.resblock(ctx, x, i * N_RB + j);
@@ -258,9 +231,7 @@ bool gsv_vocoder_ggml::forward(const float * mel, int T, std::vector<float> & wa
         x = sum;
     }
     if (x) {
-        x = ggml_scale(ctx, x, 1.0f / (float) N_RB);
-        x = ggml_leaky_relu(ctx, x, 0.01f, false);
-        x = s.conv_same(ctx, "voc.conv_post", x, 1, 0.0f);
+        x = s.conv_same(ctx, "voc.conv_post", x, 1, 0.0f, mean_scale, 0.01f);
         x = ggml_tanh(ctx, x);
         ggml_set_output(x);
     }
