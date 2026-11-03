@@ -41,6 +41,13 @@ def _ensure_repo():
         raise RuntimeError("找不到 repo (%s); 用 GSV_REPO_ROOT 指定" % _GENV_ROOT_HINT)
     # bert_path: 给 chinese2 的 G2PWPinyin 用 (它只要 tokenizer, 不加载模型权重)
     os.environ.setdefault("bert_path", _default_bert_dir())
+    # G2PW 模型目录：默认在 <repo>/models/frontend/g2pw，其次 <repo>/models/G2PWModel
+    if not os.environ.get("GSV_G2PW_MODEL"):
+        for cand in (os.path.join(os.path.dirname(_HERE), "models", "frontend", "g2pw"),
+                     os.path.join(os.path.dirname(_HERE), "models", "G2PWModel")):
+            if os.path.isdir(cand):
+                os.environ["GSV_G2PW_MODEL"] = cand
+                break
     os.environ.setdefault("version", "v2")
     if _HERE not in sys.path:
         sys.path.insert(0, _HERE)   # gsv_bert_tokenizer.py (no transformers/torch)
@@ -98,6 +105,10 @@ def _default_bert_dir():
     data = os.environ.get("GSV_FRONTEND_DATA")
     if data:
         cand = os.path.join(data, "bert_tokenizer")
+        if os.path.isdir(cand):
+            return cand
+    for cand in (os.path.join(os.path.dirname(_HERE), "models", "frontend", "bert_tokenizer"),
+                 os.path.join(os.path.dirname(_HERE), "models", "chinese-roberta-wwm-ext-large")):
         if os.path.isdir(cand):
             return cand
     return os.path.join(os.path.dirname(_HERE), "models", "chinese-roberta-wwm-ext-large")
