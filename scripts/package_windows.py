@@ -155,7 +155,7 @@ def main():
     os.makedirs(out, exist_ok=True)
 
     # 1. GAG sources
-    for name in ["gsv_api_gui.py", "GAG_tools", "translations", "resources_rc.py", "requirements.txt", "LICENSE"]:
+    for name in ["gsv_api_gui.py", "launch_gag.py", "GAG_tools", "translations", "resources_rc.py", "requirements.txt", "LICENSE"]:
         src = os.path.join(GAG, name)
         if not os.path.exists(src):
             continue
@@ -235,15 +235,9 @@ def main():
         f.write("@echo off\r\n")
         f.write("chcp 65001 >nul\r\n")
         f.write("cd /d \"%~dp0\"\r\n")
-        f.write("echo Starting GAG (gsv.cpp backend)...\r\n")
-        # Run in this console (not via `start`) so a traceback stays visible instead of the
-        # window flashing and closing.
-        f.write("\"runtime\\python\\python.exe\" gsv_api_gui.py\r\n")
-        f.write("if errorlevel 1 (\r\n")
-        f.write("  echo.\r\n")
-        f.write("  echo GAG exited with an error. See the messages above.\r\n")
-        f.write("  pause\r\n")
-        f.write(")\r\n")
+        # pythonw: no console window. launch_gag.py logs crashes to gag_error.log and shows them
+        # in a message box, so a failure is still visible.
+        f.write("start \"\" \"runtime\\python\\pythonw.exe\" launch_gag.py\r\n")
     cfg = os.path.join(out, "GAG_config.json")
     import json
     cfg_data = {
