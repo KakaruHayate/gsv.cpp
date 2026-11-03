@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-static const int T = 64, IC = 24, OC = 16, K = 3;
+static const int T = 64, IC = 32, OC = 32, K = 3;
 
 static ggml_tensor * conv_direct(ggml_context * c, ggml_tensor * w, ggml_tensor * x,
                                  ggml_tensor * b, float slope) {
