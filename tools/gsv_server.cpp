@@ -926,7 +926,12 @@ int main(int argc, char ** argv) {
 
     svr.Get("/control", [&](const httplib::Request & req, httplib::Response & res) {
         const std::string cmd = req.has_param("command") ? req.get_param_value("command") : "";
-        res.set_content(json{{"message", cmd.empty() ? "ok" : ("ok: " + cmd)}}.dump(), "application/json");
+        // api_v2 compatibility: a bare GET /control answers 400 "command is required"; clients
+        // (GAG, studio scripts) use that as the liveness probe. /health is the better endpoint.
+        if (cmd.empty()) {
+            return jerr(res, 400, "bad_request", "command is required (try 'restart' or 'exit')");
+        }
+        res.set_content(json{{"message", "ok: " + cmd}}.dump(), "application/json");
         if (cmd == "exit") {
             std::printf("[gsv_server] exit requested\n");
             std::thread([&]() {
