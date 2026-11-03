@@ -14,3 +14,7 @@ redistributes headers from the following projects:
 
 Model weights published at <https://huggingface.co/KakaruHayate/GSV.CPP> are conversions of
 GPT-SoVITS pretrained/fine-tuned checkpoints and remain under the upstream project's license.
+
+The text frontend under rontend/ is a vendored copy of GPT-SoVITS's GPT_SoVITS/text
+(MIT). Its G2PW components (	ext/g2pw/, and the g2pW.onnx model distributed separately on
+Hugging Face) come from the G2PW project and are Apache-2.0 licensed.
