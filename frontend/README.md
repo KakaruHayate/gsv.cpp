@@ -41,8 +41,8 @@ Environment variables:
 
 | variable | meaning |
 |---|---|
-| `GSV_G2PW_MODEL` | directory containing `g2pW.onnx` (default `GPT_SoVITS/text/G2PWModel`) |
-| `GSV_BERT_DIR` | directory containing `vocab.txt` (default `<repo>/models/chinese-roberta-wwm-ext-large`) |
+| `GSV_G2PW_MODEL` | directory containing `g2pW.onnx`; default search: `<repo>/models/frontend/g2pw`, `<repo>/models/G2PWModel`, then `GPT_SoVITS/text/G2PWModel` |
+| `GSV_BERT_DIR` | directory containing `vocab.txt`; default search: `<repo>/models/frontend/bert_tokenizer`, `<repo>/models/chinese-roberta-wwm-ext-large` |
 | `GSV_FRONTEND_DATA` | optional root; if it has `bert_tokenizer/`, that is used |
 | `NLTK_DATA` | nltk data directory (`nltk_data`), needed for English |
 | `GSV_REPO_ROOT` | dev only: point at a full GPT-SoVITS checkout instead of this directory |
