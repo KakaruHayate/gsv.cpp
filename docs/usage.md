@@ -28,6 +28,14 @@ Runtime requirements:
 - Linux binaries are built on Ubuntu 22.04 (glibc 2.35+).
 - Python 3.10+ for the text sidecar (`tools/text_sidecar.py`).
 
+
+### Reproducibility
+
+The text frontend is deterministic across platforms (identical phones / ert_ids). The AR
+sampler is not: the same seed on Windows and Linux yields different token trajectories because
+floating-point differences in the logits change the sampled codes, so the two wavs differ in
+length and content. Within one platform and build the output is bit-exact (same SHA-256).
+
 ## 2. Get models
 
 Converted models are published at **<https://huggingface.co/KakaruHayate/GSV.CPP>**:
