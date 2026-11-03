@@ -1,4 +1,4 @@
-From e6dbac942bd7f37926d2effd9a4d4df9c5e80756 Mon Sep 17 00:00:00 2001
+From d82c38f855c90f0b89a8c263216f70704e89ef51 Mon Sep 17 00:00:00 2001
 From: KakaruHayate <kakaru@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 20:49:32 +0800
 Subject: [PATCH] ggml: port ggml-audio-patch learned-ops + qvac-ops + vulkan
@@ -18,7 +18,7 @@ Subject: [PATCH] ggml: port ggml-audio-patch learned-ops + qvac-ops + vulkan
  ggml/include/ggml.h                           |  344 +++++
  ggml/src/ggml-backend-meta.cpp                |   17 +-
  ggml/src/ggml-cpu/ggml-cpu.c                  |  104 +-
- ggml/src/ggml-cpu/ops.cpp                     | 1308 ++++++++++++++++-
+ ggml/src/ggml-cpu/ops.cpp                     | 1310 ++++++++++++++++-
  ggml/src/ggml-cpu/ops.h                       |   19 +
  ggml/src/ggml-cuda/conv-transpose-1d.cu       |   29 +-
  ggml/src/ggml-cuda/ggml-cuda.cu               |    2 +
@@ -46,7 +46,7 @@ Subject: [PATCH] ggml: port ggml-audio-patch learned-ops + qvac-ops + vulkan
  tests-learned/bench_qvac_ops.c                |  616 ++++++++
  tests-learned/test_learned_ops.c              |  647 ++++++++
  tests-learned/test_qvac_ops.c                 |  887 +++++++++++
- 31 files changed, 6775 insertions(+), 45 deletions(-)
+ 31 files changed, 6777 insertions(+), 45 deletions(-)
  create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/add_act.comp
  create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/affine_prelu.comp
  create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/channel_shuffle.comp
@@ -662,7 +662,7 @@ index 7c274c0..802d1ce 100644
                      {
                          if (node->src[0]->type == GGML_TYPE_F16 && node->type != GGML_TYPE_F16) {
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 16a916d..d7688b4 100644
+index 16a916d..8067c16 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -11,6 +11,7 @@
@@ -1016,7 +1016,7 @@ index 16a916d..d7688b4 100644
  // ggml_compute_forward_im2col_back_f32
  
  void ggml_compute_forward_im2col_back_f32(
-@@ -10636,6 +10879,1045 @@ void ggml_compute_forward_add_rel_pos(
+@@ -10636,6 +10879,1047 @@ void ggml_compute_forward_add_rel_pos(
      }
  }
  
@@ -1886,8 +1886,10 @@ index 16a916d..d7688b4 100644
 +                        const float * xp = Xp + ic * L + t0;
 +                        const float * wp = Wb + ic * K * OCp;
 +                        for (int kw = 0; kw < K; ++kw, xp += dil, wp += OCp) {
-+                            const __m256 w0 = _mm256_load_ps(wp);
-+                            const __m256 w1 = _mm256_load_ps(wp + 8);
++                            // Wt lives in the shared work buffer, whose base is only
++                            // guaranteed to be 16-byte aligned: use unaligned loads.
++                            const __m256 w0 = _mm256_loadu_ps(wp);
++                            const __m256 w1 = _mm256_loadu_ps(wp + 8);
 +                            a00 = _mm256_fmadd_ps(_mm256_broadcast_ss(xp + 0), w0, a00);
 +                            a01 = _mm256_fmadd_ps(_mm256_broadcast_ss(xp + 0), w1, a01);
 +                            a10 = _mm256_fmadd_ps(_mm256_broadcast_ss(xp + 1), w0, a10);
