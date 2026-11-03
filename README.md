@@ -36,6 +36,7 @@ not supported.
 ## Documentation
 
 - [docs/usage.md](docs/usage.md) — build artifacts, model download/conversion, running the service
+- [docs/api.md](docs/api.md) — HTTP API (endpoints, streaming, references, errors)
 - [docs/benchmark.md](docs/benchmark.md) — full-pipeline timings (torch vs ggml, turbo/dev)
 - [tools/export_gguf/README.md](tools/export_gguf/README.md) — exporter/quantizer reference
 
@@ -145,15 +146,20 @@ Useful parameters: `voice`, `text_split_method` (`cut0`/`cut5`), `speed_factor`,
 
 ## API
 
+Full reference: [docs/api.md](docs/api.md); the server also serves OpenAPI at `GET /docs`.
+
 | Endpoint | Description |
 |---|---|
-| `POST /tts` | synthesize one text, returns `audio/wav` |
+| `POST /tts` | synthesize one text, returns `audio/wav`; `"stream": true` → chunked WAV, PCM flushed per segment |
 | `POST /batch` | queue several texts, returns a job id |
 | `GET /jobs/{id}` | job status (also `GET /jobs/{id}/events` for SSE) |
 | `GET /jobs/{id}/result/{i}` | one resulting WAV |
 | `GET /models` | list voices |
 | `GET /set_gpt_weights?weights_path=NAME` | switch voice |
-| `GET /health`, `GET /metrics` | status and counters |
+| `GET /change_refer`, `GET /set_refer_audio` | set the default reference audio / prompt |
+| `POST /reference` | upload a reference WAV, returns a usable path |
+| `GET /health`, `GET /metrics`, `GET /docs` | status, counters, OpenAPI |
+| `GET /asr` | `501` — ASR is not implemented in this engine |
 
 Bind to loopback only unless `--token <secret>` is set; `--allow-path` restricts which
 reference audio paths the service may read.

@@ -312,6 +312,13 @@ inline bool path_allowed(const std::string & p) {
             (ca.back() == '/' || c[ca.size()] == '/'))
             return true;
     }
+    // POST /reference writes uploads into <temp>/gsv_refs; those are usable without --allow-path.
+    {
+        std::error_code ec;
+        const std::string refs = canon_path((fs::temp_directory_path(ec) / "gsv_refs").string());
+        if (!ec && c.size() > refs.size() && c.compare(0, refs.size(), refs) == 0 && c[refs.size()] == '/')
+            return true;
+    }
     return false;
 }
 
