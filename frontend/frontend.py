@@ -16,8 +16,10 @@ import sys
 
 # repo 的 text/chinese2.py 在 import 时就用**相对 cwd** 的路径去开 G2PWModel,
 # 所以必须先把 cwd 切到 repo 根, 并把 repo/GPT_SoVITS 放进 sys.path。
-_REPO_ROOT = os.environ.get("GSV_REPO_ROOT", os.path.abspath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "repo")))
+# Code root: contains GPT_SoVITS/text (vendored copy of the upstream frontend).
+# Override with GSV_REPO_ROOT to point at a full GPT-SoVITS checkout for development.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.environ.get("GSV_REPO_ROOT", _HERE)
 _GSV_DIR = os.path.join(_REPO_ROOT, "GPT_SoVITS")
 
 _text_mods = {}
@@ -40,6 +42,8 @@ def _ensure_repo():
     # bert_path: 给 chinese2 的 G2PWPinyin 用 (它只要 tokenizer, 不加载模型权重)
     os.environ.setdefault("bert_path", _default_bert_dir())
     os.environ.setdefault("version", "v2")
+    if _HERE not in sys.path:
+        sys.path.insert(0, _HERE)   # gsv_bert_tokenizer.py (no transformers/torch)
     if _REPO_ROOT not in sys.path:
         sys.path.insert(0, _REPO_ROOT)
     if _GSV_DIR not in sys.path:
@@ -89,8 +93,14 @@ _GENV_ROOT_HINT = _REPO_ROOT
 
 
 def _default_bert_dir():
-    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    return os.path.join(here, "models", "chinese-roberta-wwm-ext-large")
+    if os.environ.get("GSV_BERT_DIR"):
+        return os.environ["GSV_BERT_DIR"]
+    data = os.environ.get("GSV_FRONTEND_DATA")
+    if data:
+        cand = os.path.join(data, "bert_tokenizer")
+        if os.path.isdir(cand):
+            return cand
+    return os.path.join(os.path.dirname(_HERE), "models", "chinese-roberta-wwm-ext-large")
 
 
 class Frontend:
@@ -114,8 +124,9 @@ class Frontend:
 
     def _tokenizer(self):
         if self._tok is None:
-            from transformers import AutoTokenizer
-            self._tok = AutoTokenizer.from_pretrained(self.bert_path)
+            # self-contained WordPiece tokenizer: no transformers / torch dependency
+            from gsv_bert_tokenizer import BertWordPieceTokenizer
+            self._tok = BertWordPieceTokenizer(os.path.join(self.bert_path, "vocab.txt"))
         return self._tok
 
     def __call__(self, text, language=None):
@@ -185,8 +196,9 @@ class Frontend:
 
     def _bert_ids(self, norm_text):
         """BERT tokenizer 输出 (含 CLS/SEP)。只分词, 不前向 —— 前向在 C++ 侧。"""
-        enc = self._tokenizer()(norm_text, return_tensors=None)
-        return list(enc["input_ids"])
+        tok = self._tokenizer()
+        ids = tok.convert_tokens_to_ids(["[CLS]"] + tok.tokenize(norm_text) + ["[SEP]"])
+        return list(ids)
 
     @staticmethod
     def _check(norm_text, word2ph, ids):

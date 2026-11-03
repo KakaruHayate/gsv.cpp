@@ -1,0 +1,15 @@
+# Extra dependencies for en / ja / ko / yue (install on top of requirements-zh.txt).
+g2p_en
+inflect
+wordsegment
+requests
+jieba
+fast-langdetect>=0.3.1
+split-lang
+pyopenjtalk>=0.4.1
+ToJyutping
+jamo
+g2pk2
+ko_pron
+# g2pk2 on Windows misses eunjeon; frontend.py routes it through python-mecab-ko
+python-mecab-ko

@@ -136,10 +136,17 @@ Notes:
 
 ## 4. Run
 
+The text frontend (G2P) is vendored in `frontend/` (upstream layout, MIT). It needs **no
+torch/transformers**; see [frontend/README.md](../frontend/README.md) for the data files
+(`G2PWModel`, BERT tokenizer, `nltk_data`) and how to point the sidecar at them.
+
 ```bash
-# text frontend
+# text frontend (zh only; add frontend/requirements-multi.txt for en/ja/ko/yue)
 python -m venv .venv-sidecar
-.venv-sidecar/bin/pip install -r tools/text_sidecar_requirements.txt      # Windows: .venv-sidecar\Scripts\pip
+.venv-sidecar/bin/pip install -r frontend/requirements-zh.txt   # Windows: .venv-sidecar\Scripts\pip
+export GSV_G2PW_MODEL=/path/to/G2PWModel                        # dir with g2pW.onnx
+export GSV_BERT_DIR=/path/to/chinese-roberta-wwm-ext-large      # vocab.txt + tokenizer_config.json
+export NLTK_DATA=/path/to/.nltk_data                            # required by en (g2p_en)
 .venv-sidecar/bin/python tools/text_sidecar.py --port 9882
 
 # engine + HTTP service

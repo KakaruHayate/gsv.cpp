@@ -1,0 +1,10 @@
+# Chinese frontend only (no torch, no transformers).
+#   python -m venv .venv-sidecar
+#   .venv-sidecar/bin/pip install -r frontend/requirements-zh.txt
+numpy>=1.26
+onnxruntime>=1.20
+pypinyin
+jieba_fast
+cn2an
+OpenCC
+nltk

@@ -23,7 +23,9 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
+sys.path.insert(0, ROOT)
 
 _T0 = time.perf_counter()
 from frontend.frontend import Frontend  # noqa: E402
