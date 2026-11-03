@@ -101,6 +101,8 @@ total roughly the sum of the segments.
 - `GET /control?command=exit` → graceful shutdown (used by tests).
 - `GET /asr` → `501`, ASR is not part of this engine.
 - `GET /docs`, `GET /openapi.json` → OpenAPI 3 document.
+- `GET /tts_ws` → `501`: this build has no WebSocket support; use `POST /tts` with
+  `stream: true` instead.
 
 ## Examples
 
