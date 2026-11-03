@@ -83,7 +83,7 @@ jobs:
         run: |
           set -o pipefail
           cmake -S llama.cpp -B llama.cpp/build-vk-rel \
-            -DGGML_VULKAN=ON \
+            -DGGML_VULKAN=ON -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DGGML_BUILD_TESTS=OFF -DGGML_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF \
@@ -104,7 +104,7 @@ jobs:
         shell: bash
         run: |
           cmake -S . -B build -DGSV_GGML_LIB_DIR=llama.cpp/build-vk-rel -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --config Release --target gsv_server test_add_act -j 4
+          cmake --build build --config Release --target gsv_server test_add_act test_conv_direct_act -j 4
 
       - name: add_act kernel test (CPU + Vulkan)
         shell: bash
@@ -126,6 +126,15 @@ jobs:
             VK_DRIVER_FILES="$ICD" VK_ICD_FILENAMES="$ICD" GGML_VK_VISIBLE_DEVICES=0 \
             LD_LIBRARY_PATH=llama.cpp/build-vk-rel/bin:llama.cpp/build-vk-rel/ggml/src:build \
             ./build/test_add_act --require-gpu
+          fi
+
+      - name: conv_direct activation test (CPU)
+        shell: bash
+        run: |
+          if [ "" = "Windows" ]; then
+            ./build/Release/test_conv_direct_act.exe --cpu
+          else
+            ./build/test_conv_direct_act --cpu
           fi
 
       - name: Package artifact

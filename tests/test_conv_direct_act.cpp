@@ -49,7 +49,9 @@ static bool run_on(ggml_backend_t be, const std::vector<float> & x, const std::v
 int main(int argc, char ** argv) {
     const bool cpu_only = argc > 1 && std::strcmp(argv[1], "--cpu") == 0;
     const bool require_gpu = argc > 1 && std::strcmp(argv[1], "--require-gpu") == 0;
-    ggml_backend_load_all();
+    // CPU registrations are static; loading the GPU backends under a headless runner has
+    // been seen to segfault during teardown, and --cpu does not need them.
+    if (!cpu_only) ggml_backend_load_all();
 
     std::vector<float> x((size_t) T * IC), w((size_t) K * IC * OC), b((size_t) OC);
     for (size_t i = 0; i < x.size(); i++) x[i] = 0.02f * (float) ((int) (i * 37 % 101) - 50);
