@@ -94,11 +94,14 @@ def copy_crt(*targets):
     log("VC runtime DLLs copied")
 
 
-def clean_pycache(root):
-    """Drop __pycache__ / *.pyc from the package: Python regenerates them on first run and they
-    only bloat the archive."""
+def clean_pycache(root, keep_substr=("site-packages",)):
+    """Drop __pycache__ / *.pyc outside site-packages: Python regenerates them on first run and
+    they only bloat the archive. site-packages keeps its bytecode so the first launch stays fast
+    (it is re-created explicitly by precompile_site_packages())."""
     removed = 0
     for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+        if any(k in dirpath.replace("\\", "/") for k in keep_substr):
+            continue
         for name in list(dirnames):
             if name == "__pycache__":
                 shutil.rmtree(os.path.join(dirpath, name), ignore_errors=True)
@@ -111,6 +114,16 @@ def clean_pycache(root):
                 except OSError:
                     pass
     log("removed %d pycache entries" % removed)
+
+
+def precompile_site_packages(py_dir):
+    """Regenerate bytecode for the installed packages (first launch stays fast)."""
+    site = os.path.join(py_dir, "Lib", "site-packages")
+    if not os.path.isdir(site):
+        return
+    py = os.path.join(py_dir, "python.exe")
+    r = subprocess.run([py, "-m", "compileall", "-q", site], capture_output=True, text=True)
+    log("site-packages precompiled (rc=%d)" % r.returncode)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -201,6 +214,7 @@ def main():
 
     copy_crt(py_dir, gsv_dir)
     clean_pycache(out)
+    precompile_site_packages(py_dir)
     # 6. launcher, config, readme
     bat = os.path.join(out, "Start GAG.bat")
     with open(bat, "w", encoding="utf-8", newline="\r\n") as f:
