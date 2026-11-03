@@ -8,18 +8,21 @@ RoPE/adaLN/mish fusion included); rows 1 and 4 are the unchanged torch reference
 | # | configuration | total | G2P/frontend | cond | AR | DiT | vocoder | cache |
 |---|---|---|---|---|---|---|---|---|
 | 1 | v5turbo torch | **3142** | 162 | 251 | ~2103* | 561 | 65 | — |
-| 2 | v5turbo ggml (AR fp16) | **1113** | 108 | 129 | 465 | 281 | 76 | — |
-| 3 | v5turbo ggml (AR q8) | **1108** | 108 | 132 | 452 | 284 | 75 | — |
+| 2 | v5turbo ggml (AR fp16) | **945** | 102 | 93 | 363 | 275 | 68 | — |
+| 3 | v5turbo ggml (AR q8) | **1028** | 101 | 95 | 425 | 279 | 67 | — |
 | 4 | v5dev torch | **11716** | 163 | 247 | ~2326* | 8924 | 56 | — |
-| 5 | v5dev ggml | **5659** | 106 | 126 | 523 | 4668 | 73 | — |
-| 6 | v5dev ggml + cache-dit | **4865** | 114 | 128 | 472 | 4025 | 74 | **17/64 = 26.6%** |
+| 5 | v5dev ggml | **5415** | 102 | 126 | 456 | 4617 | 68 | — |
+| 6 | v5dev ggml + cache-dit | **4740** | 101 | 120 | 422 | 4005 | 69 | **17/64 = 26.6%** |
 
 The vocoder is the ggml F32 HiFi-GAN with **sub-pixel upsampling**: the five transposed
 convolutions are replaced by one 3-tap conv1d on the input grid plus a phase interleave
-(`src/gsv_vocoder_ggml.cpp::upsample_subpixel`). For the 3.4 s clip in this table the vocoder
-now takes ~115 ms, down from ~140 ms with `ggml_conv_transpose_1d` (~18%). The equivalent ONNX
-vocoder was ~114 ms, so ggml is now at parity. AR varies by roughly ±20% between runs on this
-machine (CPU sidecar + GPU sharing), which dominates the spread of the totals.
+(`src/gsv_vocoder_ggml.cpp::upsample_subpixel`), and every convolution runs through
+`ggml_conv_direct_1d_fused` (no im2col buffer; bias/LeakyReLU, the resblock input LeakyReLU and
+the residual add all fold into the same kernel). For the 3.4 s clip in this table the vocoder
+takes **~68 ms**, down from ~140 ms with `ggml_conv_transpose_1d`, ~115 ms with sub-pixel + im2col
+and ~75 ms with per-conv direct conv (-51% overall). The old ONNX vocoder was ~114 ms. AR varies
+by roughly ±20% between runs on this machine (CPU sidecar + GPU sharing), which dominates the
+spread of the totals.
 
 \* torch's AR loop is captured as a single CUDA graph and cannot be timed separately; this
 column is `total − (frontend + cond + DiT + vocoder)` (AR + scheduling overhead).

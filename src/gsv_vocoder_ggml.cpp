@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 #include <map>
 #include <string>
 #include <vector>
@@ -54,12 +55,13 @@ struct gsv_vocoder_ggml::impl {
     // Stride-1 conv1d with the whole epilogue fused: bias + leaky out, optional input
     // scale/leaky (CONV_DIRECT_1D: no im2col buffer, CPU + Vulkan).
     ggml_tensor * conv_same(ggml_context * c, const std::string & pre, ggml_tensor * x,
-                            int dil, float leaky, float in_scale = 1.0f, float in_slope = 0.0f) {
+                            int dil, float leaky, float in_scale = 1.0f, float in_slope = 0.0f,
+                            ggml_tensor * res = nullptr) {
         ggml_tensor * ww = need(pre + ".weight");
         if (!ww) return nullptr;
         const int64_t K   = ww->ne[0];
         const int64_t pad = (K / 2) * dil;
-        return ggml_conv_direct_1d_fused(c, ww, x, need(pre + ".bias"), nullptr,
+        return ggml_conv_direct_1d_fused(c, ww, x, need(pre + ".bias"), res,
                                          (int) pad, dil, leaky, in_scale, in_slope);
     }
 
@@ -91,12 +93,12 @@ struct gsv_vocoder_ggml::impl {
         ggml_tensor * h = x;
         for (int k = 0; k < 3; k++) {
             char pre[96];
+            // conv1: LeakyReLU on the input folds into its packing, LeakyReLU on the output
+            // rides its epilogue; conv2 folds the residual add into its epilogue as well.
             std::snprintf(pre, sizeof pre, "voc.resblocks.%d.convs1.%d", idx, k);
-            ggml_tensor * y = ggml_leaky_relu(c, h, 0.1f, false);
-            y = conv_same(c, pre, y, dil[k], 0.1f);
+            ggml_tensor * y = conv_same(c, pre, h, dil[k], 0.1f, 1.0f, 0.1f);
             std::snprintf(pre, sizeof pre, "voc.resblocks.%d.convs2.%d", idx, k);
-            y = conv_same(c, pre, y, 1, 0.0f);
-            h = ggml_add(c, y, h);
+            h = conv_same(c, pre, y, 1, 0.0f, 1.0f, 0.0f, h);
         }
         return h;
     }
@@ -240,25 +242,73 @@ bool gsv_vocoder_ggml::forward(const float * mel, int T, std::vector<float> & wa
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE * 8, false);
     ggml_build_forward_expand(gf, x);
 
-    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(s.backend));
-    if (!ggml_gallocr_alloc_graph(alloc, gf)) {
-        fprintf(stderr, "[gsv_voc_ggml] graph alloc failed (T=%d)\n", T);
-        ggml_gallocr_free(alloc); ggml_free(ctx);
-        return false;
+    const bool prof = getenv("GSV_VOC_PROFILE") != nullptr;
+    ggml_gallocr_t alloc = nullptr;
+    ggml_backend_sched_t sched = nullptr;
+    ggml_backend_t prof_cpu = nullptr;
+    std::map<std::string, std::pair<int, double>> prof_acc;
+
+    if (prof) {
+        std::vector<ggml_backend_t> backends{ s.backend };
+        if (ggml_backend_dev_type(ggml_backend_get_device(s.backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            ggml_backend_dev_t cd = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (cd) { prof_cpu = ggml_backend_dev_init(cd, nullptr); backends.push_back(prof_cpu); }
+        }
+        sched = ggml_backend_sched_new(backends.data(), nullptr, (int) backends.size(),
+                                       GGML_DEFAULT_GRAPH_SIZE, false, false);
+        auto cb = [](ggml_tensor * t, bool ask, void * ud) -> bool {
+            auto * st = (std::pair<std::chrono::steady_clock::time_point, std::map<std::string, std::pair<int,double>> *> *) ud;
+            if (ask) { st->first = std::chrono::steady_clock::now(); return true; }
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - st->first).count();
+            auto & e = (*st->second)[ggml_op_name(t->op)];
+            e.first++; e.second += ms;
+            return true;
+        };
+        static std::pair<std::chrono::steady_clock::time_point, std::map<std::string, std::pair<int,double>> *> prof_ud;
+        prof_ud.second = &prof_acc;
+        ggml_backend_sched_set_eval_callback(sched, cb, &prof_ud);
+        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+            fprintf(stderr, "[gsv_voc_ggml] sched alloc failed (T=%d)\n", T);
+            ggml_backend_sched_free(sched); if (prof_cpu) ggml_backend_free(prof_cpu); ggml_free(ctx);
+            return false;
+        }
+    } else {
+        alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(s.backend));
+        if (!ggml_gallocr_alloc_graph(alloc, gf)) {
+            fprintf(stderr, "[gsv_voc_ggml] graph alloc failed (T=%d)\n", T);
+            ggml_gallocr_free(alloc); ggml_free(ctx);
+            return false;
+        }
     }
     ggml_backend_tensor_set(xin, mel, 0, (size_t) VOC_MEL * T * sizeof(float));
 
-    const ggml_status st = ggml_backend_graph_compute(s.backend, gf);
+    const ggml_status st = prof ? ggml_backend_sched_graph_compute(sched, gf)
+                                : ggml_backend_graph_compute(s.backend, gf);
     if (st != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "[gsv_voc_ggml] compute failed: %d\n", (int) st);
-        ggml_gallocr_free(alloc); ggml_free(ctx);
+        if (alloc) ggml_gallocr_free(alloc);
+        if (sched) ggml_backend_sched_free(sched);
+        if (prof_cpu) ggml_backend_free(prof_cpu);
+        ggml_free(ctx);
         return false;
     }
     const size_t n = (size_t) ggml_nelements(x);
     wav.resize(n);
     ggml_backend_tensor_get(x, wav.data(), 0, n * sizeof(float));
 
-    ggml_gallocr_free(alloc);
+    if (prof) {
+        fprintf(stderr, "[voc prof] ---- per-op totals ----\n");
+        double tot_ms = 0;
+        for (auto & kv : prof_acc) {
+            tot_ms += kv.second.second;
+            fprintf(stderr, "[voc prof] %-20s n=%3d total=%8.2f ms avg=%6.3f\n", kv.first.c_str(),
+                    kv.second.first, kv.second.second, kv.second.second / kv.second.first);
+        }
+        fprintf(stderr, "[voc prof] node total %.2f ms\n", tot_ms);
+    }
+    if (alloc) ggml_gallocr_free(alloc);
+    if (sched) ggml_backend_sched_free(sched);
+    if (prof_cpu) ggml_backend_free(prof_cpu);
     ggml_free(ctx);
     return true;
 }
