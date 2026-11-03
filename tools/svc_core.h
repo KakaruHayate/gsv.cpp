@@ -14,6 +14,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <list>
 #include <map>
@@ -464,6 +465,10 @@ struct State {
     ArBatcher * ar_batcher = nullptr;
     SynthScheduler * sched = nullptr;
     bool mock_engine = false;   // 契约测试：跳过真实引擎
+
+    // 默认参考（/change_refer 设置；请求未带 ref_audio_path/prompt_text 时回退）
+    std::mutex ref_mu;
+    std::string default_ref_path, default_prompt_text, default_prompt_lang = "zh";
 };
 
 inline std::shared_ptr<gsv_engine> snapshot(State & st) {
@@ -1262,7 +1267,43 @@ inline bool synth_text_q(State & st, const SidecarCfg & side, const SynthParams 
     return true;
 }
 
-// 批量：所有 segment 的 AR 一次性入队（跨请求聚合），再逐段 synth
+// 流式：逐 segment 合成，每段完成后立刻把 PCM(int16) 交给 sink。
+// sink 返回 false 表示客户端已断开，提前停止。不做整体 normalize（逐段归一化会抽音量）。
+using stream_pcm_fn = std::function<bool(const int16_t * pcm, size_t n)>;
+
+inline bool synth_text_stream_q(State & st, const SidecarCfg & side, const SynthParams & p,
+                                const stream_pcm_fn & sink, SynthTiming & tm, std::string & err) {
+    const auto segs = split_text(p.text, p.split_method);
+    tm.segments = (int) segs.size();
+    std::shared_ptr<const RefPrep> ref;
+    std::shared_ptr<const PromptPrep> prm;
+    if (!ensure_ref_locked(st, side, p, ref, prm, tm, err)) return false;
+
+    std::vector<int16_t> pcm;
+    auto emit = [&](const std::vector<float> & wav) -> bool {
+        pcm.resize(wav.size());
+        for (size_t i = 0; i < wav.size(); i++) {
+            const float c = std::max(-1.0f, std::min(1.0f, wav[i]));
+            pcm[i] = (int16_t) std::lrintf(c * 32767.0f);
+        }
+        return sink(pcm.data(), pcm.size());
+    };
+
+    for (size_t i = 0; i < segs.size(); i++) {
+        SynthParams sp = p;
+        sp.text = segs[i];
+        std::vector<float> wav;
+        if (!synth_segment_q(st, side, sp, ref, prm, wav, tm, err)) return false;
+        if (!emit(wav)) { err = "client disconnected"; return false; }
+        if (i + 1 < segs.size() && p.fragment_interval > 0.0f) {
+            const size_t gap = (size_t) (p.fragment_interval * kSampleRate);
+            pcm.assign(gap, 0);
+            if (!sink(pcm.data(), pcm.size())) { err = "client disconnected"; return false; }
+        }
+    }
+    return true;
+}
+
 inline bool synth_batch_texts_q(State & st, const SidecarCfg & side, const SynthParams & base,
                                 const std::vector<std::string> & texts,
                                 std::vector<std::vector<float>> & wavs,

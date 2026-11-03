@@ -102,6 +102,76 @@ json jerror(int code, const std::string & ec, const std::string & msg) {
     return json{{"message", msg}, {"code", ec}};
 }
 
+// OpenAPI 3 description served at /docs and /openapi.json
+std::string openapi_json() {
+    json s = json::object();
+    s["type"] = "string";
+
+    json tts_req = json::object();
+    tts_req["type"] = "object";
+    tts_req["required"] = json::array({"text", "ref_audio_path", "prompt_text"});
+    json props = json::object();
+    auto P = [&](const char * name, const char * type, const char * desc) {
+        props[name] = json{{"type", type}, {"description", desc}};
+    };
+    P("text", "string", "text to synthesize");
+    P("text_lang", "string", "zh / en / ja / ko / yue (default zh)");
+    P("ref_audio_path", "string", "reference wav (must be under --allow-path)");
+    P("prompt_text", "string", "text of the reference audio");
+    P("prompt_lang", "string", "language of prompt_text (default zh)");
+    P("voice", "string", "registered voice name; empty = current voice");
+    P("sample_steps", "integer", "DiT steps (default: per voice)");
+    P("cfg_rate", "number", "CFG rate");
+    P("seed", "integer", "-1 = random");
+    P("top_k", "integer", "AR sampler top-k");
+    P("top_p", "number", "AR sampler top-p");
+    P("temperature", "number", "AR sampler temperature");
+    P("repetition_penalty", "number", "AR repetition penalty");
+    P("speed_factor", "number", "duration scale, (0, 4]");
+    P("text_split_method", "string", "cut0..cut5 (default cut5)");
+    P("fragment_interval", "number", "silence between segments, seconds");
+    P("dbcache", "string", "cache-dit: off / auto / f4 / f8 / f16");
+    P("stream", "boolean", "true = chunked audio/wav, PCM is flushed per text segment");
+    P("media_type", "string", "only wav is supported");
+    tts_req["properties"] = props;
+    s["TtsRequest"] = tts_req;
+
+    json paths = json::object();
+    paths["/tts"]["post"] = json{{"summary", "synthesize (json body)"},
+                                 {"requestBody", json{{"required", true},
+                                                      {"content", json{{"application/json",
+                                                                        json{{"schema", json{{"$ref", "#/components/schemas/TtsRequest"}}}}}}}}},
+                                 {"responses", json{{"200", json{{"description", "audio/wav (chunked when stream=true)"}}},
+                                                    {"400", json{{"description", "bad_request"}}},
+                                                    {"403", json{{"description", "forbidden (path not allowed)"}}},
+                                                    {"503", json{{"description", "busy / sidecar down"}}},
+                                                    {"504", json{{"description", "timeout"}}}}}};
+    paths["/tts"]["get"] = json{{"summary", "synthesize (query parameters, same fields as the json body)"}};
+    paths["/batch"]["post"] = json{{"summary", "asynchronous batch"},
+                                   {"description", "body: {texts:[...], ...TtsRequest}. Returns {job_id,total}."}};
+    paths["/jobs/{id}"]["get"] = json{{"summary", "job state"}, {"parameters", json::array({json{{"name", "id"}, {"in", "path"}, {"required", true}, {"schema", json{{"type", "string"}}}}})}};
+    paths["/jobs/{id}/result/{i}"]["get"] = json{{"summary", "job item wav"}};
+    paths["/jobs/{id}"]["delete"] = json{{"summary", "cancel / drop job"}};
+    paths["/models"]["get"] = json{{"summary", "list voices and current voice"}};
+    paths["/change_refer"]["get"] = json{{"summary", "set the default reference audio"},
+                                         {"parameters", json::array({json{{"name", "refer_wav_path"}, {"in", "query"}, {"required", true}, {"schema", json{{"type", "string"}}}},
+                                                                     json{{"name", "prompt_text"}, {"in", "query"}, {"required", true}, {"schema", json{{"type", "string"}}}},
+                                                                     json{{"name", "prompt_lang"}, {"in", "query"}, {"schema", json{{"type", "string"}}}}})}};
+    paths["/change_refer"]["post"] = json{{"summary", "same as GET, json body accepted"}};
+    paths["/set_refer_audio"]["get"] = json{{"summary", "alias of /change_refer"}};
+    paths["/health"]["get"] = json{{"summary", "readiness"}};
+    paths["/metrics"]["get"] = json{{"summary", "counters"}};
+    paths["/control"]["get"] = json{{"summary", "command=exit to stop the server"}};
+    paths["/asr"]["get"] = json{{"summary", "always 501: ASR is not implemented in this engine"}};
+
+    json doc = json{{"openapi", "3.0.3"},
+                    {"info", json{{"title", "gsv.cpp TTS service"}, {"version", GSV_VERSION},
+                                  {"description", "api_v2-compatible subset. POST /tts with stream=true returns a chunked WAV whose PCM is flushed per text segment."}}},
+                    {"paths", paths},
+                    {"components", json{{"schemas", s}}}};
+    return doc.dump(2);
+}
+
 // JSON 取值：兼容 GET 的字符串形式和 POST 的数字形式
 std::string jstr(const json & b, const char * k, const std::string & def) {
     if (!b.contains(k) || b[k].is_null()) return def;
@@ -221,6 +291,14 @@ TtsOutcome run_tts(State & st, const SidecarCfg & side, ReqLog & rlog, const jso
     TtsOutcome o;
     SynthParams p;
     parse_params(body, p);
+    // 请求没带参考时回退到 /change_refer 设置的默认参考
+    {
+        std::lock_guard<std::mutex> lk(st.ref_mu);
+        if (p.ref_path.empty()) p.ref_path = st.default_ref_path;
+        if (p.prompt_text.empty()) p.prompt_text = st.default_prompt_text;
+        if (!body.contains("prompt_lang") && !st.default_prompt_lang.empty())
+            p.prompt_lang = st.default_prompt_lang;
+    }
     const std::string media_type = jstr(body, "media_type", "wav");
     const double t0 = now_s();
 
@@ -656,6 +734,68 @@ int main(int argc, char ** argv) {
         res.set_content(jerror(code, ec, msg).dump(), "application/json");
     };
 
+    // ---- reference management (api_v2 /change_refer, /set_refer_audio) ------
+    auto apply_refer = [&](const std::string & ref, const std::string & prompt,
+                           const std::string & lang, httplib::Response & res) {
+        if (ref.empty()) return jerr(res, 400, "bad_request", "refer_wav_path is required");
+        if (prompt.empty()) return jerr(res, 400, "bad_request", "prompt_text is required");
+        if (!path_allowed(ref))
+            return jerr(res, 403, "forbidden",
+                        "refer_wav_path is not under an allowed directory (see --allow-path)");
+        if (!fs::exists(ref))
+            return jerr(res, 400, "bad_request", "refer_wav_path does not exist");
+        const std::string pl = lang.empty() ? "zh" : lang;
+        {
+            std::lock_guard<std::mutex> lk(st.ref_mu);
+            st.default_ref_path = ref;
+            st.default_prompt_text = prompt;
+            st.default_prompt_lang = pl;
+        }
+        std::printf("[refer] default reference set: %s (prompt_lang=%s)\n", ref.c_str(), pl.c_str());
+        res.set_content(json{{"message", "ok"}, {"refer_wav_path", ref},
+                             {"prompt_text", prompt}, {"prompt_lang", pl}}.dump(),
+                        "application/json");
+    };
+
+    auto refer_params = [](const httplib::Request & req, httplib::Response & res, auto && apply) {
+        const std::string ref = req.has_param("refer_wav_path") ? req.get_param_value("refer_wav_path") : "";
+        const std::string pr = req.has_param("prompt_text") ? req.get_param_value("prompt_text") : "";
+        const std::string pl = req.has_param("prompt_lang") ? req.get_param_value("prompt_lang") : "";
+        apply(ref, pr, pl, res);
+    };
+
+    svr.Get("/change_refer", [&](const httplib::Request & req, httplib::Response & res) {
+        refer_params(req, res, apply_refer);
+    });
+    svr.Post("/change_refer", [&](const httplib::Request & req, httplib::Response & res) {
+        json b = json::object();
+        if (!req.body.empty()) { try { b = json::parse(req.body); } catch (...) {} }
+        auto pick = [&](const char * k) -> std::string {
+            if (b.contains(k) && b[k].is_string()) return b[k].get<std::string>();
+            if (req.has_param(k)) return req.get_param_value(k);
+            return "";
+        };
+        apply_refer(pick("refer_wav_path"), pick("prompt_text"), pick("prompt_lang"), res);
+    });
+
+    // ASR is not part of this engine (no recognizer); documented as 501.
+    auto asr_not_supported = [](const httplib::Request &, httplib::Response & res) {
+        res.status = 501;
+        res.set_content(jerror(501, "not_implemented",
+                               "ASR is not supported by gsv.cpp; run an external ASR service")
+                            .dump(),
+                        "application/json");
+    };
+    svr.Get("/asr", asr_not_supported);
+    svr.Post("/asr", asr_not_supported);
+
+    svr.Get("/openapi.json", [](const httplib::Request &, httplib::Response & res) {
+        res.set_content(openapi_json(), "application/json");
+    });
+    svr.Get("/docs", [](const httplib::Request &, httplib::Response & res) {
+        res.set_content(openapi_json(), "application/json");
+    });
+
     svr.Get("/health", [&](const httplib::Request &, httplib::Response & res) {
         size_t pending;
         { std::lock_guard<std::mutex> lk(qm); pending = queue.size(); }
@@ -728,9 +868,8 @@ int main(int argc, char ** argv) {
             res.set_content(json{{"voice", st.voice}, {"load_ms", ms}}.dump(), "application/json");
         });
     }
-    svr.Get("/set_refer_audio", [](const httplib::Request &, httplib::Response & res) {
-        res.set_content(json{{"message", "ok (pass ref_audio_path per /tts request)"}}.dump(),
-                        "application/json");
+    svr.Get("/set_refer_audio", [&](const httplib::Request & req, httplib::Response & res) {
+        refer_params(req, res, apply_refer);
     });
 
     svr.Get("/control", [&](const httplib::Request & req, httplib::Response & res) {
@@ -789,10 +928,97 @@ int main(int argc, char ** argv) {
         res.set_content(o.wav, "audio/wav");
     };
 
+    // ---- streaming: chunked WAV (header first, PCM per segment) --------------
+    auto wav_stream_header = []() {
+        std::string h;
+        const uint32_t sr = (uint32_t) kSampleRate;
+        h += "RIFF"; put_u32(h, 0xFFFFFFFFu);
+        h += "WAVEfmt "; put_u32(h, 16); put_u16(h, 1); put_u16(h, 1);
+        put_u32(h, sr); put_u32(h, sr * 2); put_u16(h, 2); put_u16(h, 16);
+        h += "data"; put_u32(h, 0xFFFFFFFFu);
+        return h;
+    };
+
+    auto handle_tts_stream = [&](const httplib::Request & req, httplib::Response & res, const json & body) {
+        std::string rid = req.get_header_value("X-Request-Id");
+        if (rid.empty()) rid = rlog.new_id();
+        res.set_header("X-Request-Id", rid);
+        res.set_header("Cache-Control", "no-store");
+        res.set_header("X-Accel-Buffering", "no");
+
+        SynthParams p;
+        parse_params(body, p);
+        {
+            std::lock_guard<std::mutex> lk(st.ref_mu);
+            if (p.ref_path.empty()) p.ref_path = st.default_ref_path;
+            if (p.prompt_text.empty()) p.prompt_text = st.default_prompt_text;
+            if (!body.contains("prompt_lang") && !st.default_prompt_lang.empty())
+                p.prompt_lang = st.default_prompt_lang;
+        }
+        const std::string media_type = jstr(body, "media_type", "wav");
+        if (p.text.empty()) return jerr(res, 400, "bad_request", "text is required");
+        if (p.ref_path.empty()) return jerr(res, 400, "bad_request", "ref_audio_path is required");
+        if (p.prompt_text.empty()) return jerr(res, 400, "bad_request", "prompt_text is required");
+        if (media_type != "wav") return jerr(res, 400, "bad_request", "only media_type=wav is supported");
+        if (p.speed <= 0.0 || p.speed > 4.0)
+            return jerr(res, 400, "bad_request", "speed_factor must be in (0, 4]");
+        if (!path_allowed(p.ref_path))
+            return jerr(res, 403, "forbidden",
+                        "ref_audio_path is not under an allowed directory (see --allow-path)");
+        if (!fs::exists(p.ref_path))
+            return jerr(res, 400, "bad_request", "ref_audio_path does not exist");
+        if (!p.voice.empty() && p.voice != st.voice) {
+            std::string err; double ms = 0;
+            if (!switch_voice(st, p.voice, err, ms)) return jerr(res, 500, "engine", err);
+        }
+        if (!st.mock_engine && !snapshot(st)) return jerr(res, 503, "engine", "engine not ready");
+        if (st.waiters.load() >= kMaxWaiters) {
+            st.n_busy++;
+            return jerr(res, 503, "busy", "server busy (too many waiting requests)");
+        }
+        st.n_tts++;
+        const double t0 = now_s();
+        auto sent = std::make_shared<std::atomic<bool>>(false);
+        res.set_chunked_content_provider("audio/wav",
+            [&, p, rid, t0, sent](size_t, httplib::DataSink & sink) -> bool {
+                if (sent->exchange(true)) { return false; }
+                st.waiters.fetch_add(1);
+                struct WaiterGuard {
+                    std::atomic<int> * w;
+                    ~WaiterGuard() { w->fetch_sub(1); }
+                } wg{ &st.waiters };
+                const std::string hdr = wav_stream_header();
+                if (!sink.write(hdr.data(), hdr.size())) return false;
+                SynthTiming tm;
+                std::string err;
+                const bool ok = svc::synth_text_stream_q(
+                    st, side, p,
+                    [&sink](const int16_t * pcm, size_t n) -> bool {
+                        return sink.write(reinterpret_cast<const char *>(pcm), n * sizeof(int16_t));
+                    },
+                    tm, err);
+                const double total_ms = (now_s() - t0) * 1000;
+                if (ok) {
+                    st.last_total_ms = total_ms;
+                    std::printf("[tts-stream %s] voice=%s segs=%d phones=%d | g2p %.0f prep %.0f "
+                                "bert %.0f ar %.0f synth %.0f | total %.0f ms\n",
+                                rid.c_str(), st.voice.c_str(), tm.segments, tm.phones, tm.g2p_ms,
+                                tm.prep_ms, tm.bert_ms, tm.ar_ms, tm.synth_ms, total_ms);
+                } else {
+                    st.n_errors++;
+                    std::printf("[tts-stream %s] error: %s (after %.0f ms)\n", rid.c_str(),
+                                err.c_str(), total_ms);
+                }
+                sink.done();
+                return true;
+            });
+    };
+
     svr.Post("/tts", [&](const httplib::Request & req, httplib::Response & res) {
         json body;
         try { body = json::parse(req.body); }
         catch (const std::exception & e) { return jerr(res, 400, "bad_request", std::string("bad json: ") + e.what()); }
+        if (jbool(body, "stream", false)) return handle_tts_stream(req, res, body);
         handle_tts(req, res, body);
     });
 
@@ -802,9 +1028,10 @@ int main(int argc, char ** argv) {
                                       "seed", "top_k", "top_p", "temperature", "repetition_penalty",
                                       "fragment_interval", "max_steps", "early_stop", "speed_factor", "skip_first_step",
                                       "dbcache", "dbcache_fn", "dbcache_threshold", "dbcache_warmup",
-                                      "dbcache_downsample"};
+                                      "dbcache_downsample", "stream"};
         json body = json::object();
         for (const char * k : keys) if (req.has_param(k)) body[k] = req.get_param_value(k);
+        if (jbool(body, "stream", false)) return handle_tts_stream(req, res, body);
         handle_tts(req, res, body);
     });
 
