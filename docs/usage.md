@@ -19,6 +19,8 @@ the Releases page once published).
 Runtime requirements:
 
 - A Vulkan 1.2+ driver. CPU-only works too: `--device cpu`.
+- x86-64 with AVX2 for the CPU backend (the published Windows/Linux builds are compiled with
+  an AVX2 baseline rather than `-march=native`, so they run on any AVX2 CPU).
 - Python 3.10+ for the text sidecar (`tools/text_sidecar.py`).
 
 ## 2. Get models
