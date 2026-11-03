@@ -131,7 +131,7 @@ jobs:
       - name: conv_direct activation test (CPU)
         shell: bash
         run: |
-          if [ "" = "Windows" ]; then
+          if [ "$RUNNER_OS" = "Windows" ]; then
             ./build/Release/test_conv_direct_act.exe --cpu
           else
             ./build/test_conv_direct_act --cpu
