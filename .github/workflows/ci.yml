@@ -25,6 +25,7 @@ jobs:
           python -m py_compile frontend/frontend.py frontend/gsv_bert_tokenizer.py frontend/sync_frontend.py
           python -m py_compile tools/export_gguf/export.py
           python -m py_compile tools/export_resampy_filter.py
+          python -m py_compile scripts/package_windows.py
           python -c "import sys; sys.path.insert(0, 'frontend'); import gsv_bert_tokenizer"
 
       - name: License files present
