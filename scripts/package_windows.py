@@ -38,7 +38,7 @@ GAG_REQS = ["PyQt5", "pyqtdarktheme", "psutil", "requests", "sounddevice", "soun
 FRONTEND_ZH = ["numpy>=1.26", "onnxruntime>=1.20", "pypinyin", "jieba_fast", "cn2an", "OpenCC", "nltk"]
 # best effort; failures are reported but do not abort the build
 FRONTEND_EXTRA = ["g2p_en", "inflect", "wordsegment", "jieba", "fast-langdetect>=0.3.1",
-                  "split-lang", "pyopenjtalk>=0.4.1", "ToJyutping", "jamo"]
+                  "split-lang", "pyopenjtalk>=0.4.1", "ToJyutping", "jamo", "g2pk2", "ko_pron", "python-mecab-ko"]
 
 
 def log(msg):
