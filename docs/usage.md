@@ -19,8 +19,13 @@ the Releases page once published).
 Runtime requirements:
 
 - A Vulkan 1.2+ driver. CPU-only works too: `--device cpu`.
+- The Vulkan backend needs a device with >= 32 KB compute shared memory and working f16 matmul
+  pipelines. Some newer/experimental drivers (e.g. Moore Threads MUSA on the MTT S70: 16 KB
+  shared memory, `createComputePipeline` fails for `matmul_f16_f32_f16acc`) cannot run it; use
+  `--device cpu` there.
 - x86-64 with AVX2 for the CPU backend (the published Windows/Linux builds are compiled with
   an AVX2 baseline rather than `-march=native`, so they run on any AVX2 CPU).
+- Linux binaries are built on Ubuntu 22.04 (glibc 2.35+).
 - Python 3.10+ for the text sidecar (`tools/text_sidecar.py`).
 
 ## 2. Get models
