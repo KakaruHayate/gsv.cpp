@@ -84,3 +84,13 @@ Windows, Xeon E5-2675 v3 (16 cores / 32 threads, 1.8 GHz), turbo-q8, 4 steps, 3.
 
 DiT is memory-bound in this configuration and does not improve past 8 threads; the win is in the
 AR/cond/vocoder stages. --threads N overrides the default.
+
+## What is not parallelised
+
+- **Pipeline overlap** (AR of segment i+1 while DiT/vocoder runs segment i) is not implemented:
+  ggml exposes a single backend queue, so both stages would serialize on the device anyway, and
+  on CPU they compete for the same cores. Batches are formed *across* requests instead
+  (/batch, AR batcher, request scheduler).
+- **Larger conv tiles** in conv_direct_1d were not beneficial: the kernel already uses 6-wide
+  time blocks x 16-wide output blocks, and DiT (the dominant CPU stage) is memory-bound, so
+  thread count beyond 8 did not move it.
