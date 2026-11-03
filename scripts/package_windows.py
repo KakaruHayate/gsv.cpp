@@ -118,6 +118,17 @@ def clean_pycache(root, keep_substr=("site-packages",)):
     log("removed %d pycache entries" % removed)
 
 
+def remove_legacy_dirs(root):
+    """Drop the v1-v4 weight folders that upstream GAG creates: gsv.cpp keeps its GGUF models
+    under runtime/models, and the GUI no longer watches those directories."""
+    for name in os.listdir(root):
+        if name.startswith(("GPT_weights", "SoVITS_weights")):
+            path = os.path.join(root, name)
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+                log("removed legacy dir " + name)
+
+
 def precompile_site_packages(py_dir):
     """Regenerate bytecode for the installed packages (first launch stays fast)."""
     site = os.path.join(py_dir, "Lib", "site-packages")
@@ -215,6 +226,7 @@ def main():
         pip_install(site, FRONTEND_EXTRA)
 
     copy_crt(py_dir, gsv_dir)
+    remove_legacy_dirs(out)
     clean_pycache(out)
     precompile_site_packages(py_dir)
     # 6. launcher, config, readme
