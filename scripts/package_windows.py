@@ -53,19 +53,21 @@ def copytree(src, dst, ignore=None):
 
 def ensure_python(runtime_python, cache_dir):
     py = os.path.join(runtime_python, "python.exe")
-    if os.path.exists(py):
-        return
-    os.makedirs(runtime_python, exist_ok=True)
-    os.makedirs(cache_dir, exist_ok=True)
-    zpath = os.path.join(cache_dir, "python-3.10.11-embed-amd64.zip")
-    if not os.path.exists(zpath):
-        log("downloading %s" % PY_EMBED_URL)
-        urllib.request.urlretrieve(PY_EMBED_URL, zpath)
-    with zipfile.ZipFile(zpath) as z:
-        z.extractall(runtime_python)
+    if not os.path.exists(py):
+        os.makedirs(runtime_python, exist_ok=True)
+        os.makedirs(cache_dir, exist_ok=True)
+        zpath = os.path.join(cache_dir, "python-3.10.11-embed-amd64.zip")
+        if not os.path.exists(zpath):
+            log("downloading %s" % PY_EMBED_URL)
+            urllib.request.urlretrieve(PY_EMBED_URL, zpath)
+        with zipfile.ZipFile(zpath) as z:
+            z.extractall(runtime_python)
+    # A ._pth file puts Python in isolated mode: the script directory is NOT added to sys.path,
+    # so the package root (gsv_api_gui.py, GAG_tools/) and runtime/ have to be listed here.
+    # Rewritten unconditionally so an existing embedded Python picks up the fix too.
     pth = os.path.join(runtime_python, "python310._pth")
     with open(pth, "w", encoding="utf-8") as f:
-        f.write("python310.zip\n.\nLib\\site-packages\nimport site\n")
+        f.write("python310.zip\n.\nLib\\site-packages\n..\n..\\..\nimport site\n")
     log("embeddable python ready")
 
 
@@ -217,9 +219,19 @@ def main():
     precompile_site_packages(py_dir)
     # 6. launcher, config, readme
     bat = os.path.join(out, "Start GAG.bat")
-    with open(bat, "w", encoding="utf-8", newline="\r\n") as f:
-        f.write("@echo off\r\nchcp 65001 >nul\r\ncd /d \"%~dp0\"\r\n")
-        f.write("start \"\" \"runtime\\python\\python.exe\" gsv_api_gui.py\r\n")
+    with open(bat, "w", encoding="utf-8", newline="") as f:
+        f.write("@echo off\r\n")
+        f.write("chcp 65001 >nul\r\n")
+        f.write("cd /d \"%~dp0\"\r\n")
+        f.write("echo Starting GAG (gsv.cpp backend)...\r\n")
+        # Run in this console (not via `start`) so a traceback stays visible instead of the
+        # window flashing and closing.
+        f.write("\"runtime\\python\\python.exe\" gsv_api_gui.py\r\n")
+        f.write("if errorlevel 1 (\r\n")
+        f.write("  echo.\r\n")
+        f.write("  echo GAG exited with an error. See the messages above.\r\n")
+        f.write("  pause\r\n")
+        f.write(")\r\n")
     cfg = os.path.join(out, "GAG_config.json")
     import json
     cfg_data = {
