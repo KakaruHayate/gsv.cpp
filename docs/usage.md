@@ -37,12 +37,12 @@ Converted models are published at **<https://huggingface.co/KakaruHayate/GSV.CPP
 | `gsv-v5dev-refcode.gguf` | reference encoder | v5dev |
 | `gsv-bert-f16.gguf` | BERT (Chinese RoBERTa) | shared |
 | `gsv-hubert-f16.gguf` | CN-HuBERT | shared |
-| `gsv-vocoder-f32.gguf` | HiFi-GAN vocoder (48 kHz, ggml, sub-pixel) | shared, v0.1.2+ |
+| `gsv-vocoder-f32.gguf` | HiFi-GAN vocoder (48 kHz, ggml, sub-pixel) | shared |
 | `resampy_kaiser_best.bin` | resampling filter table | shared |
 
-The vocoder is a GGUF file now: the ONNX vocoder (`vocoder_fp32.onnx`) is no longer published
-or supported. `gsv-vocoder-f32.gguf` uses the sub-pixel layout introduced in **v0.1.2**
-(phase-major `voc.upsub.*` tensors); v0.1.1 and earlier expect `voc.ups.*` and cannot load it.
+The vocoder is a GGUF file: the ONNX vocoder (`vocoder_fp32.onnx`) is no longer supported.
+`gsv-vocoder-f32.gguf` uses the sub-pixel layout (phase-major `voc.upsub.*` tensors); older
+exports with `voc.ups.*` tensors cannot be loaded.
 
 AR is published in two precisions; pick one (q8 is the default choice). The v5dev files are
 only needed if you want the 32-step model. All files go into the model directory:

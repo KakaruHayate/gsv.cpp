@@ -2,7 +2,7 @@
 
 Full pipeline (frontend → AR → cond → DiT → vocoder), same text / reference audio / seed.
 Times in milliseconds, median of three warm runs (rows 2–6). Rows 2–6 were re-measured on
-2026-11-03 with the v0.1.2 build (ggml-only F32 HiFi-GAN vocoder with sub-pixel upsampling,
+2026-11-03 with the current development build (ggml-only F32 HiFi-GAN vocoder with sub-pixel upsampling,
 RoPE/adaLN/mish fusion included); rows 1 and 4 are the unchanged torch reference.
 
 | # | configuration | total | G2P/frontend | cond | AR | DiT | vocoder | cache |

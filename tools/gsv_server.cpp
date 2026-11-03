@@ -52,7 +52,7 @@
 
 #include "ggml-backend.h"
 
-#define GSV_VERSION "0.1.3"
+#define GSV_VERSION "0.1.0"
 
 #include "svc_core.h"
 
