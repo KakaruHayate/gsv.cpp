@@ -30,3 +30,6 @@ tests/e2e_out/
 
 # vendored frontend data (G2PW onnx lives on HF)
 frontend/GPT_SoVITS/text/G2PWModel/
+
+# packaging output
+dist/
