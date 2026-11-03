@@ -236,7 +236,53 @@ inline std::vector<std::string> split_text(const std::string & text, const std::
     return bounded;
 }
 
-// ---------------------------------------------------------------- security
+// 流式切分：按标点切成更小的段（>= min_chars 就发一段），以便尽快出第一块音频。
+// cut0 表示不切。超过 max_chars 的段按字符硬切。
+inline std::vector<std::string> split_text_stream(const std::string & text,
+                                                  const std::string & method,
+                                                  size_t min_chars = 4, size_t max_chars = 60) {
+    std::vector<std::string> out;
+    if (text.empty() || method == "cut0") { out.push_back(text); return out; }
+
+    std::vector<std::string> raw;
+    std::string cur;
+    for (size_t i = 0; i < text.size();) {
+        const unsigned char c = (unsigned char) text[i];
+        const size_t len = (c < 0x80) ? 1 : ((c >> 5) == 6) ? 2 : ((c >> 4) == 14) ? 3 : 4;
+        cur += text.substr(i, len);
+        i += len;
+        if (is_punct(cur.substr(cur.size() - len))) { raw.push_back(cur); cur.clear(); }
+    }
+    if (!cur.empty()) raw.push_back(cur);
+
+    std::string acc;
+    auto flush = [&]() {
+        if (!acc.empty()) { out.push_back(acc); acc.clear(); }
+    };
+    for (const auto & s : raw) {
+        // 单段本身超长：先 flush，再按 max_chars 硬切
+        if (utf8_len(s) > max_chars) {
+            flush();
+            std::string piece;
+            for (size_t i = 0; i < s.size();) {
+                const unsigned char c = (unsigned char) s[i];
+                const size_t len = (c < 0x80) ? 1 : ((c >> 5) == 6) ? 2 : ((c >> 4) == 14) ? 3 : 4;
+                piece += s.substr(i, len);
+                i += len;
+                if (utf8_len(piece) >= max_chars) { out.push_back(piece); piece.clear(); }
+            }
+            if (!piece.empty()) out.push_back(piece);
+            continue;
+        }
+        acc += s;
+        if (utf8_len(acc) >= min_chars) flush();
+    }
+    flush();
+    if (out.empty()) out.push_back(text);
+    return out;
+}
+
+
 inline std::string g_token;                 // 空 = 不校验（仅限 loopback）
 inline std::vector<std::string> g_allow;    // 允许访问的目录（绝对路径）
 
@@ -1273,7 +1319,7 @@ using stream_pcm_fn = std::function<bool(const int16_t * pcm, size_t n)>;
 
 inline bool synth_text_stream_q(State & st, const SidecarCfg & side, const SynthParams & p,
                                 const stream_pcm_fn & sink, SynthTiming & tm, std::string & err) {
-    const auto segs = split_text(p.text, p.split_method);
+    const auto segs = split_text_stream(p.text, p.split_method);
     tm.segments = (int) segs.size();
     std::shared_ptr<const RefPrep> ref;
     std::shared_ptr<const PromptPrep> prm;

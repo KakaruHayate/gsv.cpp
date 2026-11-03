@@ -286,6 +286,46 @@ bool perform_synth(State & st, const SidecarCfg & side, const SynthParams & p, s
     return ok;
 }
 
+// 请求参数校验（/tts 与流式共用）：返回非 0 code 时直接作为错误响应。
+struct ParamError {
+    int code = 0;
+    std::string ec, msg;
+    bool ok() const { return code == 0; }
+};
+
+ParamError validate_tts_params(const SynthParams & p, const std::string & media_type) {
+    ParamError e;
+    constexpr size_t kMaxText = 4000;      // ~ utf8 bytes; longer requests should be split
+    auto fail = [&](int code, const char * ec, const char * msg) {
+        e.code = code;
+        e.ec = ec;
+        e.msg = msg;
+        return e;
+    };
+    if (p.text.empty()) return fail(400, "bad_request", "text is required");
+    if (p.text.size() > kMaxText) return fail(400, "bad_request", "text too long (> 4000 bytes); use /batch or split it");
+    if (p.ref_path.empty()) return fail(400, "bad_request", "ref_audio_path is required");
+    if (p.prompt_text.empty())
+        return fail(400, "bad_request",
+                    "prompt_text is required (V3/V4/V5 do not support reference-text-free mode)");
+    if (p.prompt_text.size() > kMaxText) return fail(400, "bad_request", "prompt_text too long (> 4000 bytes)");
+    if (media_type != "wav") return fail(400, "bad_request", "only media_type=wav is supported");
+    if (p.speed <= 0.0 || p.speed > 4.0) return fail(400, "bad_request", "speed_factor must be in (0, 4]");
+    if (p.steps != -1 && (p.steps < 1 || p.steps > 1000))
+        return fail(400, "bad_request", "sample_steps must be 1..1000 (or -1 for the voice default)");
+    if (p.cfg >= 0.0 && p.cfg > 20.0) return fail(400, "bad_request", "cfg_rate must be <= 20");
+    if (p.fragment_interval < 0.0f || p.fragment_interval > 5.0f)
+        return fail(400, "bad_request", "fragment_interval must be in [0, 5]");
+    if (!path_allowed(p.ref_path))
+        return fail(403, "forbidden",
+                    "ref_audio_path is not under an allowed directory (see --allow-path)");
+    {
+        std::error_code ec;
+        if (!fs::exists(p.ref_path, ec) || ec) return fail(400, "bad_request", "ref_audio_path does not exist");
+    }
+    return e;
+}
+
 TtsOutcome run_tts(State & st, const SidecarCfg & side, ReqLog & rlog, const json & body,
                    const std::string & rid) {
     TtsOutcome o;
@@ -302,26 +342,11 @@ TtsOutcome run_tts(State & st, const SidecarCfg & side, ReqLog & rlog, const jso
     const std::string media_type = jstr(body, "media_type", "wav");
     const double t0 = now_s();
 
-    if (p.text.empty()) { o.code = 400; o.error_code = "bad_request"; o.message = "text is required"; return o; }
-    if (p.ref_path.empty()) { o.code = 400; o.error_code = "bad_request"; o.message = "ref_audio_path is required"; return o; }
-    if (p.prompt_text.empty()) {
-        o.code = 400;
-        o.error_code = "bad_request";
-        o.message = "prompt_text is required (V3/V4/V5 do not support reference-text-free mode)";
-        return o;
-    }
-    if (media_type != "wav") {
-        o.code = 400; o.error_code = "bad_request"; o.message = "only media_type=wav is supported";
-        return o;
-    }
-    if (p.speed <= 0.0 || p.speed > 4.0) {
-        o.code = 400; o.error_code = "bad_request"; o.message = "speed_factor must be in (0, 4]";
-        return o;
-    }
-    if (!path_allowed(p.ref_path)) {
-        o.code = 403;
-        o.error_code = "forbidden";
-        o.message = "ref_audio_path is not under an allowed directory (see --allow-path)";
+    const ParamError pe = validate_tts_params(p, media_type);
+    if (!pe.ok()) {
+        o.code = pe.code;
+        o.error_code = pe.ec;
+        o.message = pe.msg;
         return o;
     }
 
@@ -329,7 +354,16 @@ TtsOutcome run_tts(State & st, const SidecarCfg & side, ReqLog & rlog, const jso
     std::vector<float> wav;
     SynthTiming tm;
     std::string err, ec;
-    const bool ok = perform_synth(st, side, p, wav, tm, err, ec);
+    bool ok = false;
+    try {
+        ok = perform_synth(st, side, p, wav, tm, err, ec);
+    } catch (const std::bad_alloc &) {
+        ec = "busy";
+        err = "out of memory while synthesizing";
+    } catch (const std::exception & e) {
+        ec = "internal";
+        err = std::string("exception: ") + e.what();
+    }
     const double total_ms = (now_s() - t0) * 1000;
 
     if (!ok) {
@@ -956,17 +990,10 @@ int main(int argc, char ** argv) {
                 p.prompt_lang = st.default_prompt_lang;
         }
         const std::string media_type = jstr(body, "media_type", "wav");
-        if (p.text.empty()) return jerr(res, 400, "bad_request", "text is required");
-        if (p.ref_path.empty()) return jerr(res, 400, "bad_request", "ref_audio_path is required");
-        if (p.prompt_text.empty()) return jerr(res, 400, "bad_request", "prompt_text is required");
-        if (media_type != "wav") return jerr(res, 400, "bad_request", "only media_type=wav is supported");
-        if (p.speed <= 0.0 || p.speed > 4.0)
-            return jerr(res, 400, "bad_request", "speed_factor must be in (0, 4]");
-        if (!path_allowed(p.ref_path))
-            return jerr(res, 403, "forbidden",
-                        "ref_audio_path is not under an allowed directory (see --allow-path)");
-        if (!fs::exists(p.ref_path))
-            return jerr(res, 400, "bad_request", "ref_audio_path does not exist");
+        {
+            const ParamError pe = validate_tts_params(p, media_type);
+            if (!pe.ok()) return jerr(res, pe.code, pe.ec, pe.msg);
+        }
         if (!p.voice.empty() && p.voice != st.voice) {
             std::string err; double ms = 0;
             if (!switch_voice(st, p.voice, err, ms)) return jerr(res, 500, "engine", err);
@@ -987,16 +1014,23 @@ int main(int argc, char ** argv) {
                     std::atomic<int> * w;
                     ~WaiterGuard() { w->fetch_sub(1); }
                 } wg{ &st.waiters };
-                const std::string hdr = wav_stream_header();
-                if (!sink.write(hdr.data(), hdr.size())) return false;
                 SynthTiming tm;
                 std::string err;
-                const bool ok = svc::synth_text_stream_q(
-                    st, side, p,
-                    [&sink](const int16_t * pcm, size_t n) -> bool {
-                        return sink.write(reinterpret_cast<const char *>(pcm), n * sizeof(int16_t));
-                    },
-                    tm, err);
+                bool ok = false;
+                try {
+                    const std::string hdr = wav_stream_header();
+                    if (!sink.write(hdr.data(), hdr.size())) return false;
+                    ok = svc::synth_text_stream_q(
+                        st, side, p,
+                        [&sink](const int16_t * pcm, size_t n) -> bool {
+                            return sink.write(reinterpret_cast<const char *>(pcm), n * sizeof(int16_t));
+                        },
+                        tm, err);
+                } catch (const std::bad_alloc &) {
+                    err = "out of memory while streaming";
+                } catch (const std::exception & e) {
+                    err = std::string("exception: ") + e.what();
+                }
                 const double total_ms = (now_s() - t0) * 1000;
                 if (ok) {
                     st.last_total_ms = total_ms;
