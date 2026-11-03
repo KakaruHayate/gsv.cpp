@@ -233,8 +233,8 @@ bool gsv_vocoder_ggml::forward(const float * mel, int T, std::vector<float> & wa
         x = sum;
     }
     if (x) {
-        x = s.conv_same(ctx, "voc.conv_post", x, 1, 0.0f, mean_scale, 0.01f);
-        x = ggml_tanh(ctx, x);
+        // conv_post folds tanh into the conv epilogue (slope < 0 selects tanh)
+        x = s.conv_same(ctx, "voc.conv_post", x, 1, -1.0f, mean_scale, 0.01f);
         ggml_set_output(x);
     }
     if (!x) { ggml_free(ctx); return false; }
