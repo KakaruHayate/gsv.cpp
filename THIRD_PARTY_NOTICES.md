@@ -1,7 +1,7 @@
 # Third-party notices
 
 This project is MIT licensed (see [LICENSE](LICENSE)). It builds on, links against or
-redistributes headers from the following projects:
+redistributes code and data from the following projects:
 
 | component | license | where |
 |---|---|---|
@@ -10,11 +10,12 @@ redistributes headers from the following projects:
 | [nlohmann/json](https://github.com/nlohmann/json) | MIT | `third_party/nlohmann/json.hpp`, `third_party/nlohmann/LICENSE.MIT` |
 | [pocketfft](https://gitlab.mpcdf.mpg.de/mtr/pocketfft) | BSD-3-Clause | `third_party/pocketfft_hdronly.h` |
 | [xxHash](https://github.com/Cyan4973/xxHash) | BSD-2-Clause | `third_party/xxhash/xxhash.h` |
-| [GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS) | MIT | model weights derived from its checkpoints; see `licenses/GPT-SoVITS-LICENSE.txt` |
+| [GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS) | MIT | vendored text frontend (`frontend/GPT_SoVITS/text`); model weights derived from its checkpoints; see `licenses/GPT-SoVITS-LICENSE.txt` |
+| [G2PW](https://github.com/GitYCC/g2pW) | Apache-2.0 | `frontend/GPT_SoVITS/text/g2pw/` (vendored) and the `g2pW.onnx` model distributed separately; see `licenses/G2PW-LICENSE.txt` |
 
 Model weights published at <https://huggingface.co/KakaruHayate/GSV.CPP> are conversions of
 GPT-SoVITS pretrained/fine-tuned checkpoints and remain under the upstream project's license.
 
-The text frontend under rontend/ is a vendored copy of GPT-SoVITS's GPT_SoVITS/text
-(MIT). Its G2PW components (	ext/g2pw/, and the g2pW.onnx model distributed separately on
+The text frontend under `frontend/` is a vendored copy of GPT-SoVITS's `GPT_SoVITS/text`
+(MIT). Its G2PW components (`text/g2pw/`, and the `g2pW.onnx` model distributed separately on
 Hugging Face) come from the G2PW project and are Apache-2.0 licensed.
