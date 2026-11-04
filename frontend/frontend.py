@@ -176,19 +176,21 @@ class Frontend:
         return ids
 
     def _auto(self, text):
-        """分段处理再拼接 —— 与 repo get_phones_and_bert 的 auto 分支同构。"""
+        """分段处理再拼接 —— 与 repo get_phones_and_bert 的 auto 分支同构。
+
+        Upstream keeps one segment per detected language in the auto branch (no merging); the
+        merge seen in the 'else' branch is for explicit single-language modes. Merging here
+        folded a Korean run into the preceding Japanese one and dropped the hangul.
+        """
         from text.LangSegmenter import LangSegmenter
-        segs = []
-        for tmp in LangSegmenter.getTexts(text):
-            l = tmp["lang"]
-            if segs and ((l == "en") == (segs[-1][0] == "en")):
-                segs[-1] = (segs[-1][0], segs[-1][1] + tmp["text"])
-            else:
-                segs.append((l, tmp["text"]))
+        segs = [(tmp["lang"], tmp["text"]) for tmp in LangSegmenter.getTexts(text)]
         all_ids, all_w2p, norm_parts = [], [], []
         bert_segs = []
         for l, t in segs:
-            lang = l if l == "en" else "zh"      # repo: 无法区分中日韩汉字, 以用户输入为准
+            # Use the detected language as-is: mapping ja/ko back to zh silently dropped kana
+            # and hangul (they produced no phones). Languages the text layer does not know fall
+            # back to zh so nothing disappears.
+            lang = l if l in ("zh", "en", "ja", "ko", "yue") else "zh"
             phones, word2ph, norm_text = self._one(t, lang)
             start = len(all_ids)
             all_ids += _text_mods["to_seq"](phones, os.environ.get("version", "v2"))
