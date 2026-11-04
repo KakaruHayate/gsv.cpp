@@ -306,6 +306,7 @@ inline bool path_allowed(const std::string & p) {
     if (p.empty()) return true;
     const std::string c = canon_path(p);
     for (const auto & a : g_allow) {
+        if (a == "*" || a == "all") return true;   // --allow-path '*' = no restriction
         const std::string ca = canon_path(a);
         if (c == ca) return true;
         if (c.size() > ca.size() && c.compare(0, ca.size(), ca) == 0 &&

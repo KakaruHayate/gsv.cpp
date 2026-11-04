@@ -462,6 +462,7 @@ int main(int argc, char ** argv) {
         else if (a == "-h" || a == "--help") {
             std::printf("usage: gsv_server [--models DIR] [--device cpu|vulkan|vulkan:N|N]\n"
                         "                  [--host 127.0.0.1] [--port 9880] [--sidecar 127.0.0.1:9882]\n"
+                        "                  [--allow-path DIR]...  ('*' = allow every directory)\n"
                         "                  [--log-dir logs] [--threads N] [--verbose] [--list-devices] [--version]\n");
             return 0;
         } else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }

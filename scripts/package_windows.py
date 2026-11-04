@@ -247,7 +247,7 @@ def main():
         "device": "vulkan",
         "sidecar_python": "runtime/python/python.exe",
         "sidecar_data_dir": "runtime/models/frontend",
-        "allow_dirs": "runtime/models",
+        "allow_dirs": "",
         "autostart_api": True,
         "language": "auto",
     }
