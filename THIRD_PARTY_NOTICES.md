@@ -12,6 +12,7 @@ redistributes code and data from the following projects:
 | [xxHash](https://github.com/Cyan4973/xxHash) | BSD-2-Clause | `third_party/xxhash/xxhash.h` |
 | [GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS) | MIT | vendored text frontend (`frontend/GPT_SoVITS/text`); model weights derived from its checkpoints; see `licenses/GPT-SoVITS-LICENSE.txt` |
 | [G2PW](https://github.com/GitYCC/g2pW) | Apache-2.0 | `frontend/GPT_SoVITS/text/g2pw/` (vendored) and the `g2pW.onnx` model distributed separately; see `licenses/G2PW-LICENSE.txt` |
+| [GAG - GPT-SoVITS-Api-GUI](https://github.com/AliceNavigator/GPT-SoVITS-Api-GUI) | MIT | GUI bundled in the Windows one-click package (modified fork: https://github.com/KakaruHayate/GPT-SoVITS-Api-GUI); see `licenses/GAG-LICENSE.txt` |
 
 Model weights published at <https://huggingface.co/KakaruHayate/GSV.CPP> are conversions of
 GPT-SoVITS pretrained/fine-tuned checkpoints and remain under the upstream project's license.
