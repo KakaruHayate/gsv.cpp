@@ -507,10 +507,11 @@ if (!dev) { fprintf(stderr, "[gsv_ar] no usable backend device"); delete m; retu
             const char * desc = ggml_backend_dev_description(dev);
             const bool nvidia = desc && (strstr(desc, "NVIDIA") || strstr(desc, "GeForce") ||
                                          strstr(desc, "Quadro") || strstr(desc, "Tesla"));
-            if (nvidia) {
-                fprintf(stderr, "[gsv_ar] warning: Vulkan coopmat2 is not disabled; AR logits precision "
-                                "drops (delta 0.0035 -> 0.0201). Set GGML_VK_DISABLE_COOPMAT2=1 before "
-                                "launching the process\n");
+            if (nvidia && cfg.verbose) {
+                // Kept for --verbose only: coopmat2 is on by default and the precision impact is
+                // accepted (our torch comparisons ran with it enabled too).
+                fprintf(stderr, "[gsv_ar] note: Vulkan coopmat2 enabled; AR logits delta 0.0035 -> "
+                                "0.0201 (set GGML_VK_DISABLE_COOPMAT2=1 to disable)\n");
             }
         }
     }
