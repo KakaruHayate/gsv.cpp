@@ -216,6 +216,9 @@ def main():
             # keep it next to g2pw/bert_tokenizer so GAG's Frontend data dir finds it
             copytree(nltk_src, os.path.join(data, "nltk_data"))
             copytree(nltk_src, os.path.join(models, "nltk_data"))
+        fl_src = os.path.join(GSV, "models", "frontend", "fast_langdetect")
+        if os.path.isdir(fl_src):
+            copytree(fl_src, os.path.join(data, "fast_langdetect"))
         log("models copied")
 
     # 5. embeddable python + deps

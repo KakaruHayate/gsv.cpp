@@ -8,7 +8,10 @@ jieba.setLogLevel(logging.CRITICAL)
 # 更改fast_langdetect大模型位置
 from pathlib import Path
 import fast_langdetect
-fast_langdetect.infer._default_detector = fast_langdetect.infer.LangDetector(fast_langdetect.infer.LangDetectConfig(cache_dir=Path(__file__).parent.parent.parent / "pretrained_models" / "fast_langdetect"))
+import os as _gsv_os
+_gsv_fl = _gsv_os.environ.get("GSV_FAST_LANGDETECT", "")
+_gsv_fl_dir = Path(_gsv_fl) if _gsv_fl else (Path(__file__).parent.parent.parent / "pretrained_models" / "fast_langdetect")
+fast_langdetect.infer._default_detector = fast_langdetect.infer.LangDetector(fast_langdetect.infer.LangDetectConfig(cache_dir=_gsv_fl_dir))
 
 
 from split_lang import LangSplitter
