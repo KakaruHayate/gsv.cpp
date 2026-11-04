@@ -35,7 +35,9 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -436,6 +438,7 @@ int main(int argc, char ** argv) {
     SidecarCfg side;
     std::string log_dir = "logs";
     bool verbose = false;
+    int parent_pid = 0;   // exit when this process disappears (GUI closed / crashed)
     bool list_devices = false;
     double job_ttl_arg = 3600.0;
     State st;
@@ -458,6 +461,7 @@ int main(int argc, char ** argv) {
         else if (a == "--token") g_token = next("--token");
         else if (a == "--allow-path") g_allow.push_back(next("--allow-path"));
         else if (a == "--job-ttl") job_ttl_arg = std::atof(next("--job-ttl").c_str());
+        else if (a == "--parent-pid") parent_pid = std::atoi(next("--parent-pid").c_str());
         else if (a == "--list-devices") list_devices = true;
         else if (a == "--version") { std::printf("gsv_server %s\n", GSV_VERSION); return 0; }
         else if (a == "--mock-engine") st.mock_engine = true;
@@ -470,6 +474,33 @@ int main(int argc, char ** argv) {
                         "                  [--log-dir logs] [--threads N] [--verbose] [--list-devices] [--version]\n");
             return 0;
         } else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
+    }
+    // Watchdog: the GUI passes --parent-pid. If it disappears (normal close, crash or a force
+    // kill that bypassed the job object), exit so the GPU/VRAM is released.
+    if (parent_pid > 0) {
+        std::thread([parent_pid]() {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+#ifdef _WIN32
+                HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, (DWORD) parent_pid);
+                if (!h) {
+                    std::printf("[gsv_server] parent %d is gone, exiting\n", parent_pid);
+                    std::_Exit(0);
+                }
+                const DWORD w = WaitForSingleObject(h, 0);
+                CloseHandle(h);
+                if (w == WAIT_OBJECT_0) {
+                    std::printf("[gsv_server] parent %d exited, shutting down\n", parent_pid);
+                    std::_Exit(0);
+                }
+#else
+                if (kill(parent_pid, 0) != 0) {
+                    std::printf("[gsv_server] parent %d is gone, exiting\n", parent_pid);
+                    std::_Exit(0);
+                }
+#endif
+            }
+        }).detach();
     }
     // CPU thread default: physical cores when SMT is present (hyperthreads add spin contention
     // in ggml's barrier); --threads overrides it.

@@ -120,11 +120,40 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"message": "%s: %s" % (type(e).__name__, e)})
 
 
+def _watch_parent(pid):
+    """Exit when the owning process disappears (GUI closed / crashed), so nothing lingers."""
+    if not pid:
+        return
+
+    def loop():
+        while True:
+            time.sleep(2.0)
+            try:
+                if os.name == "nt":
+                    import ctypes
+                    h = ctypes.windll.kernel32.OpenProcess(0x00100000, False, int(pid))  # SYNCHRONIZE
+                    if not h:
+                        break
+                    w = ctypes.windll.kernel32.WaitForSingleObject(h, 0)
+                    ctypes.windll.kernel32.CloseHandle(h)
+                    if w == 0:
+                        break
+                else:
+                    os.kill(int(pid), 0)
+            except Exception:
+                break
+        os._exit(0)
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=9882)
+    ap.add_argument("--parent-pid", type=int, default=0)
     args = ap.parse_args()
+    _watch_parent(args.parent_pid)
 
     # 先监听、再在后台预热：C++ 服务可以同时启动，/health 立即可用，
     # /g2p 会等 _ready（首次请求最多等预热完成）。
