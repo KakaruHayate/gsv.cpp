@@ -213,6 +213,8 @@ def main():
             shutil.copy2(os.path.join(bt, f), os.path.join(data, "bert_tokenizer", f))
         nltk_src = os.path.join(GSV, ".nltk_data")
         if os.path.isdir(nltk_src):
+            # keep it next to g2pw/bert_tokenizer so GAG's Frontend data dir finds it
+            copytree(nltk_src, os.path.join(data, "nltk_data"))
             copytree(nltk_src, os.path.join(models, "nltk_data"))
         log("models copied")
 
