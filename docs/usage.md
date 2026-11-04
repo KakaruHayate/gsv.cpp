@@ -117,7 +117,7 @@ python tools/export_gguf/export.py --kind bert   --ckpt chinese-roberta-wwm-ext-
 python tools/export_gguf/export.py --kind hubert --ckpt chinese-hubert-base          --out models/gsv-hubert-f16.gguf
 
 # vocoder (vocoder.pth -> GGUF; F32 weights, phase-major sub-pixel upsampling)
-python tools/export_vocoder_gguf.py --ckpt models/vocoder.pth --out models/gsv-vocoder-f32.gguf
+python tools/export_gguf/export_vocoder_gguf.py --ckpt models/vocoder.pth --out models/gsv-vocoder-f32.gguf
 
 # resampling filter table
 python tools/export_resampy_filter.py --out models/resampy_kaiser_best.bin

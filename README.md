@@ -1,178 +1,102 @@
 # gsv.cpp
 
-C++/ggml inference engine for **GPT-SoVITS V5** (v5turbo / v5dev), with a small HTTP service
-that speaks the same API as the original Python `api_v2.py` (so the GAG GUI can talk to it).
+**C++/ggml inference engine for GPT-SoVITS V5** — `v5turbo` (4-step DMD) and `v5dev`
+(32-step + cache-dit) — with an api_v2-compatible HTTP service.
 
-The engine re-implements the full V5 pipeline in C++ on top of [ggml](https://github.com/ggml-org/ggml):
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/KakaruHayate/gsv.cpp)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Weights](https://img.shields.io/badge/weights-Hugging%20Face-yellow)](https://huggingface.co/KakaruHayate/GSV.CPP)
+
+English | [中文](README.zh.md)
+
+The whole V5 pipeline runs in C++ on top of [ggml](https://github.com/ggml-org/llama.cpp):
+AR → cond (enc_p / ref_enc / wns1 / rvq) → DiT/CFM → HiFi-GAN vocoder (sub-pixel, ggml).
+A small Python sidecar does text front-end work (G2P + BERT ids); it needs no torch, and ONNX
+Runtime is not used anywhere.
 
 ```
-text ──► Python text sidecar (G2P + BERT) ─┐
-                                           ▼
-                          AR (s1v3) ──► cond (enc_p/ref_enc/wns1/rvq)
-                                           │
-                                           ▼
-                          DiT (CFM, v5turbo 4 steps / v5dev 32 steps)
-                                           │
-                                           ▼
-                          vocoder (HiFi-GAN, ggml, sub-pixel)
-                                           │
-                                           ▼
-                                         48 kHz WAV
+text ──► Python sidecar (G2P + BERT ids) ──┐
+                                            ├─► gsv_server (C++/ggml) ──► 48 kHz WAV
+GGUF models (AR/cond/DiT/refcode/BERT/HuBERT/vocoder) ─┘
 ```
 
 ## Features
 
 - **ggml backends**: Vulkan (NVIDIA/AMD/Intel) and CPU; no CUDA dependency.
-- **Quantized weights**: Q8_0 attention/FFN for AR, F16 for the rest; F32 sub-pixel vocoder.
-- **Batched AR**: several texts/segments share one decode pass (fallback to per-sequence).
-- **cache-dit** (DBCache) for the 32-step v5dev model: ~20% faster with near-lossless audio.
+- **Quantised weights**: Q8_0 attention/FFN for AR, F16 elsewhere, F32 sub-pixel vocoder.
+- **Batched AR**: several texts/segments share one decode pass.
+- **cache-dit** (DBCache) for the 32-step v5dev model: faster with near-lossless audio.
 - **Request scheduler**: concurrent `/tts` calls are grouped; DiT and vocoder run as a pipeline.
-- **HTTP service**: `/tts`, `/batch` + jobs (SSE), `/models`, `/set_gpt_weights`, `/metrics`,
-  token auth, path allow-list, crash dumps.
+- **HTTP service**: `/tts`, streaming `/tts`, `/batch` + jobs (SSE), `/models`, `/metrics`,
+  `/progress`, token auth, reference-audio allow-list, crash dumps.
+- **Vendored text frontend** (`frontend/`): G2P for zh/en/ja/ko/yue, BERT tokenization,
+  mixed-language segmentation — no torch/transformers.
 
-V5 only: **v5turbo** and **v5dev** checkpoints are supported; v2/v3/v4 are intentionally
-not supported.
+V5 only: v2/v3/v4 checkpoints are intentionally not supported.
 
-## Documentation
+## Quick start
 
-- [docs/usage.md](docs/usage.md) — build artifacts, model download/conversion, running the service
-- [docs/api.md](docs/api.md) — HTTP API (endpoints, streaming, references, errors)
-- [docs/benchmark.md](docs/benchmark.md) — full-pipeline timings (torch vs ggml, turbo/dev)
-- [tools/export_gguf/README.md](tools/export_gguf/README.md) — exporter/quantizer reference
+**Windows (one-click)**: download `windows/GSV.CPP-win64-*.zip` from
+<https://huggingface.co/KakaruHayate/GSV.CPP>, extract it anywhere and run `Start GAG.bat`.
+It contains the engine, an embedded Python with the sidecar dependencies, the models and the
+[GAG](https://github.com/KakaruHayate/GPT-SoVITS-Api-GUI) GUI.
 
-Converted models: <https://huggingface.co/KakaruHayate/GSV.CPP> (all GGUF, AR in fp16 and q8).
+**Linux**: grab the prebuilt `gsv_server` from the
+[releases](https://github.com/KakaruHayate/gsv.cpp/releases), plus the GGUF models and the
+frontend data from <https://huggingface.co/KakaruHayate/GSV.CPP>, then follow
+[docs/build.md](docs/build.md) for the sidecar and run steps.
 
-## Requirements
-
-- Windows 10/11 x64 or Linux x64, a Vulkan 1.2+ GPU (CPU-only also works).
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) source tree with the audio ops patch
-  (`patches/0001-ggml-audio-patch-port-on-llamacpp.patch`), built with `GGML_VULKAN=ON`.
-- MSVC 2019+ (Windows) or GCC/Clang (Linux), C++17.
-- Python 3.10+ for the text sidecar (`tools/text_sidecar.py`, installs with
-  `tools/text_sidecar_requirements.txt`).
-- No ONNX Runtime: the HiFi-GAN vocoder runs on ggml and is the only vocoder backend.
-
-## Build
-
-The engine builds against [llama.cpp](https://github.com/ggml-org/llama.cpp) (for ggml) with the
-audio-ops patch in `patches/`. Clone it next to this repo and apply the patch:
-
-```bash
-git clone https://github.com/ggml-org/llama.cpp
-git -C llama.cpp apply ../patches/0001-ggml-audio-patch-port-on-llamacpp.patch
-```
-
-### CMake (Windows / Linux)
-
-Build ggml first (Vulkan recommended, CPU-only also works):
-
-```bash
-cmake -S llama.cpp -B llama.cpp/build-vk-rel -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build llama.cpp/build-vk-rel --config Release -j
-```
-
-Then build this project, pointing `GSV_GGML_LIB_DIR` at the ggml build output
-(`find_library`-style search, or leave empty to add llama.cpp as a subproject):
-
-```bash
-cmake -S . -B build -DGSV_GGML_LIB_DIR=llama.cpp/build-vk-rel
-cmake --build build --config Release --target gsv_server
-# binary: build/Release/gsv_server.exe (Windows) or build/gsv_server (Linux)
-```
-
-On Windows the ggml DLLs found next to the libraries are copied next to the executable.
-The vocoder is pure ggml: no ONNX Runtime DLL is needed at run time.
-
-### MSVC script (Windows alternative)
-
-`scripts\build-server.bat` builds the same target with `cl.exe` and copies a newer MSVC runtime
-when it can find one (set `GSV_VCRT_DIR` if the executable fails to load it).
+**From source**: see **[docs/build.md](docs/build.md)** (English) or
+**[docs/build.zh.md](docs/build.zh.md)** (中文) — full instructions for Linux and Windows,
+including the patched llama.cpp/ggml, the Python sidecar and the model layout.
 
 ## Models
 
-Converted weights: <https://huggingface.co/KakaruHayate/GSV.CPP> (all GGUF, AR in fp16 and
-q8; see [docs/usage.md](docs/usage.md) for the file list and manifests). To convert your own
-fine-tuned checkpoints:
+Prebuilt GGUFs: <https://huggingface.co/KakaruHayate/GSV.CPP> (AR in fp16 and q8, shared
+BERT/HuBERT/vocoder, v5turbo + v5dev sets). Voice manifests go in `models/voices/<name>/`.
 
-```bat
-python tools\export_gguf\export.py --kind ar     --ckpt s1v3.ckpt  --out models\gsv-ar-q8.gguf --spec attn=q8_0,ffn=q8_0
-python tools\export_gguf\export.py --kind cond   --ckpt s2Gv5turbo.pth --out models\gsv-cond-f16.gguf
-python tools\export_gguf\export.py --kind dit    --ckpt s2Gv5turbo.pth --out models\gsv-dit-f16all.gguf --spec lin=f16
-python tools\export_gguf\export.py --kind refcode --ckpt s2Gv5turbo.pth --out models\gsv-refcode.gguf
-python tools\export_gguf\export.py --kind bert   --ckpt ... --out models\gsv-bert-f16.gguf
-python tools\export_gguf\export.py --kind hubert --ckpt ... --out models\gsv-hubert-f16.gguf
-python tools\export_vocoder_gguf.py --ckpt models\vocoder.pth --out models\gsv-vocoder-f32.gguf
-```
-
-The model directory should contain `gsv-ar-*.gguf`, `gsv-cond-*.gguf`, `gsv-dit-*.gguf`,
-`gsv-refcode.gguf`, `gsv-bert-*.gguf`, `gsv-hubert-*.gguf`, `gsv-vocoder-f32.gguf` and
-`resampy_kaiser_best.bin` (see `tools/export_resampy_filter.py`).
-Extra voices can be described with `models/voices/<name>/manifest.json`.
+To convert your own fine-tune, use `tools/export_gguf` — see
+[tools/export_gguf/README.md](tools/export_gguf/README.md) (GGUF only; the ONNX vocoder path is
+gone).
 
 ## Run
 
-```bat
-REM text frontend (G2P + BERT) on port 9882
+```bash
+# text frontend (G2P) — see docs/build.md §6 for the data files
 python -m venv .venv-sidecar
-.venv-sidecar\Scripts\pip install -r tools\text_sidecar_requirements.txt
-.venv-sidecar\Scripts\python tools\text_sidecar.py --port 9882
+.venv-sidecar/bin/pip install -r frontend/requirements-zh.txt
+.venv-sidecar/bin/python tools/text_sidecar.py --port 9882
 
-REM engine + HTTP service on port 9880
-tests\relcpu\gsv_server.exe --device vulkan --port 9880
+# engine + HTTP service
+./build/gsv_server --models models --device vulkan --port 9880
 ```
 
-```bat
-curl -X POST http://127.0.0.1:9880/tts -H "Content-Type: application/json" -d @request.json -o out.wav
-```
-
-`request.json`:
-
-```json
-{
+```bash
+curl -X POST http://127.0.0.1:9880/tts -H 'Content-Type: application/json' -d '{
   "text": "你好，欢迎使用语音合成系统。",
-  "text_lang": "zh",
-  "ref_audio_path": "ref.wav",
-  "prompt_text": "参考音频对应的文字。",
-  "prompt_lang": "zh",
-  "sample_steps": 4,
-  "cfg_rate": 0.0,
-  "seed": 20261014
-}
+  "text_lang": "all_zh",
+  "ref_audio_path": "models/ref.wav",
+  "prompt_text": "参考音频对应的文本",
+  "prompt_lang": "all_zh",
+  "sample_steps": 4
+}' -o out.wav
 ```
 
-Useful parameters: `voice`, `text_split_method` (`cut0`/`cut5`), `speed_factor`,
-`sample_steps`/`cfg_rate` (defaults follow the voice version: v5turbo 4 / 0.0, v5dev 32 / 1.30),
-`dbcache` (`off`/`auto`/`f8`/...), `skip_first_step`.
+Reference audio must be 3–10 s (max 30 s) and inside an allowed directory (see
+`--allow-path`). The full parameter list is in [docs/api.md](docs/api.md).
 
-## API
+## Documentation
 
-Full reference: [docs/api.md](docs/api.md); the server also serves OpenAPI at `GET /docs`.
-
-| Endpoint | Description |
+| document | contents |
 |---|---|
-| `POST /tts` | synthesize one text, returns `audio/wav`; `"stream": true` → chunked WAV, PCM flushed per segment |
-| `POST /batch` | queue several texts, returns a job id |
-| `GET /jobs/{id}` | job status (also `GET /jobs/{id}/events` for SSE) |
-| `GET /jobs/{id}/result/{i}` | one resulting WAV |
-| `GET /models` | list voices |
-| `GET /set_gpt_weights?weights_path=NAME` | switch voice |
-| `GET /change_refer`, `GET /set_refer_audio` | set the default reference audio / prompt |
-| `POST /reference` | upload a reference WAV, returns a usable path |
-| `GET /health`, `GET /metrics`, `GET /docs` | status, counters, OpenAPI |
-| `GET /asr` | `501` — ASR is not implemented in this engine |
+| [docs/build.md](docs/build.md) / [中文](docs/build.zh.md) | from zero to a running server (Linux/Windows) |
+| [docs/usage.md](docs/usage.md) | artifacts, models, conversion, service usage |
+| [docs/api.md](docs/api.md) | HTTP API: endpoints, streaming, references, errors |
+| [docs/benchmark.md](docs/benchmark.md) | full-pipeline timings (torch vs ggml, turbo/dev) |
+| [tools/export_gguf/README.md](tools/export_gguf/README.md) | checkpoint → GGUF exporter |
 
-Bind to loopback only unless `--token <secret>` is set; `--allow-path` restricts which
-reference audio paths the service may read.
+## Licence
 
-## Tests
-
-```bat
-scripts\run-svc-tests.bat        REM unit tests for the service core
-powershell -File tests\contract_test.ps1   REM HTTP contract tests (mock engine)
-```
-
-## License
-
-MIT — see [LICENSE](LICENSE). Third-party components and the model weights keep their own
-licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and
-[licenses/GPT-SoVITS-LICENSE.txt](licenses/GPT-SoVITS-LICENSE.txt).
+MIT (see [LICENSE](LICENSE)). The vendored frontend keeps its upstream licences; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and `licenses/`.
+Model weights are conversions of GPT-SoVITS checkpoints (MIT) and stay under that licence.

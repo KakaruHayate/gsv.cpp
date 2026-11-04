@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Unified GGUF/ONNX exporter for the GPT-SoVITS V5 components.
+"""Unified GGUF exporter for the GPT-SoVITS V5 components.
 
 Kinds
 -----
@@ -7,21 +7,20 @@ Kinds
   cond      s2Gv5*.pth      -> condition segment (enc_p / ref_enc / wns1 / bridge / rvq) GGUF
   dit       s2Gv5*.pth      -> DiT/CFM estimator GGUF
   refcode   s2Gv5*.pth      -> reference semantic-token chain (ssl_proj + codebook) GGUF
-  vocoder   vocoder.pth     -> fp32 ONNX (strictly not quantised)
+  vocoder   vocoder.pth     -> F32 HiFi-GAN vocoder GGUF (sub-pixel layout, never quantised)
+  bert      chinese-roberta -> BERT GGUF (optional: download the prebuilt file instead)
+  hubert    chinese-hubert  -> CN-HuBERT GGUF (optional: download the prebuilt file instead)
 
-HuBERT / BERT are intentionally **out of scope**: they are plain HuggingFace models
-and are exported by the runtime project (gsv.cpp), not by GPT-SoVITS.
+Everything the engine consumes is GGUF; ONNX is not used anywhere anymore.
 
-This file is a thin dispatcher over the component converters in ../ (same repo) so
-that upstream users have one entry point, plus a --self-test that re-opens the
-artifact and validates tensor count / names.
+All converters live next to this file so the export tooling is self-contained.
 
 Usage
 -----
   python tools/export_gguf/export.py --kind ar --ckpt models/s1v3.ckpt \
       --out build/gsv-ar-f16.gguf --f16 --self-test
 
-Requires: torch, numpy, gguf (pip install gguf); onnx for the vocoder export.
+Requires: torch, numpy, gguf (pip install gguf); transformers for bert/hubert.
 """
 import argparse
 import os
@@ -29,21 +28,22 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TOOLS = os.path.dirname(HERE)
-ROOT = os.path.dirname(TOOLS)
+ROOT = os.path.dirname(os.path.dirname(HERE))
 
 KINDS = {
     "ar":      ("convert_ar.py",            295, True),
     "cond":    ("convert_cond.py",          298, True),
     "dit":     ("convert_dit.py",           365, True),
     "refcode": ("convert_refcode.py",         4, True),
-    "vocoder": ("export_vocoder_onnx.py",  None, False),
+    "vocoder": ("export_vocoder_gguf.py",  None, False),
+    "bert":    ("convert_bert.py",         None, False),
+    "hubert":  ("convert_hubert.py",       None, False),
 }
 
 
 def build_cmd(kind, a):
     script, _, _ = KINDS[kind]
-    cmd = [sys.executable, os.path.join(TOOLS, script), "--ckpt", a.ckpt, "--out", a.out]
+    cmd = [sys.executable, os.path.join(HERE, script), "--ckpt", a.ckpt, "--out", a.out]
     if kind == "ar":
         # 显式的组级 spec 优先；否则 --q8 / --f16 落到推荐的分组
         if a.spec:
@@ -54,22 +54,12 @@ def build_cmd(kind, a):
             cmd += ["--spec", "attn=f16,ffn=f16,predict=f16,emb=f16"]
     elif kind in ("cond", "dit") and a.spec:
         cmd += ["--spec", a.spec]
-    if kind == "vocoder":
-        if a.opset:
-            cmd += ["--opset", str(a.opset)]
-        if not a.bench:
-            cmd.append("--skip-bench")
     return cmd
 
 
 def self_test(kind, path):
     if not os.path.exists(path):
         raise SystemExit("[self-test] missing output: %s" % path)
-    if kind == "vocoder":
-        size = os.path.getsize(path)
-        if size < 1_000_000:
-            raise SystemExit("[self-test] vocoder onnx too small: %d bytes" % size)
-        return "onnx ok (%d bytes)" % size
 
     try:
         from gguf import GGUFReader
@@ -90,15 +80,13 @@ def self_test(kind, path):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="GGUF/ONNX exporter for GPT-SoVITS V5 components")
+    ap = argparse.ArgumentParser(description="GGUF exporter for GPT-SoVITS V5 components")
     ap.add_argument("--kind", required=True, choices=sorted(KINDS))
-    ap.add_argument("--ckpt", required=True, help="input checkpoint (.ckpt / .pth)")
-    ap.add_argument("--out", required=True, help="output .gguf / .onnx")
+    ap.add_argument("--ckpt", required=True, help="input checkpoint (.ckpt / .pth / HF dir)")
+    ap.add_argument("--out", required=True, help="output .gguf")
     ap.add_argument("--spec", default="", help="per-group dtypes, e.g. attn=f16,ffn=f16")
     ap.add_argument("--f16", action="store_true", help="ar: store weights as F16 (norm/bias/emb stay F32)")
     ap.add_argument("--q8", action="store_true", help="ar: store attn/ffn as Q8_0")
-    ap.add_argument("--opset", type=int, default=17, help="vocoder: onnx opset")
-    ap.add_argument("--bench", action="store_true", help="vocoder: also run the torch-vs-onnx benchmark")
     ap.add_argument("--self-test", action="store_true", help="re-open the artifact and validate it")
     a = ap.parse_args()
 
@@ -119,3 +107,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
