@@ -98,11 +98,21 @@ total roughly the sum of the segments.
 ## Misc
 
 - `GET /models` → voices and the current one; `?rescan=1` re-scans `models/voices`.
-- `GET /control?command=exit` → graceful shutdown (used by tests).
+- `GET /progress` → coarse progress of the current synthesis:
+  `{"stage":1,"cur":0,"total":0}` where stage is `0` idle, `1` text frontend, `2` AR,
+  `3` DiT/CFM, `4` vocoder, `5` done; `cur/total` counts AR tokens or DiT steps.
+  The GAG GUI polls this for its progress bar.
+- `GET /control` without `command` → `400 {"message":"command is required ..."}`. This is the
+  api_v2-compatible liveness probe (the upstream GUI treats `400` as "API ready"); prefer
+  `/health` for new clients.
+- `GET /control?command=exit` → graceful shutdown (used by tests); `?command=restart` reloads
+  the current voice.
 - `GET /asr` → `501`, ASR is not part of this engine.
 - `GET /docs`, `GET /openapi.json` → OpenAPI 3 document.
 - `GET /tts_ws` → `501`: this build has no WebSocket support; use `POST /tts` with
   `stream: true` instead.
+- `--parent-pid PID` (CLI) makes the server exit when that process disappears; the Windows
+  one-click package uses it so closing the GUI frees the GPU.
 
 ## Examples
 
