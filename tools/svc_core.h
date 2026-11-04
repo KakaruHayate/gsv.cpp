@@ -152,6 +152,40 @@ inline void normalize(std::vector<float> & x) {
     }
 }
 
+// Header-only duration probe: used to reject absurdly long reference audio before the engine
+// has to load it (a 4-minute 48 kHz stereo float wav used to crash the synthesis path).
+inline double wav_duration_seconds(const std::string & path) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) return -1.0;
+    char hdr[12];
+    if (fread(hdr, 1, 12, f) != 12 || memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "WAVE", 4) != 0) {
+        fclose(f);
+        return -1.0;
+    }
+    uint32_t byte_rate = 0, data_bytes = 0;
+    bool have_data = false;
+    while (true) {
+        char cid[4];
+        uint32_t csz;
+        if (fread(cid, 1, 4, f) != 4 || fread(&csz, 4, 1, f) != 1) break;
+        if (memcmp(cid, "fmt ", 4) == 0) {
+            uint8_t b[16] = {0};
+            if (fread(b, 1, 16, f) != 16) break;
+            std::memcpy(&byte_rate, b + 8, 4);
+            if (csz > 16) fseek(f, (long) (csz - 16), SEEK_CUR);
+        } else if (memcmp(cid, "data", 4) == 0) {
+            data_bytes = csz;
+            have_data = true;
+            break;
+        } else {
+            fseek(f, (long) csz + (csz & 1), SEEK_CUR);
+        }
+    }
+    fclose(f);
+    if (!have_data || byte_rate == 0) return -1.0;
+    return (double) data_bytes / (double) byte_rate;
+}
+
 inline std::string wav_bytes(const std::vector<float> & x) {
     std::string out;
     const uint32_t n = (uint32_t) x.size();
