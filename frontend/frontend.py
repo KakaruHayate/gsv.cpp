@@ -37,6 +37,12 @@ def _ensure_repo():
     """把 cwd/sys.path/env 准备好并 import repo 的 text 层 (幂等)。"""
     if _text_mods:
         return _text_mods
+    # The text layer imports chinese2 while cwd is temporarily switched to the frontend package
+    # directory, so a relative data path would resolve against the wrong directory (G2PW would
+    # then try to download its model and crash). Pin them to absolute paths before that.
+    for _k in ("GSV_G2PW_MODEL", "GSV_BERT_DIR", "NLTK_DATA"):
+        if os.environ.get(_k):
+            os.environ[_k] = os.path.abspath(os.environ[_k])
     if not os.path.isdir(_GSV_DIR):
         raise RuntimeError("找不到 repo (%s); 用 GSV_REPO_ROOT 指定" % _GENV_ROOT_HINT)
     # bert_path: 给 chinese2 的 G2PWPinyin 用 (它只要 tokenizer, 不加载模型权重)
