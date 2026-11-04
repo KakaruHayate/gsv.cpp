@@ -23,7 +23,11 @@ from .utils import load_config
 
 onnxruntime.set_default_logger_severity(3)
 try:
-    onnxruntime.preload_dlls()
+    # CPU build: asking for the CUDA/cuDNN preload prints a scary (and irrelevant) warning.
+    try:
+        onnxruntime.preload_dlls(cuda=False, cudnn=False)
+    except TypeError:      # older onnxruntime without the keyword arguments
+        onnxruntime.preload_dlls()
 except Exception:
     pass
 warnings.filterwarnings("ignore")

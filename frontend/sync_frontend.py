@@ -41,6 +41,33 @@ TOKENIZER_INIT_NEW = '''        if BertWordPieceTokenizer is not None:
 CHINESE2_OLD = '        model_dir="GPT_SoVITS/text/G2PWModel",'
 CHINESE2_NEW = '        model_dir=os.environ.get("GSV_G2PW_MODEL", "GPT_SoVITS/text/G2PWModel"),'
 
+ORT_PRELOAD_OLD = '''onnxruntime.set_default_logger_severity(3)
+try:
+    onnxruntime.preload_dlls()
+except Exception:
+    pass'''
+
+ORT_PRELOAD_NEW = '''onnxruntime.set_default_logger_severity(3)
+try:
+    # CPU build: asking for the CUDA/cuDNN preload prints a scary (and irrelevant) warning.
+    try:
+        onnxruntime.preload_dlls(cuda=False, cudnn=False)
+    except TypeError:      # older onnxruntime without the keyword arguments
+        onnxruntime.preload_dlls()
+except Exception:
+    pass'''
+
+LANGDETECT_OLD = (
+    'fast_langdetect.infer._default_detector = fast_langdetect.infer.LangDetector('
+    'fast_langdetect.infer.LangDetectConfig(cache_dir=Path(__file__).parent.parent.parent / '
+    '"pretrained_models" / "fast_langdetect"))'
+)
+
+LANGDETECT_NEW = '''import os as _gsv_os
+_gsv_fl = _gsv_os.environ.get("GSV_FAST_LANGDETECT", "")
+_gsv_fl_dir = Path(_gsv_fl) if _gsv_fl else (Path(__file__).parent.parent.parent / "pretrained_models" / "fast_langdetect")
+fast_langdetect.infer._default_detector = fast_langdetect.infer.LangDetector(fast_langdetect.infer.LangDetectConfig(cache_dir=_gsv_fl_dir))'''
+
 
 def copy_tree(src, dst):
     copied = changed = 0
@@ -104,8 +131,11 @@ def main():
     copied, changed = copy_tree(src, DST)
     patch_file(os.path.join(DST, "g2pw", "onnx_api.py"),
                [(TOKENIZER_IMPORT, TOKENIZER_IMPORT_NEW),
-                (TOKENIZER_INIT, TOKENIZER_INIT_NEW)])
+                (TOKENIZER_INIT, TOKENIZER_INIT_NEW),
+                (ORT_PRELOAD_OLD, ORT_PRELOAD_NEW)])
     patch_file(os.path.join(DST, "chinese2.py"), [(CHINESE2_OLD, CHINESE2_NEW)])
+    patch_file(os.path.join(DST, "LangSegmenter", "langsegmenter.py"),
+               [(LANGDETECT_OLD, LANGDETECT_NEW)])
     print("synced %d file(s), %d changed; patches applied" % (copied, changed))
     print("review with: git diff -- frontend/GPT_SoVITS/text")
     return 0
