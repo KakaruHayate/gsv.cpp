@@ -1,5 +1,6 @@
 #include "gsv_ar.h"
 #include "gsv_device.h"
+#include "gsv_progress.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -735,7 +736,9 @@ gsv_ar_result gsv_ar::generate(const std::vector<gsv_ar_request> & reqs,
     }
     std::vector<float> prob_dump;   // [steps][V] (seq0), 由 GSV_AR_PROB_DUMP 触发
 
+    gsvprog::begin(2, max_steps);
     for (int idx = 0; idx < max_steps; idx++) {
+        gsvprog::tick();
         for (int b = 0; b < B; b++) {
             if (idx_list[b] >= 0) continue;                  // 已完成
             float row[1025];

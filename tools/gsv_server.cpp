@@ -51,6 +51,7 @@
 #include "json.hpp"
 
 #include "ggml-backend.h"
+#include "gsv_progress.h"
 
 #define GSV_VERSION "0.1.0"
 
@@ -854,6 +855,14 @@ int main(int argc, char ** argv) {
         res.set_content(openapi_json(), "application/json");
     });
 
+    svr.Get("/progress", [](const httplib::Request &, httplib::Response & res) {
+        // stage: 0 idle, 1 text frontend, 2 AR, 3 DiT/CFM, 4 vocoder, 5 done
+        res.set_content(json{{"stage", gsvprog::stage.load()},
+                             {"cur", gsvprog::cur.load()},
+                             {"total", gsvprog::total.load()}}.dump(),
+                        "application/json");
+    });
+
     svr.Get("/health", [&](const httplib::Request &, httplib::Response & res) {
         size_t pending;
         { std::lock_guard<std::mutex> lk(qm); pending = queue.size(); }
@@ -986,7 +995,10 @@ int main(int argc, char ** argv) {
         std::string rid = req.get_header_value("X-Request-Id");
         if (rid.empty()) rid = rlog.new_id();
         res.set_header("X-Request-Id", rid);
+        gsvprog::reset();
+        gsvprog::begin(1);                 // text frontend / g2p
         TtsOutcome o = run_tts(st, side, rlog, body, rid);
+        gsvprog::done();
         if (o.code != 200) return jerr(res, o.code, o.error_code, o.message);
         res.set_content(o.wav, "audio/wav");
     };

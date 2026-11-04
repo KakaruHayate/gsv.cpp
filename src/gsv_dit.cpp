@@ -7,6 +7,7 @@
 #include "gsv_dit.h"
 #include "gsv_device.h"
 #include "gsv_sampler.h"      // gsv_rng
+#include "gsv_progress.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -1161,7 +1162,9 @@ bool gsv_dit::sample(const float * mu, const float * prompt, int P, int T, int s
 
     const float step = 1.0f / (float) steps;
     std::vector<float> vel((size_t) MEL * T), neg((size_t) MEL * T);
+    gsvprog::begin(3, steps);
     for (int j = 0; j < steps; j++) {
+        gsvprog::tick();
         const float t = (float) j * step;
         s.db_step = j;                        // dbcache 的 current_step (warmup/gates 用)
         if (j < skip_steps) {                 // 邪修：跳过前 N 次模型调用（v=0，x 不动）

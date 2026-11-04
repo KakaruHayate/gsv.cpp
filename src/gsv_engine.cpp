@@ -11,6 +11,7 @@
 #include "gsv_refenc.h"
 #include "gsv_sampler.h"
 #include "gsv_vocoder_ggml.h"
+#include "gsv_progress.h"
 #include "gsv_wns1.h"
 
 #include <cmath>
@@ -585,6 +586,7 @@ bool gsv_engine::vocode_mel(const std::vector<float> & mel, int mel_T, std::vect
     impl & s = *p;
     wav.clear();
     // ORT 的 WebGPU/DML EP 都不保证并发安全：所有 vocoder 调用串行
+    gsvprog::begin(4, 1);
     std::lock_guard<std::mutex> vl(s.voc_mu);
     if (!s.ready || mel_T <= 0 || mel.size() != (size_t) MEL_DIM * (size_t) mel_T) return false;
     std::vector<float> mel_dn((size_t) MEL_DIM * (size_t) mel_T);
