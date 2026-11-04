@@ -23,6 +23,8 @@ def main():
     ap.add_argument("--to", dest="dst", required=True)
     ap.add_argument("--with-models", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--gag", help="also copy GUI sources from a GAG checkout (avoids a stale "
+                                  "dist/ build when only Python code changed)")
     args = ap.parse_args()
 
     src, dst = os.path.abspath(args.src), os.path.abspath(args.dst)
@@ -32,6 +34,35 @@ def main():
         raise SystemExit("target not found: " + dst)
 
     copied = skipped = 0
+    if args.gag:
+        gag = os.path.abspath(args.gag)
+        for name in ("gsv_api_gui.py", "launch_gag.py", "GAG_tools", "translations",
+                     "resources_rc.py"):
+            s_path = os.path.join(gag, name)
+            if not os.path.exists(s_path):
+                continue
+            if os.path.isdir(s_path):
+                for root, dirs, files in os.walk(s_path):
+                    dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+                    rel = os.path.relpath(root, gag)
+                    out = os.path.join(dst, rel)
+                    for f in files:
+                        if f.endswith((".pyc", ".pyo")):
+                            continue
+                        sp, dp = os.path.join(root, f), os.path.join(out, f)
+                        if os.path.exists(dp) and filecmp.cmp(sp, dp, shallow=False):
+                            skipped += 1
+                            continue
+                        if args.dry_run:
+                            print("would copy", os.path.join(rel, f))
+                            copied += 1
+                            continue
+                        os.makedirs(out, exist_ok=True)
+                        shutil.copy2(sp, dp)
+                        copied += 1
+            else:
+                shutil.copy2(s_path, os.path.join(dst, name))
+                copied += 1
     for root, dirs, files in os.walk(src):
         rel = os.path.relpath(root, src)
         rel_norm = rel.replace("\\", "/")
