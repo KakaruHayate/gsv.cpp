@@ -324,7 +324,8 @@ ParamError validate_tts_params(const SynthParams & p, const std::string & media_
                     "ref_audio_path is not under an allowed directory (see --allow-path)");
     {
         std::error_code ec;
-        if (!fs::exists(p.ref_path, ec) || ec) return fail(400, "bad_request", "ref_audio_path does not exist");
+        if (!fs::exists(gsvpath::from_utf8(p.ref_path), ec) || ec)
+            return fail(400, "bad_request", "ref_audio_path does not exist");
     }
     if (const double dur = wav_duration_seconds(p.ref_path); dur > 30.0)
         return fail(400, "bad_request",
@@ -822,7 +823,7 @@ int main(int argc, char ** argv) {
         if (!path_allowed(ref))
             return jerr(res, 403, "forbidden",
                         "refer_wav_path is not under an allowed directory (see --allow-path)");
-        if (!fs::exists(ref))
+        if (!fs::exists(gsvpath::from_utf8(ref)))
             return jerr(res, 400, "bad_request", "refer_wav_path does not exist");
         if (const double dur = wav_duration_seconds(ref); dur > 30.0)
             return jerr(res, 400, "bad_request", "refer_wav_path too long (> 30 s); trim it to 3-10 s");

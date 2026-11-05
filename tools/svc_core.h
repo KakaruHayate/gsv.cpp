@@ -30,6 +30,7 @@
 #include "json.hpp"
 
 #include "gsv_engine.h"
+#include "gsv_path.h"
 
 namespace svc {
 
@@ -114,6 +115,18 @@ inline bool sidecar_g2p(const SidecarCfg & sc, const std::string & text, const s
         err = std::string("text sidecar 响应解析失败: ") + e.what();
         return false;
     }
+    // Every phone is a separator/punctuation (ids 0..3): the language does not match the text
+    // (e.g. feeding Korean to the Chinese cleaner). Fail with a hint instead of synthesising
+    // a near-silent clip.
+    bool any_phone = false;
+    for (const int32_t id : out.phones) {
+        if (id > 3) { any_phone = true; break; }
+    }
+    if (!any_phone) {
+        err = "text produced no phonemes (lang='" + lang +
+              "'); check that the language matches the text, or use auto";
+        return false;
+    }
     return true;
 }
 
@@ -155,7 +168,7 @@ inline void normalize(std::vector<float> & x) {
 // Header-only duration probe: used to reject absurdly long reference audio before the engine
 // has to load it (a 4-minute 48 kHz stereo float wav used to crash the synthesis path).
 inline double wav_duration_seconds(const std::string & path) {
-    FILE * f = fopen(path.c_str(), "rb");
+    FILE * f = gsvpath::open_read(path);
     if (!f) return -1.0;
     char hdr[12];
     if (fread(hdr, 1, 12, f) != 12 || memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "WAVE", 4) != 0) {
@@ -326,8 +339,11 @@ inline bool is_loopback(const std::string & h) {
 
 inline std::string canon_path(const std::string & p) {
     std::error_code ec;
-    fs::path fp = fs::weakly_canonical(fs::absolute(p), ec);
-    if (ec) fp = fs::absolute(p);
+    // JSON paths arrive as UTF-8; go through the wide API on Windows, otherwise non-ASCII
+    // paths throw "No mapping for the Unicode character exists in the target multi-byte code page".
+    const fs::path in = gsvpath::from_utf8(p);
+    fs::path fp = fs::weakly_canonical(in, ec);
+    if (ec) fp = in;
     std::string s = fp.string();
     for (char & c : s) {
         if (c == '\\') c = '/';

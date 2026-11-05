@@ -27,6 +27,16 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, ROOT)
 
+# The sidecar is started with no console (pythonw) or a piped one, so Python picks the ANSI code
+# page for stdout/stderr. Any log line containing Chinese/Japanese text then raises
+# UnicodeEncodeError ("No mapping for the Unicode character exists in the target multi-byte code
+# page"), which the request handler turns into a 500. Force UTF-8 and never fail on a log write.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 _T0 = time.perf_counter()
 from frontend.frontend import Frontend  # noqa: E402
 _T_IMPORT = time.perf_counter() - _T0
@@ -53,6 +63,25 @@ def warm():
     _ready.set()
     print("[sidecar] zh frontend warm in %.1fs (import %.1fs)"
           % (_warm_ms["v"] / 1000.0, _T_IMPORT), flush=True)
+
+
+def check_data():
+    """Fail fast (and loudly) instead of letting G2PW silently download 600 MB.
+
+    Without GSV_G2PW_MODEL the frontend falls back to "GPT_SoVITS/text/G2PWModel" relative to
+    the frontend package; when that does not exist the G2PW converter starts a modelscope
+    download and the sidecar never becomes ready.
+    """
+    import frontend.frontend as ff
+    d = os.environ.get("GSV_G2PW_MODEL", "")
+    if not d:
+        print("[sidecar] WARNING: GSV_G2PW_MODEL is not set; looking for the default "
+              "G2PWModel directory", file=sys.stderr, flush=True)
+    elif not os.path.isdir(os.path.join(d, "")):
+        print("[sidecar] ERROR: GSV_G2PW_MODEL=%s is not a directory" % d,
+              file=sys.stderr, flush=True)
+    elif not os.path.exists(os.path.join(d, "g2pW.onnx")):
+        print("[sidecar] ERROR: %s does not contain g2pW.onnx" % d, file=sys.stderr, flush=True)
 
 
 def g2p(text, lang):
@@ -160,6 +189,7 @@ def main():
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print("[sidecar] listening on http://%s:%d (warming zh frontend in background)"
           % (args.host, args.port), flush=True)
+    check_data()
     threading.Thread(target=warm, daemon=True).start()
     try:
         srv.serve_forever()

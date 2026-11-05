@@ -24,6 +24,12 @@ _GSV_DIR = os.path.join(_REPO_ROOT, "GPT_SoVITS")
 
 _text_mods = {}
 
+import re as _re  # noqa: E402  (script detection for mixed-language routing)
+
+_LATIN_RE = _re.compile(r"[A-Za-z]")
+# Han + kana + hangul: anything the per-language cleaners would drop as "foreign"
+_CJK_RE = _re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufafa\uac00-\ud7af]")
+
 # NLTK 数据 (英文 G2P 的 g2p_en 需要 cmudict + averaged_perceptron_tagger_eng)。
 # 本机 nltk_data 里只有旧的 tagger 名, 而 nltk 3.10 要 `_eng`; 网络又下不动,
 # 所以仓库里放一份本地副本 (scripts/fetch-nltk-data.bat 生成), 有就优先用它。
@@ -155,12 +161,32 @@ class Frontend:
         """
         lang = language or self.language
         mods = _text_mods
-        if lang == "auto":
-            return self._auto(text)
+        # auto / auto_yue, and any explicit single-language mode whose text mixes scripts
+        # (GAG 的「中英混合」「日英混合」…): those cleaners silently drop the foreign script
+        # (zh strips [a-zA-zA]+, en drops CJK), so route them through the segmenter instead.
+        if lang in ("auto", "auto_yue") or self._needs_auto(text, lang):
+            return self._auto(text, yue=(lang == "auto_yue"))
         phones, word2ph, norm_text = self._one(text, lang)
         phone_ids = mods["to_seq"](phones, os.environ.get("version", "v2"))
         ids = self._bert_ids_for(lang, norm_text, word2ph)
         return phone_ids, word2ph, ids, []
+
+    @staticmethod
+    def _needs_auto(text, lang):
+        """True when the text contains a script the chosen cleaner would silently drop.
+
+        zh/ja/yue/ko strip [a-zA-Z]+ (chinese.py: re.sub("[a-zA-Z]+", "", seg)), en drops CJK,
+        so any "foreign" script in an explicit single-language mode must go through the
+        segmenter instead - that is what GAG's 中英混合 / 日英混合 / ... options expect.
+        """
+        base = lang.replace("all_", "")
+        if base not in ("zh", "en", "ja", "yue", "ko"):
+            return False
+        has_latin = bool(_LATIN_RE.search(text))
+        has_cjk = bool(_CJK_RE.search(text))
+        if base == "en":
+            return has_cjk
+        return has_latin
 
     def _bert_ids_for(self, lang, norm_text, word2ph):
         """zh 走真 BERT; 其它语言 repo 直接给全零 (get_bert_inf), 所以返回空表即可。
@@ -175,12 +201,14 @@ class Frontend:
         self._check(norm_text, word2ph, ids)
         return ids
 
-    def _auto(self, text):
+    def _auto(self, text, yue=False):
         """分段处理再拼接 —— 与 repo get_phones_and_bert 的 auto 分支同构。
 
         Upstream keeps one segment per detected language in the auto branch (no merging); the
         merge seen in the 'else' branch is for explicit single-language modes. Merging here
         folded a Korean run into the preceding Japanese one and dropped the hangul.
+
+        yue=True is upstream's auto_yue: Chinese segments are re-run as Cantonese.
         """
         from text.LangSegmenter import LangSegmenter
         segs = [(tmp["lang"], tmp["text"]) for tmp in LangSegmenter.getTexts(text)]
@@ -191,6 +219,8 @@ class Frontend:
             # and hangul (they produced no phones). Languages the text layer does not know fall
             # back to zh so nothing disappears.
             lang = l if l in ("zh", "en", "ja", "ko", "yue") else "zh"
+            if yue and lang == "zh":
+                lang = "yue"
             phones, word2ph, norm_text = self._one(t, lang)
             start = len(all_ids)
             all_ids += _text_mods["to_seq"](phones, os.environ.get("version", "v2"))

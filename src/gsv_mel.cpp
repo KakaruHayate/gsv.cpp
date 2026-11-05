@@ -1,4 +1,5 @@
 #include "gsv_mel.h"
+#include "gsv_path.h"
 
 #include "pocketfft_hdronly.h"
 
@@ -72,7 +73,7 @@ static void reflect_pad(const float * src, int64_t n, int pad, std::vector<float
 // ============================ wav 读取 ============================
 
 bool gsv_wav_load(const std::string & path, std::vector<float> & out, int & sr) {
-    FILE * f = fopen(path.c_str(), "rb");
+    FILE * f = gsvpath::open_read(path);
     if (!f) return false;
     char riff[4], wave[4];
     uint32_t rsz;
