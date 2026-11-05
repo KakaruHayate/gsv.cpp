@@ -19,6 +19,15 @@ is served by the server itself: `GET /docs` or `GET /openapi.json` (OpenAPI 3).
 
 Synthesize one text.
 
+`text_lang` / `prompt_lang` accept `zh`, `en`, `ja`, `yue`, `ko`, `auto`, `auto_yue` and the
+`all_*` spellings (`all_zh`, `all_ja`, ...). When an explicit single-language mode is given but the
+text contains a script that cleaner would drop (Chinese/Japanese/Korean text with `en`, Latin text
+with `zh`/`ja`/`yue`/`ko`), the request is routed through the segmenter instead, so 中英混合 and
+friends produce the right phonemes. If the result contains no phonemes at all (e.g. Korean text
+with `zh`) the request fails with `text produced no phonemes (lang=...)` - pick the matching
+language or `auto`. `ref_audio_path` may contain non-ASCII characters (Chinese/Japanese paths are
+converted from UTF-8 explicitly).
+
 ```json
 {
   "text": "你好，欢迎使用语音合成系统。",
