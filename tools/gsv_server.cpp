@@ -257,6 +257,10 @@ bool perform_synth(State & st, const SidecarCfg & side, const SynthParams & p, s
                      "voice='%s' ref='%s' prompt=%zu flen=%zu split=%s\n",
                      p.steps, p.cfg, p.seed, p.max_steps, p.early_stop, p.speed, p.voice.c_str(),
                      p.ref_path.c_str(), p.prompt_text.size(), p.text.size(), p.split_method.c_str());
+        // cfg_rate defaults to -1 ("auto"): synth_text resolves it per voice version
+        // (v5dev 1.30 / v5turbo 0). Say so, otherwise the log reads like CFG is disabled.
+        if (p.cfg < 0.0f)
+            std::fprintf(stderr, "[perform_synth] cfg_rate not given -> auto (v5dev 1.30 / v5turbo 0)\n");
     }
     if (!p.voice.empty() && p.voice != st.voice) {
         double ms = 0;
