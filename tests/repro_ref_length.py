@@ -1,4 +1,4 @@
-"""With the user's own reference: is the length blow-up caused by fragmentation, by the
+﻿"""With the user's own reference: is the length blow-up caused by fragmentation, by the
 reference being much longer than its transcript, or by the seed?
 
 The uploaded reference is 4.63 s of audio for an 11-character prompt ("好奇怪，心跳变得好快"),
@@ -45,7 +45,7 @@ def tts(ref, split, seed=3047):
         'seed': seed, 'sample_steps': 32, 'dbcache': 'auto',
         'top_k': 5, 'top_p': 1.0, 'temperature': 1.0, 'repetition_penalty': 1.35,
         'text_split_method': split, 'fragment_interval': 0.3,
-        'dit_cfg_off_t': 0.7, 'dit_uncond_reuse': 0, 'skip_first_step': 1,
+        'dit_uncond_reuse': 0, 'skip_first_step': 1,
     }
     data = json.dumps(body, ensure_ascii=False).encode('utf-8')
     req = urllib.request.Request('http://127.0.0.1:%d/tts' % PORT, data=data,

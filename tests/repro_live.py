@@ -1,4 +1,4 @@
-"""Reproduce the live report against the running GAG/gsv_server instance.
+﻿"""Reproduce the live report against the running GAG/gsv_server instance.
 
 Uses the exact reference the GUI uploaded (24 kHz mono 4.63 s, 222364 bytes), the reported text,
 and the GUI's settings, then varies only what can explain "same request, only the seed changed":
@@ -32,7 +32,7 @@ def tts(voice, seed, top_k, steps=32):
         'seed': seed, 'sample_steps': steps, 'dbcache': 'auto',
         'top_k': top_k, 'top_p': 1.0, 'temperature': 1.0, 'repetition_penalty': 1.35,
         'text_split_method': 'cut4', 'fragment_interval': 0.3,
-        'dit_cfg_off_t': 0.7, 'dit_uncond_reuse': 0, 'skip_first_step': 1,
+        'dit_uncond_reuse': 0, 'skip_first_step': 1,
     }
     data = json.dumps(body, ensure_ascii=False).encode('utf-8')
     req = urllib.request.Request('http://127.0.0.1:%d/tts' % PORT, data=data,

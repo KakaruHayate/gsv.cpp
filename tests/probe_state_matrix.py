@@ -1,4 +1,4 @@
-"""Which part of the render path carries state between two identical requests?
+﻿"""Which part of the render path carries state between two identical requests?
 
 Runs the same fixed-seed request twice and compares bit-exactly, across the two axes that
 differ between this session's earlier verification (cut0 + dbcache off) and the GUI's settings
@@ -28,7 +28,7 @@ def tts(split, dbcache, seed=12345):
         'seed': seed, 'sample_steps': 32, 'dbcache': dbcache,
         'top_k': 5, 'top_p': 1.0, 'temperature': 1.0, 'repetition_penalty': 1.35,
         'text_split_method': split, 'fragment_interval': 0.3,
-        'dit_cfg_off_t': 0.5, 'dit_uncond_reuse': 0, 'skip_first_step': 1,
+        'dit_uncond_reuse': 0, 'skip_first_step': 1,
     }
     data = json.dumps(body, ensure_ascii=False).encode('utf-8')
     req = urllib.request.Request('http://127.0.0.1:%d/tts' % PORT, data=data,

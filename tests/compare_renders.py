@@ -1,4 +1,4 @@
-"""Compare the two renders the user saved 37 s apart with identical settings.
+﻿"""Compare the two renders the user saved 37 s apart with identical settings.
 
 If the second one echoes the reference or repeats itself, that shows up as (a) much longer
 duration than the text justifies, (b) the reference waveform correlating inside the output,

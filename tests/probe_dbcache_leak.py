@@ -1,4 +1,4 @@
-"""Is the per-request degradation a cache-dit state leak?
+﻿"""Is the per-request degradation a cache-dit state leak?
 
 Symptom reported: the FIRST render after (re)starting is fine, the SECOND is garbage, every time,
 for different texts and references. That is the signature of state carried over between requests
@@ -37,7 +37,7 @@ def tts(dbcache, seed, text=TEXT):
         'seed': seed, 'sample_steps': 32, 'dbcache': dbcache,
         'top_k': 5, 'top_p': 1.0, 'temperature': 1.0, 'repetition_penalty': 1.35,
         'text_split_method': 'cut0', 'fragment_interval': 0.0,
-        'dit_cfg_off_t': 0.5, 'dit_uncond_reuse': 0, 'skip_first_step': 1,
+        'dit_uncond_reuse': 0, 'skip_first_step': 1,
     }
     data = json.dumps(body, ensure_ascii=False).encode('utf-8')
     req = urllib.request.Request('http://127.0.0.1:%d/tts' % PORT, data=data,

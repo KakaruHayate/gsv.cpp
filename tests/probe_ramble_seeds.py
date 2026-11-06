@@ -1,4 +1,4 @@
-"""Find the seeds that make this request ramble, and look at what the AR actually produced.
+﻿"""Find the seeds that make this request ramble, and look at what the AR actually produced.
 
 The two saved renders (18.10 s vs 48.98 s, identical settings, seed=-1 = random) differ only by
 the random draw, so some seeds must degenerate. This sweeps fixed seeds with the user's exact
@@ -31,7 +31,7 @@ def tts(seed):
         'seed': seed, 'sample_steps': 32, 'dbcache': 'auto',
         'top_k': 5, 'top_p': 1.0, 'temperature': 1.0, 'repetition_penalty': 1.35,
         'text_split_method': 'cut1', 'fragment_interval': 0.3,
-        'dit_cfg_off_t': 0.5, 'dit_uncond_reuse': 0, 'skip_first_step': 1,
+        'dit_uncond_reuse': 0, 'skip_first_step': 1,
     }
     data = json.dumps(body, ensure_ascii=False).encode('utf-8')
     req = urllib.request.Request('http://127.0.0.1:%d/tts' % PORT, data=data,
