@@ -227,6 +227,12 @@ int main(int argc, char ** argv) {
             gsv_dit_alg a; a.window = 0; a.cfg_off_t = 0.0f; a.uncond_reuse = 0; a.ref_iso = 1;
             push("ref_iso", a);
         }
+        // 块级稀疏度实测: 生成段查询只保留 1/stride 的参考块 (模拟 SpargeAttention 选块)
+        for (float rk : {0.75f, 0.5f, 0.25f, 0.125f}) {
+            gsv_dit_alg a; a.window = 0; a.cfg_off_t = 0.0f; a.uncond_reuse = 0; a.ref_keep = rk;
+            char * nm = new char[20]; snprintf(nm, 20, "refkeep%.3f", (double) rk);
+            push(nm, a);
+        }
         push("prod(128+.7)", prod);
         push("all-off", []{ gsv_dit_alg a; a.window = 0; a.cfg_off_t = 0.0f; a.uncond_reuse = 0; a.ref_iso = 0; return a; }());
         printf("  %-12s %10s %10s %10s %8s %9s %8s\n",

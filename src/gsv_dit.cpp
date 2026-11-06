@@ -116,6 +116,7 @@ struct gsv_dit::impl {
     // 这是"参考段 KV 预计算"这一加速路线的可行性前提: 只有参考行与噪声目标解耦,
     // 它的 K/V 才能在 chunk 内只算一次. 仅用于实验报告, 不进公开 API.
     int ref_iso = 0;
+    float ref_keep = 1.0f;                   // 实验: 生成段查询保留的参考块比例
     bool debug = false;                      // GSV_DIT_DEBUG=1: 把中间张量标为 output 供读回
     bool mark_on = false;                    // 仅对 pos 图开启标记 (避免 neg 图重名)
     std::vector<float> cos_host, sin_host;   // [32*T]
@@ -459,6 +460,12 @@ bool gsv_dit::impl::make_persistents() {
             }
             // 参考段隔离 (实验): 参考查询禁止看到生成段键 -> 参考行跨步恒定, 可预计算
             if (keep && s->ref_iso && q < P && k >= P) keep = false;
+            // 参考段块抽样 (实验): 生成段查询只看保留的参考块, 模拟块级稀疏注意力的可用稀疏度
+            if (keep && s->ref_keep < 0.999f && q >= P && k < P) {
+                const int blk = k / 16;                       // 16 帧一个块 (与 shader 粒度同量级)
+                const int stride = (int) std::lround(1.0f / s->ref_keep);
+                if (stride > 1 && (blk % stride) != 0) keep = false;
+            }
             am[(size_t) k + (size_t) T * q] = keep ? f_keep : f_mask;
         }
     ggml_backend_tensor_set(s->p_amask, am.data(), 0, am.size() * 2);
@@ -795,8 +802,9 @@ bool gsv_dit::prepare(const float * prompt_mel, const float * mu, int T, int x_l
 
     {
         // ref_iso 是结构性开关 (改掩码) -> 变化时重建图; 必须在 first 之前求值
-        if (s.ref_iso != (s.alg.ref_iso ? 1 : 0)) {
+        if (s.ref_iso != (s.alg.ref_iso ? 1 : 0) || s.ref_keep != s.alg.ref_keep) {
             s.ref_iso = s.alg.ref_iso ? 1 : 0;
+            s.ref_keep = s.alg.ref_keep;
             s.force_rebuild = true;
         }
     }

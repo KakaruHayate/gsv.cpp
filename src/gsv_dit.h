@@ -60,6 +60,9 @@ struct gsv_dit_alg {
     // 实验用 (不进公开 API): 1 = 参考段查询禁止看到生成段键 (block-diagonal 注意力).
     // 用于验证"参考段 KV 预计算"这条加速路线的前提是否成立.
     int   ref_iso       = 0;
+    // 实验用 (不进公开 API): >0 时, 生成段查询只保留每 (1/ref_keep) 个 16 帧参考块的第一个,
+    // 用来实测"参考段可稀疏掉多少而质量不塌" — 即 SpargeAttention 类方法的可用稀疏度 s.
+    float ref_keep      = 1.0f;
 };
 
 class gsv_dit {
