@@ -467,16 +467,22 @@ struct Voice {
 
 class VoiceRegistry {
 public:
+    // models_dir 可能是**相对路径** (GAG 默认就传 "runtime/models"), 而 manifest 里的文件名是
+    // 相对 manifest 目录的。两者一叠加, gsv_engine::impl::path() 又会给非绝对路径补一次
+    // model_dir, 于是变成 "…/voices/v5dev/runtime/models/voices/v5dev/../../gsv-ar-q8.gguf" ——
+    // 一个不存在的路径, voice 加载在 6 ms 内就失败 (只有 default 没事, 因为它的文件名是空的)。
+    // 这里统一解析成绝对路径, 之后 path() 见到 "X:" 就直接返回, 与 CWD 无关。
     void init(const std::string & models_dir) {
         std::lock_guard<std::mutex> lk(mu_);
         map_.clear();
+        const std::string base = abs_path(models_dir);
         Voice def;
         def.name = "default";
-        def.dir = models_dir;
-        def.cfg.model_dir = models_dir;
+        def.dir = base;
+        def.cfg.model_dir = base;
         map_["default"] = def;
 
-        const fs::path root = fs::path(models_dir) / "voices";
+        const fs::path root = fs::path(gsvpath::from_utf8(base)) / "voices";
         std::error_code ec;
         if (!fs::is_directory(root, ec)) return;
         for (const auto & e : fs::directory_iterator(root, ec)) {
@@ -496,6 +502,7 @@ public:
                     const std::string val = j[key].get<std::string>();
                     const fs::path fp(val);
                     dst = fp.is_absolute() ? val : (e.path() / val).string();
+                    dst = abs_path(dst);
                 };
                 p("ar", v.cfg.ar_file);
                 p("cond", v.cfg.cond_file);
@@ -516,6 +523,15 @@ public:
                 std::fprintf(stderr, "[voices] bad manifest %s: %s\n", mf.string().c_str(), ex.what());
             }
         }
+    }
+
+    // UTF-8 相对路径 -> 绝对路径 (失败就原样返回)
+    static std::string abs_path(const std::string & p) {
+        if (p.empty()) return p;
+        std::error_code ec;
+        const fs::path abs = fs::absolute(gsvpath::from_utf8(p), ec);
+        if (ec) return p;
+        return abs.u8string();
     }
 
     std::vector<Voice> list() const {
@@ -643,6 +659,22 @@ inline std::shared_ptr<gsv_engine> snapshot(State & st) {
     return st.eng;
 }
 
+// voice 的全部模型文件里第一个不存在的 (空字符串 = 都齐)
+inline std::string first_missing_model_file(const gsv_engine_cfg & c) {
+    const std::pair<const char *, const std::string *> files[] = {
+        {"ar", &c.ar_file},         {"cond", &c.cond_file},     {"dit", &c.dit_file},
+        {"bert", &c.bert_file},     {"hubert", &c.hubert_file}, {"refcode", &c.refcode_file},
+        {"vocoder", &c.vocoder_file}, {"filter", &c.filter_file},
+    };
+    for (const auto & f : files) {
+        if (f.second->empty()) continue;
+        FILE * fp = gsvpath::open_read(*f.second);
+        if (fp) { std::fclose(fp); continue; }
+        return std::string(f.first) + ": " + *f.second;
+    }
+    return std::string();
+}
+
 // 同步换 voice（阻塞；期间旧引擎继续服务）。不预热：加载成功后原子换指针。
 inline bool switch_voice(State & st, const std::string & name, std::string & err, double & load_ms) {
     if (name.empty()) return true;
@@ -666,14 +698,29 @@ inline bool switch_voice(State & st, const std::string & name, std::string & err
     if (cfg.model_dir.empty()) cfg.model_dir = st.base.model_dir;
     if (cfg.filter_file.empty() && !st.base.model_dir.empty()) {
         // 共享资源：resampy 表在顶层 model_dir，不在 voice 目录里
-        cfg.filter_file = fs::absolute(fs::path(st.base.model_dir) / "resampy_kaiser_best.bin").string();
+        cfg.filter_file = VoiceRegistry::abs_path(
+            (fs::path(gsvpath::from_utf8(st.base.model_dir)) / "resampy_kaiser_best.bin").u8string());
+    }
+    // 先查文件再加载: 少了文件时 gsv_engine::load 会在几毫秒内返回 nullptr, 只留一句
+    // "engine load failed for voice: X", 完全看不出是哪个文件/路径错了。
+    {
+        const std::string miss = first_missing_model_file(cfg);
+        if (!miss.empty()) {
+            st.reloading = false;
+            err = "voice '" + name + "' 缺少模型文件 -> " + miss;
+            return false;
+        }
     }
 
     const double t0 = now_s();
     gsv_engine * e = gsv_engine::load(cfg);
     load_ms = (now_s() - t0) * 1000;
     st.reloading = false;
-    if (!e) { err = "engine load failed for voice: " + name; return false; }
+    if (!e) {
+        err = "engine load failed for voice: " + name +
+              " (模型文件都在, 见服务端日志: 可能是显存不足)";
+        return false;
+    }
 
     {
         std::lock_guard<std::mutex> lk(st.eng_mu);

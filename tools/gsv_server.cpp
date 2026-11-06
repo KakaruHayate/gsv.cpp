@@ -595,6 +595,11 @@ int main(int argc, char ** argv) {
     ReqLog rlog;
     rlog.init(log_dir);
 
+    // --models 常被传成相对路径 (GAG 默认就是 "runtime/models")。统一解析成绝对路径：
+    // 否则 voice manifest 里的相对文件名会再被 gsv_engine::path() 补一次 model_dir,
+    // 拼成 ".../voices/v5dev/runtime/models/voices/v5dev/../../gsv-ar-q8.gguf" 这种不存在的路径，
+    // voice 加载几毫秒就失败 (只有 default 正常 —— 它的文件名是空的)。
+    st.base.model_dir = VoiceRegistry::abs_path(st.base.model_dir);
     st.voices.init(st.base.model_dir);
     if (st.mock_engine) {
         std::printf("[gsv_server] mock engine mode (no models/GPU); sidecar mock=%d\n",
