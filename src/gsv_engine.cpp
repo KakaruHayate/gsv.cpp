@@ -115,6 +115,14 @@ int gsv_engine::mel_dim()  const { return MEL_DIM; }
 void gsv_engine::set_dbcache(int fn, float threshold, int warmup, int downsample) {
     if (p->dit) p->dit->set_dbcache(fn, threshold, warmup, downsample);
 }
+
+void gsv_engine::set_dit_alg(const gsv_dit_alg & a) {
+    if (p->dit) p->dit->set_alg(a);
+}
+
+gsv_dit_alg gsv_engine::dit_alg() const {
+    return p->dit ? p->dit->alg() : gsv_dit_alg();
+}
 int gsv_engine::dbcache_fn() const { return p->dit ? p->dit->dbcache_fn() : 0; }
 
 void gsv_engine::last_stage_ms(double & cond_ms, double & dit_ms) const {

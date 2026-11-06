@@ -221,6 +221,29 @@ def main():
             copytree(fl_src, os.path.join(data, "fast_langdetect"))
         log("models copied")
 
+    # One voice per model version: the engine resolves relative names against the voice's
+    # own directory (models/voices/<name>/), so the shared gguf files are reached with "../..".
+    import json as _json
+
+    def write_voice(name, version, dit, cond, refcode):
+        d = os.path.join(models, "voices", name)
+        os.makedirs(d, exist_ok=True)
+        man = {"name": name, "version": version, "ar": "../../gsv-ar-q8.gguf", "cond": "../../" + cond,
+               "dit": "../../" + dit, "refcode": "../../" + refcode, "bert": "../../gsv-bert-f16.gguf",
+               "hubert": "../../gsv-hubert-f16.gguf", "vocoder": "../../gsv-vocoder-f32.gguf"}
+        with open(os.path.join(d, "manifest.json"), "w", encoding="utf-8") as f:
+            _json.dump(man, f, ensure_ascii=False, indent=2)
+
+    needed = ["gsv-ar-q8.gguf", "gsv-bert-f16.gguf", "gsv-hubert-f16.gguf", "gsv-vocoder-f32.gguf"]
+    if all(os.path.exists(os.path.join(models, n)) for n in needed):
+        if os.path.exists(os.path.join(models, "gsv-dit-f16all.gguf")):
+            write_voice("v5turbo", "v5turbo", "gsv-dit-f16all.gguf",
+                        "gsv-cond-f16.gguf", "gsv-refcode.gguf")
+        if os.path.exists(os.path.join(models, "gsv-v5dev-dit-f16all.gguf")):
+            write_voice("v5dev", "v5dev", "gsv-v5dev-dit-f16all.gguf",
+                        "gsv-v5dev-cond-f16.gguf", "gsv-v5dev-refcode.gguf")
+        log("voice manifests written")
+
     # 5. embeddable python + deps
     py_dir = os.path.join(runtime, "python")
     ensure_python(py_dir, os.path.join(GSV, "dist", "cache"))

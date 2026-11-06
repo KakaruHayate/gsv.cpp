@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "gsv_sampler.h"
+#include "gsv_dit.h"          // gsv_dit_alg (算法级加速开关, 逐请求可调)
 
 struct gsv_engine_cfg {
     std::string device;        // ggml 后端: "" = CPU, "vulkan"/"gpu" = 第一个 GPU
@@ -104,6 +105,10 @@ public:
     // cache-dit 运行时配置（fn<=0 关闭；仅影响 DiT，调用方需持有 engine 锁）
     void set_dbcache(int fn, float threshold, int warmup, int downsample);
     int  dbcache_fn() const;
+    // DiT 算法级加速开关 (DiTFastAttn 窗口 / CFG 截断+Uncond 复用; 默认即生产配置).
+    // window 变更会触发 DiT 图重建 (mask 是持久张量, 下次 prepare 生效).
+    void set_dit_alg(const gsv_dit_alg & a);
+    gsv_dit_alg dit_alg() const;
     // 最近一次 DiT 采样的 cache-dit 命中统计（pos+neg 合计）
     void dbcache_stats(int & hits, int & misses) const;
     // 最近一次 synthesize_mel 内部耗时：cond(decode_encp 参考+目标) / DiT

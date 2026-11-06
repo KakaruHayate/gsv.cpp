@@ -200,6 +200,60 @@ curl -X POST http://127.0.0.1:9880/tts -H "Content-Type: application/json" -d @r
 If `sample_steps` / `cfg_rate` are omitted they follow the voice version (v5turbo 4 / 0.0,
 v5dev 32 / 1.30). Bind to loopback only unless `--token <secret>` is set.
 
+### DiT algorithm switches (optional, default = production config)
+
+Per-request JSON fields (also accepted as GET query params). The defaults are the shipped
+production values; every switch can be overridden per request. `dit_window` changes rebuild the
+DiT graphs (0~0.4 s on the first request after a change), the others are free.
+
+| field | default | meaning |
+|---|---|---|
+| `dit_window` | 128 | DiTFastAttn window in frames: the reference (prompt) segment stays a global prefix while generated queries only see `[all reference] ∪ [i ± window]`. 0 = off (full attention). Exact no-op whenever the generated span is no wider than the window (short utterances), and near-lossless beyond it; no measurable speedup at current sequence lengths (~550-1000 frames), because attention is only ~14% of DiT FLOPs. |
+| `dit_cfg_off_t` | 0.7 | skip the Uncond branch once `t >= dit_cfg_off_t` (equivalent to cfg_scale = 1.0 for those steps). **The skip ratio is `1 - dit_cfg_off_t`**: 0.7 skips the last 30% of steps. Only affects voices with cfg > 0 (v5dev); for v5turbo (cfg 0) it is an exact no-op. This is a real fidelity/speed trade, not a free win — see the table below. |
+| `dit_uncond_reuse` | 0 | 0 = off; 1 = compute the Uncond branch only on even steps and reuse it on odd steps; 2 = linear extrapolation `2*neg[k-1] - neg[k-2]` on odd steps. |
+
+Example (v5dev, skip the last 40% of steps + odd-step Uncond reuse):
+
+```json
+{ "text": "...", "voice": "v5dev", "dit_cfg_off_t": 0.6, "dit_uncond_reuse": 1 }
+```
+
+Measured on RTX 2070 / Vulkan against the all-off run, same text/seed/reference, v5dev with
+cache-dit `auto`. Deltas are on the DiT mel output (`relL1` / correlation of `mel_out`), which
+is the meaningful signal — vocoded waveform correlation is dominated by phase and is not a
+usable fidelity proxy here:
+
+| setting | mel relL1 | mel corr | DiT time |
+|---|---|---|---|
+| `dit_window=128` (default) | 0.000 | 1.000000 | ~0 |
+| `dit_cfg_off_t=0.95` (skip 5%) | 0.027 | 0.999544 | ~-2% |
+| `dit_cfg_off_t=0.90` (skip 10%) | 0.058 | 0.997941 | ~-5% |
+| `dit_cfg_off_t=0.7` (default, skip 30%) | 0.120 | 0.991247 | ~-9% |
+| `dit_cfg_off_t=0.7` + `dit_uncond_reuse=1` | 0.12 (adds reuse noise) | ~0.99 | ~-32% |
+| `dit_cfg_off_t=0.6` + `dit_uncond_reuse=1` | ~0.15 | ~0.99 | ~-35% |
+
+If you care about staying close to the unaccelerated output, raise `dit_cfg_off_t` toward 0.9
+(skip 10%) or send 0 to disable the skip entirely; the throughput gain scales with the skip
+ratio and stacks with cache-dit.
+
+#### Reference
+
+`dit_window` follows DiTFastAttn (Window Attention with Residual Sharing),
+Yuan et al., NeurIPS 2024 — [arXiv:2406.08552](https://arxiv.org/abs/2406.08552).
+This implementation uses the plain windowed form (no residual sharing, which needs many
+denoising steps to pay off) with the reference segment kept as the global prefix.
+
+### Timeouts
+
+The engine lock / scheduler / AR-batch waits used to be hardcoded at 300 s. They are now
+configurable:
+
+- global default: `--lock-timeout-ms N` (default 300000)
+- per request: `"timeout_ms": N` in the JSON body (or GET query param); `<= 0` uses the global
+  default. Applies to the engine lock, the request scheduler and the AR batch wait.
+
+The HTTP read timeout for the text sidecar is separate (180 s, `svc_core.h`).
+
 ## 5. License
 
 Engine code is MIT (see [LICENSE](../LICENSE)). Third-party components and the model weights

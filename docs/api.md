@@ -58,6 +58,10 @@ converted from UTF-8 explicitly).
 | `text_split_method` | string | `cut5` | `cut0`..`cut5` |
 | `fragment_interval` | float | 0.3 | silence between segments, seconds (0..5) |
 | `dbcache` | string | `auto` | cache-dit: `off` / `auto` / `f4` / `f8` / `f16` |
+| `dit_window` | int | 128 | DiTFastAttn window in frames (reference segment stays a global prefix; 0 = off) |
+| `dit_cfg_off_t` | float | 0.7 | DiT alg: skip the Uncond branch for `t >=` this value; skip ratio = `1 - dit_cfg_off_t` |
+| `dit_uncond_reuse` | int | 0 | DiT alg: 0 off / 1 reuse neg on odd steps / 2 linear extrapolation |
+| `timeout_ms` | int | 0 | override engine lock / scheduler / AR wait timeout in ms (<= 0 = server default, `--lock-timeout-ms`) |
 | `media_type` | string | `wav` | only `wav` |
 | `stream` | bool | `false` | see below |
 

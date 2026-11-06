@@ -116,6 +116,10 @@ struct gsv_dit::impl {
     bool mark_on = false;                    // 仅对 pos 图开启标记 (避免 neg 图重名)
     std::vector<float> cos_host, sin_host;   // [32*T]
 
+    // ---- 算法级加速开关 (2026-11-06; 见 gsv_dit.h 的 alg_* 说明) ----
+    // 只保留两个实测可投产的: DiTFastAttn 窗口注意力 (alg_window) 与 CFG 截断 (alg_cfg_off_t).
+    gsv_dit_alg alg;
+
     void mark(ggml_tensor * t, const char * n) {
         if (!debug || !mark_on) return;
         ggml_set_output(t);
@@ -429,12 +433,25 @@ bool gsv_dit::impl::make_persistents() {
     for (int t = 0; t < T; t++) maskrow[t] = (t < x_lens) ? 1.0f : 0.0f;
     ggml_backend_tensor_set(s->p_maskrow, maskrow.data(), 0, maskrow.size() * 4);
 
+    // 注意力 mask (F16, 加到 QK^T 分数上):
+    //   - 基础: k >= x_lens 的列 (padding) 置 -inf
+    //   - DiTFastAttn (alg_window>0): gen 查询行对 gen 键列只保留 |k-q| <= window 的带状区;
+    //     ref 查询行与全部 ref 键列恒为全局 (Prefix-Global + Local-Window).
+    //     论文: arXiv:2406.08552 (NeurIPS 2024), 纯窗口形式, 无残差共享.
     std::vector<ggml_fp16_t> am((size_t) T * T);
     const ggml_fp16_t f_keep = ggml_fp32_to_fp16(0.0f);
     const ggml_fp16_t f_mask = ggml_fp32_to_fp16(-1e30f);          // -> -inf
+    const int W = alg.window;
+    const int P = s->prompt_T;
     for (int q = 0; q < T; q++)
-        for (int k = 0; k < T; k++)
-            am[(size_t) k + (size_t) T * q] = (k < x_lens) ? f_keep : f_mask;
+        for (int k = 0; k < T; k++) {
+            bool keep = (k < x_lens);
+            if (keep && W > 0 && q >= P && k >= P) {
+                const int d = k - q;
+                keep = (d >= -W && d <= W);
+            }
+            am[(size_t) k + (size_t) T * q] = keep ? f_keep : f_mask;
+        }
     ggml_backend_tensor_set(s->p_amask, am.data(), 0, am.size() * 2);
 
     ggml_backend_tensor_set(s->p_cos, s->cos_host.data(), 0, s->cos_host.size() * 4);
@@ -608,6 +625,9 @@ gsv_dit * gsv_dit::load(const std::string & gguf_path, const gsv_dit_cfg & cfg) 
     s.dbc.max_cont        = cfg.dbcache_max_cont;
     s.dbc.max_accum       = cfg.dbcache_max_accum;
     s.dbc.ds              = cfg.dbcache_downsample >= 1 ? cfg.dbcache_downsample : 1;
+    s.alg.window          = cfg.alg_window < 0 ? 0 : cfg.alg_window;
+    s.alg.cfg_off_t       = cfg.alg_cfg_off_t < 0.0f ? 0.0f : (cfg.alg_cfg_off_t > 1.0f ? 1.0f : cfg.alg_cfg_off_t);
+    s.alg.uncond_reuse    = (cfg.alg_uncond_reuse < 0 || cfg.alg_uncond_reuse > 2) ? 0 : cfg.alg_uncond_reuse;
 
     ggml_backend_dev_t dev = nullptr;
     {
@@ -731,10 +751,11 @@ void gsv_dit::time_sin(float t, float * out256) {
     }
 }
 
-bool gsv_dit::prepare(const float * prompt_mel, const float * mu, int T, int x_lens) {
+bool gsv_dit::prepare(const float * prompt_mel, const float * mu, int T, int x_lens, int P) {
     impl & s = *p;
     if (T <= 0) { fprintf(stderr, "[gsv_dit] bad T=%d\n", T); return false; }
     if (x_lens <= 0 || x_lens > T) x_lens = T;
+    if (P <= 0 || P >= T) P = 0;             // 0 = 无 prompt 段 (禁用依赖 P 的优化)
 
     // 诊断: 落盘 DiT 真正拿到的条件 (供 torch 同输入对比)
     if (const char * dd = getenv("GSV_DIT_DUMP")) {
@@ -758,7 +779,7 @@ bool gsv_dit::prepare(const float * prompt_mel, const float * mu, int T, int x_l
     const bool first = (s.T != T || s.x_lens != x_lens || s.force_rebuild);
     if (first) {
         s.force_rebuild = false;
-        s.T = T; s.x_lens = x_lens;
+        s.T = T; s.x_lens = x_lens; s.prompt_T = P;
         if (!s.make_persistents()) return false;
         if (!s.build_prepare()) return false;
     }
@@ -1097,6 +1118,23 @@ void gsv_dit::set_dbcache(int fn, float threshold, int warmup, int downsample) {
 
 int gsv_dit::dbcache_fn() const { return p->dbc.fn; }
 
+// 运行时算法开关: window 变更 -> 强制重建图 (mask 是持久张量, 下次 prepare 生效);
+// cfg_off_t / uncond_reuse 是运行期闸门, 直接生效.
+void gsv_dit::set_alg(const gsv_dit_alg & a) {
+    impl & s = *p;
+    gsv_dit_alg n = a;
+    if (n.window < 0) n.window = 0;
+    if (n.cfg_off_t < 0.0f) n.cfg_off_t = 0.0f;
+    if (n.cfg_off_t > 1.0f) n.cfg_off_t = 1.0f;
+    if (n.uncond_reuse < 0 || n.uncond_reuse > 2) n.uncond_reuse = 0;
+    const bool structural = (n.window != s.alg.window);
+    s.alg = n;
+    if (!structural) return;
+    s.force_rebuild = true;
+}
+
+gsv_dit_alg gsv_dit::alg() const { return p->alg; }
+
 void gsv_dit::db_get_stats(db_stats & st) const {
     const impl & s = *p;
     st.steps = s.db_step;
@@ -1144,8 +1182,8 @@ bool gsv_dit::sample(const float * mu, const float * prompt, int P, int T, int s
     std::vector<float> prompt_x((size_t) MEL * T, 0.0f);
     for (int c = 0; c < MEL; c++)
         memcpy(prompt_x.data() + (size_t) c * T, prompt + (size_t) c * P, (size_t) P * 4);
-    if (!prepare(prompt_x.data(), mu, T, T)) return false;
-    s.prompt_T = P;
+    s.prompt_T = P;                          // 图/mask 依赖 P, 必须在 prepare 之前
+    if (!prepare(prompt_x.data(), mu, T, T, P)) return false;
     s.db_reset_state();                       // 每次采样 = 一次新的推理 (对应 mark_step_begin 的复位)
     s.db_total_steps = steps;
 
@@ -1162,6 +1200,12 @@ bool gsv_dit::sample(const float * mu, const float * prompt, int P, int T, int s
 
     const float step = 1.0f / (float) steps;
     std::vector<float> vel((size_t) MEL * T), neg((size_t) MEL * T);
+    // CFG 截断 (t >= cfg_off_t 的步跳过 Uncond, 等价 cfg_scale=1.0) +
+    //        Uncond 复用 (偶数步算 neg; 奇数步复用/线性外推, 不走网络)
+    const float cfg_off = s.alg.cfg_off_t;
+    const int   ur      = s.alg.uncond_reuse;
+    std::vector<float> neg_p1((size_t) MEL * T), neg_p2((size_t) MEL * T);
+    int neg_count = 0;                        // 已实际算过的 neg 数 (外推至少要 2 个)
     gsvprog::begin(3, steps);
     for (int j = 0; j < steps; j++) {
         gsvprog::tick();
@@ -1173,8 +1217,20 @@ bool gsv_dit::sample(const float * mu, const float * prompt, int P, int T, int s
             continue;
         }
         if (!velocity(x.data(), t, false, vel.data())) return false;
-        if (cfg > 1e-5f) {
-            if (!velocity(x.data(), t, true, neg.data())) return false;
+        const bool cfg_on = cfg > 1e-5f && !(cfg_off > 0.0f && t >= cfg_off);
+        if (cfg_on) {
+            const bool odd = (j & 1) != 0;
+            if (odd && neg_count >= 1 && ur == 1) {
+                // 直接沿用上一步算过的 neg (偶数步才算)
+            } else if (odd && neg_count >= 2 && ur == 2) {
+                // 线性外推: neg_k = 2*neg[k-1] - neg[k-2] (p1/p2 是最近两次实算值)
+                for (size_t i = 0; i < neg.size(); i++) neg[i] = 2.0f * neg[i] - neg_p2[i];
+            } else {
+                if (!velocity(x.data(), t, true, neg.data())) return false;
+                neg_count++;
+                neg_p2.swap(neg_p1);
+                neg_p1 = neg;
+            }
             for (size_t i = 0; i < vel.size(); i++) vel[i] = vel[i] + (vel[i] - neg[i]) * cfg;
         }
         for (size_t i = 0; i < vel.size(); i++) x[i] += step * vel[i];

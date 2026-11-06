@@ -55,7 +55,7 @@
 #include "ggml-backend.h"
 #include "gsv_progress.h"
 
-#define GSV_VERSION "0.1.0"
+#define GSV_VERSION "0.1.2"
 
 #include "svc_core.h"
 
@@ -134,6 +134,10 @@ std::string openapi_json() {
     P("text_split_method", "string", "cut0..cut5 (default cut5)");
     P("fragment_interval", "number", "silence between segments, seconds");
     P("dbcache", "string", "cache-dit: off / auto / f4 / f8 / f16");
+    P("dit_window", "integer", "DiTFastAttn window in frames (0 = off, default 128)");
+    P("dit_cfg_off_t", "number", "DiT alg: skip the Uncond branch for t >= this value (default 0.7 = skip last 30%)");
+    P("dit_uncond_reuse", "integer", "DiT alg: 0 off / 1 reuse neg on odd steps / 2 linear extrapolation");
+    P("timeout_ms", "integer", "override engine lock / scheduler / AR wait timeout in ms (<=0 = server default)");
     P("stream", "boolean", "true = chunked audio/wav, PCM is flushed per text segment");
     P("media_type", "string", "only wav is supported");
     tts_req["properties"] = props;
@@ -227,6 +231,12 @@ void parse_params(const json & b, SynthParams & p) {
         p.dbcache_warmup = (int) jnum(b, "dbcache_warmup", p.dbcache_warmup);
         p.dbcache_ds = (int) jnum(b, "dbcache_downsample", p.dbcache_ds);
     }
+    // DiT 算法级加速 (默认即生产配置; 见 docs/usage.md "DiT 算法开关")
+    p.dit_window = (int) jnum(b, "dit_window", p.dit_window);
+    p.dit_cfg_off_t = (float) jnum(b, "dit_cfg_off_t", p.dit_cfg_off_t);
+    p.dit_uncond_reuse = (int) jnum(b, "dit_uncond_reuse", p.dit_uncond_reuse);
+    // 超时覆盖 (毫秒; <=0 = 服务端默认)
+    p.timeout_ms = (int) jnum(b, "timeout_ms", p.timeout_ms);
     p.seed = (int) jnum(b, "seed", -1);
     p.max_steps = (int) jnum(b, "max_steps", 1500);
     p.early_stop = (int) jnum(b, "early_stop", 400);
@@ -269,7 +279,8 @@ bool perform_synth(State & st, const SidecarCfg & side, const SynthParams & p, s
     // 请求级聚合：提交给调度器，与同时到达的 /tts、/batch 文本一起分组
     if (st.sched) {
         auto fut = st.sched->submit(pp, pp.text);
-        if (fut.wait_for(std::chrono::seconds(300)) != std::future_status::ready) {
+        const int wait_ms = pp.timeout_ms > 0 ? pp.timeout_ms : st.lock_timeout_ms;
+        if (fut.wait_for(std::chrono::milliseconds(wait_ms)) != std::future_status::ready) {
             st.waiters.fetch_sub(1);
             st.n_timeouts++;
             err = "scheduler timeout";
@@ -442,6 +453,7 @@ int main(int argc, char ** argv) {
     int parent_pid = 0;   // exit when this process disappears (GUI closed / crashed)
     bool list_devices = false;
     double job_ttl_arg = 3600.0;
+    int lock_timeout_ms = 300000;   // engine 锁/调度器/AR 等待的全局默认 (请求可用 timeout_ms 覆盖)
     State st;
     st.base.model_dir = "models";
 
@@ -462,6 +474,7 @@ int main(int argc, char ** argv) {
         else if (a == "--token") g_token = next("--token");
         else if (a == "--allow-path") g_allow.push_back(next("--allow-path"));
         else if (a == "--job-ttl") job_ttl_arg = std::atof(next("--job-ttl").c_str());
+        else if (a == "--lock-timeout-ms") lock_timeout_ms = std::atoi(next("--lock-timeout-ms").c_str());
         else if (a == "--parent-pid") parent_pid = std::atoi(next("--parent-pid").c_str());
         else if (a == "--list-devices") list_devices = true;
         else if (a == "--version") { std::printf("gsv_server %s\n", GSV_VERSION); return 0; }
@@ -472,10 +485,13 @@ int main(int argc, char ** argv) {
             std::printf("usage: gsv_server [--models DIR] [--device cpu|vulkan|vulkan:N|N]\n"
                         "                  [--host 127.0.0.1] [--port 9880] [--sidecar 127.0.0.1:9882]\n"
                         "                  [--allow-path DIR]...  ('*' = allow every directory)\n"
-                        "                  [--log-dir logs] [--threads N] [--verbose] [--list-devices] [--version]\n");
+                        "                  [--log-dir logs] [--threads N] [--verbose] [--list-devices] [--version]\n"
+                        "                  [--lock-timeout-ms N]  (engine lock / scheduler wait; per-request\n"
+                        "                                            override via the timeout_ms field)\n");
             return 0;
         } else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
+    st.lock_timeout_ms = lock_timeout_ms > 0 ? lock_timeout_ms : 300000;
     // Watchdog: the GUI passes --parent-pid. If it disappears (normal close, crash or a force
     // kill that bypassed the job object), exit so the GPU/VRAM is released.
     if (parent_pid > 0) {
@@ -1135,7 +1151,9 @@ int main(int argc, char ** argv) {
                                       "seed", "top_k", "top_p", "temperature", "repetition_penalty",
                                       "fragment_interval", "max_steps", "early_stop", "speed_factor", "skip_first_step",
                                       "dbcache", "dbcache_fn", "dbcache_threshold", "dbcache_warmup",
-                                      "dbcache_downsample", "stream"};
+                                      "dbcache_downsample", "stream",
+                                      "dit_window", "dit_cfg_off_t", "dit_uncond_reuse",
+                                      "timeout_ms"};
         json body = json::object();
         for (const char * k : keys) if (req.has_param(k)) body[k] = req.get_param_value(k);
         if (jbool(body, "stream", false)) return handle_tts_stream(req, res, body);

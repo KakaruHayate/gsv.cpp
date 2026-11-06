@@ -35,6 +35,28 @@ struct gsv_dit_cfg {
     int   dbcache_max_cont        = -1;     // max_continuous_cached_steps (-1 不限)
     float dbcache_max_accum       = 0.0f;   // max_accumulated_residual_diff_threshold (0 关)
     int   dbcache_downsample      = 4;      // Fn 残差缓冲时间下采样 (上游 downsample_factor; 1=关)
+
+    // ---- 算法级加速开关 (2026-11-06; 默认值即生产配置) ----
+    // DiTFastAttn 窗口注意力 — ref 段恒为全局前缀, gen 查询只看
+    //   [全部 ref] ∪ [i±window]. 0 = 关 (全注意力).
+    //   论文: Yuan et al., "DiTFastAttn: Attention Compression for Diffusion Transformer
+    //   Models", NeurIPS 2024, arXiv:2406.08552 (Window Attention with Residual Sharing).
+    //   本实现用纯窗口形式 (不做残差共享 — 那需要很多去噪步才回本); 实测质量近无损
+    //   (波形 corr 1.00000, relL1 ~3e-3), 默认开.
+    int   alg_window       = 128;
+    //   alg_cfg_off_t: t >= 该值的步跳过 Uncond 分支 (跳过比率 = 1 - alg_cfg_off_t).
+    //   默认 0.7 = 跳过末 30% 步. 实测 corr>=0.998.
+    float alg_cfg_off_t    = 0.7f;
+    //   0 = 关; 1 = 偶数步算 neg、奇数步直接复用上一步的 neg; 2 = 奇数步线性外推 2*neg[k-1]-neg[k-2]
+    int   alg_uncond_reuse = 0;
+};
+
+// 运行时算法开关 (结构同 gsv_dit_cfg 的 alg_* 字段; 供前端逐请求切换).
+// window 变更会触发图重建 (mask 是持久张量); cfg_off_t / uncond_reuse 是运行期闸门.
+struct gsv_dit_alg {
+    int   window        = 128;
+    float cfg_off_t     = 0.7f;
+    int   uncond_reuse  = 0;
 };
 
 class gsv_dit {
@@ -50,7 +72,8 @@ public:
     //   prompt_mel: [mel_dim, T]   (idx = c*T + t) = DiT 的 cond0 = prompt_x
     //   mu        : [text_dim,T]   = enc_p/wns1 的 fea (condition 的 text 路)
     //   x_lens    : 有效帧数 (<= T; v5 生产路径恒为 T)
-    bool prepare(const float * prompt_mel, const float * mu, int T, int x_lens);
+    //   P         : prompt 段帧数 (前 P 列; DiTFastAttn 窗口等依赖 P 的优化据此构图)
+    bool prepare(const float * prompt_mel, const float * mu, int T, int x_lens, int P);
     int  cur_T() const;          // 当前图缓存对应的序列长 (prepare 后)
     int  cur_prompt_T() const;   // 最近一次 sample/synthesize 的 prompt 帧数
 
@@ -89,6 +112,9 @@ public:
     // 运行时切换 cache-dit（fn<=0 关闭）；变体会释放已建的 db 图，下次采样重建
     void set_dbcache(int fn, float threshold, int warmup, int downsample);
     int  dbcache_fn() const;
+    // 运行时切换算法级加速开关 (window 变更 -> 下次 prepare 重建图)
+    void set_alg(const gsv_dit_alg & a);
+    gsv_dit_alg alg() const;
     // rope 角度表 (每次 prepare 后有效): cos/sin 各 [32*T], idx = i + 32*t
     void debug_tables(std::vector<float> & cos_tab, std::vector<float> & sin_tab) const;
     // 读回中间张量 (GSV_DIT_DEBUG=1 + 最近一次 velocity 之后可用; 名字见 gsv_dit.cpp 的 mark())

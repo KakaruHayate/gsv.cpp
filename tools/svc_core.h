@@ -396,10 +396,28 @@ struct SynthParams {
     float dbcache_thr = 0.02f;
     int dbcache_warmup = 8;
     int dbcache_ds = 4;
+    // ---- DiT 算法级加速 (默认即生产配置; 语义见 gsv_dit.h alg_*) ----
+    // DiTFastAttn 窗口注意力 (帧). 0 = 关; 默认 128 (质量近无损)
+    int dit_window = 128;
+    // CFG 截断 + Uncond 复用 (仅 cfg>0 生效; v5turbo 上为无操作)
+    float dit_cfg_off_t = 0.7f;      // t>=该值的步跳过 Uncond; 跳过比率 = 1 - 该值 (默认跳 30%)
+    int dit_uncond_reuse = 0;        // 0=关; 1=偶数步算 neg 奇数步复用; 2=奇数步线性外推
+    // ---- 超时 (毫秒; <=0 = 用 State 的全局默认) ----
+    // 覆盖 engine 锁等待 / 调度器等待 / AR 批量等待. 服务端另有读超时 (--read-timeout-s).
+    int timeout_ms = 0;
     gsv_sampler_cfg sampler;
     std::string split_method = "cut5";
     float fragment_interval = 0.3f;
 };
+
+// SynthParams 的 DiT 算法开关 -> gsv_dit_alg
+inline gsv_dit_alg dit_alg_of(const SynthParams & p) {
+    gsv_dit_alg a;
+    a.window        = p.dit_window;
+    a.cfg_off_t     = p.dit_cfg_off_t;
+    a.uncond_reuse  = p.dit_uncond_reuse;
+    return a;
+}
 
 struct SynthTiming {
     double g2p_ms = 0, prep_ms = 0, bert_ms = 0, ar_ms = 0, synth_ms = 0;
@@ -569,6 +587,12 @@ struct State {
     ArBatcher * ar_batcher = nullptr;
     SynthScheduler * sched = nullptr;
     bool mock_engine = false;   // 契约测试：跳过真实引擎
+    int  lock_timeout_ms = 300000;   // engine 锁 / 调度器 / AR 批量等待的全局默认 (ms)
+
+    // 请求级超时 (ms): p.timeout_ms > 0 时优先, 否则用 lock_timeout_ms
+    int req_timeout_ms(const SynthParams & p) const {
+        return p.timeout_ms > 0 ? p.timeout_ms : lock_timeout_ms;
+    }
 
     // 默认参考（/change_refer 设置；请求未带 ref_audio_path/prompt_text 时回退）
     std::mutex ref_mu;
@@ -821,7 +845,7 @@ inline bool synth_batch_segments(State & st, const SidecarCfg & side, const Synt
         return false;
     }
     std::unique_lock<std::timed_mutex> lk(st.compute_mu, std::defer_lock);
-    const bool got = lk.try_lock_for(std::chrono::seconds(300));
+    const bool got = lk.try_lock_for(std::chrono::milliseconds(st.req_timeout_ms(base)));
     st.waiters.fetch_sub(1);
     if (!got) { st.n_timeouts++; err = "queue timeout"; ec = "timeout"; return false; }
 
@@ -934,7 +958,7 @@ inline bool synth_batch_texts(State & st, const SidecarCfg & side, const SynthPa
         return false;
     }
     std::unique_lock<std::timed_mutex> lk(st.compute_mu, std::defer_lock);
-    const bool got = lk.try_lock_for(std::chrono::seconds(300));
+    const bool got = lk.try_lock_for(std::chrono::milliseconds(st.req_timeout_ms(base)));
     st.waiters.fetch_sub(1);
     if (!got) { st.n_timeouts++; err = "queue timeout"; ec = "timeout"; return false; }
 
@@ -1180,7 +1204,7 @@ struct ArBatcher {
             return;
         }
         std::unique_lock<std::timed_mutex> lk(st->compute_mu, std::defer_lock);
-        if (!lk.try_lock_for(std::chrono::seconds(300))) {
+        if (!lk.try_lock_for(std::chrono::milliseconds(st->lock_timeout_ms))) {
             for (auto & t : group) t->prom.set_value({});
             return;
         }
@@ -1243,8 +1267,9 @@ inline std::shared_ptr<ArTask> ar_make_task(const std::string & key,
 }
 
 inline bool ar_take(std::future<std::vector<int32_t>> & fut, std::vector<int32_t> & sem,
-                    std::string & err) {
-    if (fut.wait_for(std::chrono::seconds(300)) != std::future_status::ready) {
+                    std::string & err, int timeout_ms = 0) {
+    const int to = timeout_ms > 0 ? timeout_ms : 300000;
+    if (fut.wait_for(std::chrono::milliseconds(to)) != std::future_status::ready) {
         err = "ar batch timeout";
         return false;
     }
@@ -1256,10 +1281,11 @@ inline bool ar_take(std::future<std::vector<int32_t>> & fut, std::vector<int32_t
     return true;
 }
 
-// 短锁：仅包住一次 engine 调用
-inline bool lock_engine(State & st, std::unique_lock<std::timed_mutex> & lk, std::string & err) {
+// 短锁：仅包住一次 engine 调用 (timeout_ms <=0 时用 st.lock_timeout_ms)
+inline bool lock_engine(State & st, std::unique_lock<std::timed_mutex> & lk, std::string & err,
+                        int timeout_ms = 0) {
     lk = std::unique_lock<std::timed_mutex>(st.compute_mu, std::defer_lock);
-    if (!lk.try_lock_for(std::chrono::seconds(300))) {
+    if (!lk.try_lock_for(std::chrono::milliseconds(timeout_ms > 0 ? timeout_ms : st.lock_timeout_ms))) {
         st.n_timeouts++;
         err = "engine lock timeout";
         return false;
@@ -1274,7 +1300,7 @@ inline bool ensure_ref_locked(State & st, const SidecarCfg & side, const SynthPa
     auto eng = snapshot(st);
     if (!eng) { err = "engine not ready"; return false; }
     std::unique_lock<std::timed_mutex> lk(st.compute_mu, std::defer_lock);
-    if (!lk.try_lock_for(std::chrono::seconds(300))) { st.n_timeouts++; err = "engine lock timeout"; return false; }
+    if (!lk.try_lock_for(std::chrono::milliseconds(st.req_timeout_ms(p)))) { st.n_timeouts++; err = "engine lock timeout"; return false; }
     return ensure_ref(st, st.voice, *eng, side, p, ref, prm, pre, err);
 }
 
@@ -1298,7 +1324,7 @@ inline bool synth_segment_q(State & st, const SidecarCfg & side, const SynthPara
         auto eng = snapshot(st);
         if (!eng) { err = "engine not ready"; return false; }
         std::unique_lock<std::timed_mutex> lk(st.compute_mu, std::defer_lock);
-        if (!lk.try_lock_for(std::chrono::seconds(300))) { st.n_timeouts++; err = "engine lock timeout"; return false; }
+        if (!lk.try_lock_for(std::chrono::milliseconds(st.req_timeout_ms(p)))) { st.n_timeouts++; err = "engine lock timeout"; return false; }
         const double tb = now_s();
         if (!compute_bert(*eng, tgt, bert)) { err = "bert_feature(target) failed"; return false; }
         tm.bert_ms += (now_s() - tb) * 1000;
@@ -1315,11 +1341,11 @@ inline bool synth_segment_q(State & st, const SidecarCfg & side, const SynthPara
         auto task = ar_make_task(ar_key(st.voice, p), tgt.phones, bert, prm->phones, ref->codes,
                                  prm->bert, p.max_steps, p.early_stop, p.sampler, (uint64_t) seed);
         auto fut = st.ar_batcher->enqueue(task);
-        if (!ar_take(fut, sem, err)) return false;
+        if (!ar_take(fut, sem, err, st.req_timeout_ms(p))) return false;
     } else {
         auto eng2 = snapshot(st);
         std::unique_lock<std::timed_mutex> lk(st.compute_mu, std::defer_lock);
-        if (!lk.try_lock_for(std::chrono::seconds(300))) { st.n_timeouts++; err = "engine lock timeout"; return false; }
+        if (!lk.try_lock_for(std::chrono::milliseconds(st.req_timeout_ms(p)))) { st.n_timeouts++; err = "engine lock timeout"; return false; }
         if (!eng2->ar_generate(tgt.phones, bert, prm->phones, prm->bert, ref->codes, p.max_steps,
                                p.early_stop, (uint64_t) seed, sem, &p.sampler)) {
             err = "ar_generate failed";
@@ -1331,9 +1357,10 @@ inline bool synth_segment_q(State & st, const SidecarCfg & side, const SynthPara
     auto eng3 = snapshot(st);
     if (!eng3) { err = "engine not ready"; return false; }
     std::unique_lock<std::timed_mutex> lk(st.compute_mu, std::defer_lock);
-    if (!lk.try_lock_for(std::chrono::seconds(300))) { st.n_timeouts++; err = "engine lock timeout"; return false; }
+    if (!lk.try_lock_for(std::chrono::milliseconds(st.req_timeout_ms(p)))) { st.n_timeouts++; err = "engine lock timeout"; return false; }
     const int dbn = p.dbcache_fn >= 0 ? p.dbcache_fn : (p.steps >= 16 ? 8 : 0);
     eng3->set_dbcache(dbn, p.dbcache_thr, p.dbcache_warmup, p.dbcache_ds);
+    eng3->set_dit_alg(svc::dit_alg_of(p));
     const double t_sy = now_s();
     if (!eng3->synthesize(sem, tgt.phones, ref->codes, prm->phones, ref->ge, ref->mel2, ref->mel2_T,
                           p.steps, p.cfg, (uint64_t) seed, wav, p.speed)) {
@@ -1466,7 +1493,7 @@ inline bool synth_batch_texts_q(State & st, const SidecarCfg & side, const Synth
         if (units[k].err.empty() && !units[k].g2p.phones.empty()) {
             auto eng = snapshot(st);
             std::unique_lock<std::timed_mutex> lk(st.compute_mu, std::defer_lock);
-            if (!lk.try_lock_for(std::chrono::seconds(300))) { units[k].err = "engine lock timeout"; continue; }
+            if (!lk.try_lock_for(std::chrono::milliseconds(st.req_timeout_ms(p)))) { units[k].err = "engine lock timeout"; continue; }
             const double tb = now_s();
             if (!compute_bert(*eng, units[k].g2p, units[k].bert)) { units[k].err = "bert_feature failed"; continue; }
             t_bert[units[k].item] += (now_s() - tb) * 1000.0;
@@ -1536,9 +1563,10 @@ inline bool synth_batch_texts_q(State & st, const SidecarCfg & side, const Synth
             int melT = 0;
             {
                 std::unique_lock<std::timed_mutex> lk(st.compute_mu, std::defer_lock);
-                if (!lk.try_lock_for(std::chrono::seconds(300))) { u.err = "engine lock timeout"; continue; }
+                if (!lk.try_lock_for(std::chrono::milliseconds(st.req_timeout_ms(p)))) { u.err = "engine lock timeout"; continue; }
                 const int dbn = p.dbcache_fn >= 0 ? p.dbcache_fn : (p.steps >= 16 ? 8 : 0);
                 eng2->set_dbcache(dbn, p.dbcache_thr, p.dbcache_warmup, p.dbcache_ds);
+                eng2->set_dit_alg(svc::dit_alg_of(p));
                 const double ts = now_s();
                 try {
                     if (!eng2->synthesize_mel(u.sem, u.g2p.phones, ref->codes, prm->phones, ref->ge,

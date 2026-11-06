@@ -68,6 +68,30 @@ so the numbers above do not change. `tests/test_add_act.cpp` checks all four act
 a host reference on CPU and on every GPU backend; CI runs it under Mesa lavapipe, which exercises
 the Vulkan shader branch (max|diff| 2.4e-7).
 
+## DiT algorithm switches (2026-11-06, same machine/text/seed)
+
+Optional per-request switches; the defaults below are the shipped production values.
+Quality is measured on the DiT mel output (`mel_out`) against the all-off run — vocoded waveform
+correlation is dominated by phase and is not a usable fidelity proxy. The DiT column is the
+stage time from the server log (`dit`).
+
+| setting | mel relL1 | mel corr | DiT time | verdict |
+|---|---|---|---|---|
+| `dit_window=128` (default) | 0.000 | 1.000000 | ~0 | exact no-op on short utterances, near-lossless beyond; no speedup at these lengths |
+| `dit_cfg_off_t=0.95` (skip 5%) | 0.027 | 0.999544 | ~-2% | safest skip |
+| `dit_cfg_off_t=0.90` (skip 10%) | 0.058 | 0.997941 | ~-5% | good trade |
+| `dit_cfg_off_t=0.7` (default, skip 30%) | 0.120 | 0.991247 | ~-9% | shipped default; audible fidelity trade |
+| `dit_cfg_off_t=0.7` + `dit_uncond_reuse=1` | ~0.12 | ~0.99 | -32% | aggressive |
+| `dit_cfg_off_t=0.6` + `dit_uncond_reuse=1` | ~0.15 | ~0.99 | -35% | aggressive |
+
+Notes: the CFG skip is **not** lossless — the mel delta grows roughly linearly with the skip
+ratio, so opt down (0.9 = 10%) or off (0) when fidelity matters more than throughput.
+`dit_cfg_off_t` is an exact no-op for v5turbo (cfg=0, verified bit-identical). The CFG
+switches stack with cache-dit. `dit_window` follows DiTFastAttn (Window Attention with Residual
+Sharing), Yuan et al., NeurIPS 2024 — [arXiv:2406.08552](https://arxiv.org/abs/2406.08552) —
+in its plain windowed form with the reference segment kept as the global prefix; residual
+sharing is not used because it needs many denoising steps to pay off.
+
 ## CPU backend threading
 
 ggml's barrier spins while waiting, so on SMT CPUs the default hardware_concurrency() (logical

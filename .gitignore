@@ -9,6 +9,12 @@ tests/relcpu/*.obj
 *.obj
 *.dll
 
+# A/B 运行产物 (wav / 日志 / fixture 文本)
+tests/relcpu/e2e/
+tests/relcpu/*.log
+tests/relcpu/*.wav
+tests/relcpu/*.txt
+
 # models and exported weights
 models/
 *.gguf
