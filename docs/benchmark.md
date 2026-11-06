@@ -77,7 +77,6 @@ stage time from the server log (`dit`).
 
 | setting | mel relL1 | mel corr | DiT time | verdict |
 |---|---|---|---|---|
-| `dit_window=128` (default) | 0.000 | 1.000000 | ~0 | exact no-op on short utterances, near-lossless beyond; no speedup at these lengths |
 | `dit_cfg_off_t=0.95` (skip 5%) | 0.027 | 0.999544 | ~-2% | safest skip |
 | `dit_cfg_off_t=0.90` (skip 10%) | 0.058 | 0.997941 | ~-5% | good trade |
 | `dit_cfg_off_t=0.7` (default, skip 30%) | 0.120 | 0.991247 | ~-9% | shipped default; audible fidelity trade |
@@ -86,11 +85,8 @@ stage time from the server log (`dit`).
 
 Notes: the CFG skip is **not** lossless — the mel delta grows roughly linearly with the skip
 ratio, so opt down (0.9 = 10%) or off (0) when fidelity matters more than throughput.
-`dit_cfg_off_t` is an exact no-op for v5turbo (cfg=0, verified bit-identical). The CFG
-switches stack with cache-dit. `dit_window` follows DiTFastAttn (Window Attention with Residual
-Sharing), Yuan et al., NeurIPS 2024 — [arXiv:2406.08552](https://arxiv.org/abs/2406.08552) —
-in its plain windowed form with the reference segment kept as the global prefix; residual
-sharing is not used because it needs many denoising steps to pay off.
+`dit_cfg_off_t` is an exact no-op for v5turbo (cfg=0, verified bit-identical). Both switches
+stack with cache-dit.
 
 ## CPU backend threading
 

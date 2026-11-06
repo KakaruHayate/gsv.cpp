@@ -68,12 +68,11 @@ $voices = @("turbo-q8", "v5dev")
 foreach ($v in $voices) {
     Write-Host "`n================ voice=$v ================"
     # baseline: 显式全关 (与改动前逐位一致的口径)
-    $baseRun = Tts "$v-base" @{ voice = $v; dit_window = 0; dit_cfg_off_t = 0; dit_uncond_reuse = 0 }
+    $baseRun = Tts "$v-base" @{ voice = $v; dit_cfg_off_t = 0; dit_uncond_reuse = 0 }
     Write-Host ("  base(all-off) {0,6} ms  ({1} samples)" -f $baseRun.ms, $baseRun.samples.Length)
-    # 生产默认 (不传 dit_* -> 服务端默认 window=128 / cfg_off=0.7)
+    # 生产默认 (不传 dit_* -> 服务端默认 cfg_off=0.7)
     $cases = [ordered]@{
         "default(no-fields)" = @{ voice = $v }
-        "window128"        = @{ voice = $v; dit_window = 128 }
         "cfg.7(default)"   = @{ voice = $v; dit_cfg_off_t = 0.7 }
         "cfg.7+u1"         = @{ voice = $v; dit_cfg_off_t = 0.7; dit_uncond_reuse = 1 }
         "cfg.6+u1"         = @{ voice = $v; dit_cfg_off_t = 0.6; dit_uncond_reuse = 1 }

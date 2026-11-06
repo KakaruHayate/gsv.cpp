@@ -397,8 +397,6 @@ struct SynthParams {
     int dbcache_warmup = 8;
     int dbcache_ds = 4;
     // ---- DiT 算法级加速 (默认即生产配置; 语义见 gsv_dit.h alg_*) ----
-    // DiTFastAttn 窗口注意力 (帧). 0 = 关; 默认 128 (质量近无损)
-    int dit_window = 128;
     // CFG 截断 + Uncond 复用 (仅 cfg>0 生效; v5turbo 上为无操作)
     float dit_cfg_off_t = 0.7f;      // t>=该值的步跳过 Uncond; 跳过比率 = 1 - 该值 (默认跳 30%)
     int dit_uncond_reuse = 0;        // 0=关; 1=偶数步算 neg 奇数步复用; 2=奇数步线性外推
@@ -413,7 +411,6 @@ struct SynthParams {
 // SynthParams 的 DiT 算法开关 -> gsv_dit_alg
 inline gsv_dit_alg dit_alg_of(const SynthParams & p) {
     gsv_dit_alg a;
-    a.window        = p.dit_window;
     a.cfg_off_t     = p.dit_cfg_off_t;
     a.uncond_reuse  = p.dit_uncond_reuse;
     return a;

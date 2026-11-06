@@ -1,6 +1,6 @@
 // DiT 算法级加速 A/B 工具 (2026-11-06).
 //   1) 全关档与 tests/golden/cfm.* (torch 同输入 dump) 绝对对齐 — 验证 fixture 口径;
-//   2) 各开关 (DiTFastAttn 窗口 / CFG 截断+Uncond 复用) 对全关档的质量差 + 耗时;
+//   2) 各开关 (CFG 截断 + Uncond 复用) 对全关档的质量差 + 耗时;
 //   3) cfm.chunk.* 多 chunk 场景 A/B.
 // 用法:
 //   test_dit_opt [--device cpu|vulkan] [--models DIR] [--golden DIR]
@@ -169,9 +169,9 @@ int main(int argc, char ** argv) {
             return ok;
         };
 
-        // 全关档 = 上游口径: window/cfg_off_t/uncond_reuse 全 0 (struct 默认是生产值, 须显式清零)
+        // 全关档 = 上游口径: cfg_off_t / uncond_reuse 全 0 (struct 默认是生产值, 须显式清零)
         gsv_dit_alg off;
-        off.window = 0; off.cfg_off_t = 0.0f; off.uncond_reuse = 0;
+        off.cfg_off_t = 0.0f; off.uncond_reuse = 0;
         std::vector<float> m_off, m_tmp;
         double ms_off = 0, ms_cold = 0;
         CHECK(run(off, m_off, ms_cold));                   // 第一次: 建图 + 跑
@@ -201,40 +201,23 @@ int main(int argc, char ** argv) {
         std::vector<variant> vs;
         auto push = [&](const char * n, gsv_dit_alg a) { vs.push_back({ n, a }); };
         gsv_dit_alg prod;                                  // 生产默认 (128 / 0.7 / 0)
-        // 方向1: DiTFastAttn 局部窗 (gen = T-P 帧)
-        for (int w : {32, 64, 96, 128, 192, 256, 384, 512}) {
-            gsv_dit_alg a; a.window = w; a.cfg_off_t = 0.0f; a.uncond_reuse = 0;
-            char * nm = new char[16]; snprintf(nm, 16, "win%d", w);
-            push(nm, a);
-        }
-        // 方向3: CFG 截断 + Uncond 复用 (window 关, 隔离变量)
+        // 方向3: CFG 截断 + Uncond 复用
         for (float off : {0.95f, 0.90f, 0.85f, 0.80f, 0.70f, 0.60f, 0.50f}) {
-            gsv_dit_alg a; a.window = 0; a.cfg_off_t = off; a.uncond_reuse = 0;
+            gsv_dit_alg a; a.cfg_off_t = off; a.uncond_reuse = 0;
             char * nm = new char[20]; snprintf(nm, 20, "cfg%.2f", off);
             push(nm, a);
         }
         for (int ur : {1, 2}) {
-            gsv_dit_alg a; a.window = 0; a.cfg_off_t = 0.7f; a.uncond_reuse = ur;
+            gsv_dit_alg a; a.cfg_off_t = 0.7f; a.uncond_reuse = ur;
             char * nm = new char[20]; snprintf(nm, 20, "cfg0.70+u%d", ur);
             push(nm, a);
         }
         {
-            gsv_dit_alg a; a.window = 0; a.cfg_off_t = 0.6f; a.uncond_reuse = 1;
+            gsv_dit_alg a; a.cfg_off_t = 0.6f; a.uncond_reuse = 1;
             push("cfg0.60+u1", a);
         }
-        // 方向2: 参考段隔离 (= 参考段 KV 预计算的前提条件)
-        {
-            gsv_dit_alg a; a.window = 0; a.cfg_off_t = 0.0f; a.uncond_reuse = 0; a.ref_iso = 1;
-            push("ref_iso", a);
-        }
-        // 块级稀疏度实测: 生成段查询只保留 1/stride 的参考块 (模拟 SpargeAttention 选块)
-        for (float rk : {0.75f, 0.5f, 0.25f, 0.125f}) {
-            gsv_dit_alg a; a.window = 0; a.cfg_off_t = 0.0f; a.uncond_reuse = 0; a.ref_keep = rk;
-            char * nm = new char[20]; snprintf(nm, 20, "refkeep%.3f", (double) rk);
-            push(nm, a);
-        }
-        push("prod(128+.7)", prod);
-        push("all-off", []{ gsv_dit_alg a; a.window = 0; a.cfg_off_t = 0.0f; a.uncond_reuse = 0; a.ref_iso = 0; return a; }());
+        push("prod(cfg.70)", prod);
+        push("all-off", []{ gsv_dit_alg a; a.cfg_off_t = 0.0f; a.uncond_reuse = 0; return a; }());
         printf("  %-12s %10s %10s %10s %8s %9s %8s\n",
                "variant", "max|d|", "mean|d|", "relL1", "corr", "ms(warm)", "speedup");
         for (const variant & v : vs) {
@@ -280,7 +263,7 @@ int main(int argc, char ** argv) {
                     return dit->sample(mu_p, prompt.data(), P, T, steps, 0.0f, 1, nn.data(), mel);
                 };
                 gsv_dit_alg off;
-                off.window = 0; off.cfg_off_t = 0.0f; off.uncond_reuse = 0;
+                off.cfg_off_t = 0.0f; off.uncond_reuse = 0;
                 std::vector<float> m_off, m_try, mu_t((size_t) mu.size());
                 CHECK(run_mel(off, mu.data(), noise.data(), noise_scale, m_off));
                 metrics g1 = cmp_cols(out, m_off, 100, T, T - P, P, T - P);
@@ -360,7 +343,7 @@ int main(int argc, char ** argv) {
                 std::vector<float> m_off;
                 double ms_off = 0;
                 gsv_dit_alg off;
-                off.window = 0; off.cfg_off_t = 0.0f; off.uncond_reuse = 0;
+                off.cfg_off_t = 0.0f; off.uncond_reuse = 0;
                 for (int ci = 0; ci < 5; ci++) {
                     if (chunk_steps > 0) { if (cands[ci].steps != chunk_steps) continue; }
                     if (chunk_cfg >= 0.0f) { if (fabsf(cands[ci].cfg - chunk_cfg) > 1e-6f) continue; }
@@ -379,12 +362,11 @@ int main(int argc, char ** argv) {
                     struct variant { const char * name; gsv_dit_alg alg; };
                     std::vector<variant> vs;
                     gsv_dit_alg prod;                                  // 生产默认 (128 / 0.7 / 0)
-                    vs.push_back({ "window128", []{ gsv_dit_alg a; a.window = 128; return a; }() });
-                    if (cands[best_i].cfg > 1e-5f) {
+                                if (cands[best_i].cfg > 1e-5f) {
                         vs.push_back({ "cfg.7(default)", []{ gsv_dit_alg a; a.cfg_off_t = 0.7f; return a; }() });
                         vs.push_back({ "cfg.7+u1", []{ gsv_dit_alg a; a.cfg_off_t = 0.7f; a.uncond_reuse = 1; return a; }() });
                     }
-                    vs.push_back({ "prod(128+.7)", prod });
+                    vs.push_back({ "prod(cfg.70)", prod });
                     printf("  %-12s %10s %10s %10s %8s %9s %8s\n",
                            "variant", "max|d|", "mean|d|", "relL1", "corr", "ms(warm)", "speedup");
                     for (const variant & v : vs) {

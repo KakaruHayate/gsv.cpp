@@ -134,7 +134,6 @@ std::string openapi_json() {
     P("text_split_method", "string", "cut0..cut5 (default cut5)");
     P("fragment_interval", "number", "silence between segments, seconds");
     P("dbcache", "string", "cache-dit: off / auto / f4 / f8 / f16");
-    P("dit_window", "integer", "DiTFastAttn window in frames (0 = off, default 128)");
     P("dit_cfg_off_t", "number", "DiT alg: skip the Uncond branch for t >= this value (default 0.7 = skip last 30%)");
     P("dit_uncond_reuse", "integer", "DiT alg: 0 off / 1 reuse neg on odd steps / 2 linear extrapolation");
     P("timeout_ms", "integer", "override engine lock / scheduler / AR wait timeout in ms (<=0 = server default)");
@@ -232,7 +231,6 @@ void parse_params(const json & b, SynthParams & p) {
         p.dbcache_ds = (int) jnum(b, "dbcache_downsample", p.dbcache_ds);
     }
     // DiT 算法级加速 (默认即生产配置; 见 docs/usage.md "DiT 算法开关")
-    p.dit_window = (int) jnum(b, "dit_window", p.dit_window);
     p.dit_cfg_off_t = (float) jnum(b, "dit_cfg_off_t", p.dit_cfg_off_t);
     p.dit_uncond_reuse = (int) jnum(b, "dit_uncond_reuse", p.dit_uncond_reuse);
     // 超时覆盖 (毫秒; <=0 = 服务端默认)
@@ -1152,7 +1150,7 @@ int main(int argc, char ** argv) {
                                       "fragment_interval", "max_steps", "early_stop", "speed_factor", "skip_first_step",
                                       "dbcache", "dbcache_fn", "dbcache_threshold", "dbcache_warmup",
                                       "dbcache_downsample", "stream",
-                                      "dit_window", "dit_cfg_off_t", "dit_uncond_reuse",
+                                      "dit_cfg_off_t", "dit_uncond_reuse",
                                       "timeout_ms"};
         json body = json::object();
         for (const char * k : keys) if (req.has_param(k)) body[k] = req.get_param_value(k);

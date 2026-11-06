@@ -112,26 +112,18 @@ struct gsv_dit::impl {
     bool force_rebuild = false;            // cache-dit 切换后强制 prepare 重建图
 
     int T = 0, x_lens = 0, prompt_T = 0;
-    // 实验开关 (GSV_DIT_REF_ISO=1): 禁止参考段查询看到生成段键 (block-diagonal 注意力).
-    // 这是"参考段 KV 预计算"这一加速路线的可行性前提: 只有参考行与噪声目标解耦,
-    // 它的 K/V 才能在 chunk 内只算一次. 仅用于实验报告, 不进公开 API.
-    int ref_iso = 0;
-    float ref_keep = 1.0f;                   // 实验: 生成段查询保留的参考块比例
     bool debug = false;                      // GSV_DIT_DEBUG=1: 把中间张量标为 output 供读回
     bool mark_on = false;                    // 仅对 pos 图开启标记 (避免 neg 图重名)
     std::vector<float> cos_host, sin_host;   // [32*T]
 
     // ---- 算法级加速开关 (2026-11-06; 见 gsv_dit.h 的 alg_* 说明) ----
-    // 只保留两个实测可投产的: DiTFastAttn 窗口注意力 (alg_window) 与 CFG 截断 (alg_cfg_off_t).
+    // CFG 截断 (alg_cfg_off_t) + Uncond 复用 (alg_uncond_reuse), 均为运行期闸门.
     gsv_dit_alg alg;
-
-    ggml_tensor * dbg_b0_attn = nullptr;     // 实验: 供参考段跨步漂移测量读回
 
     void mark(ggml_tensor * t, const char * n) {
         if (!debug || !mark_on) return;
         ggml_set_output(t);
         ggml_set_name(t, n);
-        if (n && std::strcmp(n, "dbg_b0_attn") == 0) dbg_b0_attn = t;
     }
 
     // ---------------- 图内算子助手 (Domain B: ggml ne{C,T}) ----------------
@@ -441,42 +433,14 @@ bool gsv_dit::impl::make_persistents() {
     for (int t = 0; t < T; t++) maskrow[t] = (t < x_lens) ? 1.0f : 0.0f;
     ggml_backend_tensor_set(s->p_maskrow, maskrow.data(), 0, maskrow.size() * 4);
 
-    // 注意力 mask (F16, 加到 QK^T 分数上):
-    //   - 基础: k >= x_lens 的列 (padding) 置 -inf
-    //   - DiTFastAttn (alg_window>0): gen 查询行对 gen 键列只保留 |k-q| <= window 的带状区;
-    //     ref 查询行与全部 ref 键列恒为全局 (Prefix-Global + Local-Window).
-    //     论文: arXiv:2406.08552 (NeurIPS 2024), 纯窗口形式, 无残差共享.
+    // 注意力 mask (F16, 加到 QK^T 分数上): 只屏蔽 padding 列 (k >= x_lens).
     std::vector<ggml_fp16_t> am((size_t) T * T);
     const ggml_fp16_t f_keep = ggml_fp32_to_fp16(0.0f);
     const ggml_fp16_t f_mask = ggml_fp32_to_fp16(-1e30f);          // -> -inf
-    const int W = alg.window;
-    const int P = s->prompt_T;
     for (int q = 0; q < T; q++)
-        for (int k = 0; k < T; k++) {
-            bool keep = (k < x_lens);
-            if (keep && W > 0 && q >= P && k >= P) {
-                const int d = k - q;
-                keep = (d >= -W && d <= W);
-            }
-            // 参考段隔离 (实验): 参考查询禁止看到生成段键 -> 参考行跨步恒定, 可预计算
-            if (keep && s->ref_iso && q < P && k >= P) keep = false;
-            // 参考段块抽样 (实验): 生成段查询只看保留的参考块, 模拟块级稀疏注意力的可用稀疏度
-            if (keep && s->ref_keep < 0.999f && q >= P && k < P) {
-                const int blk = k / 16;                       // 16 帧一个块 (与 shader 粒度同量级)
-                const int stride = (int) std::lround(1.0f / s->ref_keep);
-                if (stride > 1 && (blk % stride) != 0) keep = false;
-            }
-            am[(size_t) k + (size_t) T * q] = keep ? f_keep : f_mask;
-        }
+        for (int k = 0; k < T; k++)
+            am[(size_t) k + (size_t) T * q] = (k < x_lens) ? f_keep : f_mask;
     ggml_backend_tensor_set(s->p_amask, am.data(), 0, am.size() * 2);
-    if (getenv("GSV_DIT_ALG_DEBUG")) {
-        size_t nmask = 0, nwin = 0;
-        for (size_t i = 0; i < am.size(); i++) if (am[i] == f_mask) nmask++;
-        for (int q = P; q < T; q++)
-            for (int k = P; k < T; k++) if (am[(size_t) k + (size_t) T * q] == f_mask) nwin++;
-        fprintf(stderr, "[dit-alg] T=%d x_lens=%d P=%d W=%d masked_total=%zu masked_beyond_P=%zu\n",
-                T, x_lens, P, W, nmask, nwin);
-    }
 
     ggml_backend_tensor_set(s->p_cos, s->cos_host.data(), 0, s->cos_host.size() * 4);
     ggml_backend_tensor_set(s->p_sin, s->sin_host.data(), 0, s->sin_host.size() * 4);
@@ -649,7 +613,6 @@ gsv_dit * gsv_dit::load(const std::string & gguf_path, const gsv_dit_cfg & cfg) 
     s.dbc.max_cont        = cfg.dbcache_max_cont;
     s.dbc.max_accum       = cfg.dbcache_max_accum;
     s.dbc.ds              = cfg.dbcache_downsample >= 1 ? cfg.dbcache_downsample : 1;
-    s.alg.window          = cfg.alg_window < 0 ? 0 : cfg.alg_window;
     s.alg.cfg_off_t       = cfg.alg_cfg_off_t < 0.0f ? 0.0f : (cfg.alg_cfg_off_t > 1.0f ? 1.0f : cfg.alg_cfg_off_t);
     s.alg.uncond_reuse    = (cfg.alg_uncond_reuse < 0 || cfg.alg_uncond_reuse > 2) ? 0 : cfg.alg_uncond_reuse;
 
@@ -800,14 +763,6 @@ bool gsv_dit::prepare(const float * prompt_mel, const float * mu, int T, int x_l
             s.sin_host[(size_t) i + 32 * (size_t) n] = sinf(a);
         }
 
-    {
-        // ref_iso 是结构性开关 (改掩码) -> 变化时重建图; 必须在 first 之前求值
-        if (s.ref_iso != (s.alg.ref_iso ? 1 : 0) || s.ref_keep != s.alg.ref_keep) {
-            s.ref_iso = s.alg.ref_iso ? 1 : 0;
-            s.ref_keep = s.alg.ref_keep;
-            s.force_rebuild = true;
-        }
-    }
     const bool first = (s.T != T || s.x_lens != x_lens || s.force_rebuild);
     if (first) {
         s.force_rebuild = false;
@@ -1150,20 +1105,14 @@ void gsv_dit::set_dbcache(int fn, float threshold, int warmup, int downsample) {
 
 int gsv_dit::dbcache_fn() const { return p->dbc.fn; }
 
-// 运行时算法开关: window 变更 -> 强制重建图 (mask 是持久张量, 下次 prepare 生效);
-// cfg_off_t / uncond_reuse 是运行期闸门, 直接生效.
+// 运行时算法开关: cfg_off_t / uncond_reuse 都是运行期闸门, 不改变图结构, 直接生效.
 void gsv_dit::set_alg(const gsv_dit_alg & a) {
     impl & s = *p;
     gsv_dit_alg n = a;
-    if (n.window < 0) n.window = 0;
     if (n.cfg_off_t < 0.0f) n.cfg_off_t = 0.0f;
     if (n.cfg_off_t > 1.0f) n.cfg_off_t = 1.0f;
     if (n.uncond_reuse < 0 || n.uncond_reuse > 2) n.uncond_reuse = 0;
-    n.ref_iso = n.ref_iso ? 1 : 0;
-    const bool structural = (n.window != s.alg.window) || (n.ref_iso != s.alg.ref_iso);
     s.alg = n;
-    if (!structural) return;
-    s.force_rebuild = true;
 }
 
 gsv_dit_alg gsv_dit::alg() const { return p->alg; }
@@ -1239,24 +1188,6 @@ bool gsv_dit::sample(const float * mu, const float * prompt, int P, int T, int s
     const int   ur      = s.alg.uncond_reuse;
     std::vector<float> neg_p1((size_t) MEL * T), neg_p2((size_t) MEL * T);
     int neg_count = 0;                        // 已实际算过的 neg 数 (外推至少要 2 个)
-    // ---- 实验: 参考段隐状态跨去噪步的漂移 (方向2 "冻结" 近似误差的直接度量) ----
-    // 需要 GSV_DIT_DEBUG=1 (让 dbg_b0_attn 成为图输出) + GSV_DIT_REFDRIFT=1.
-    const bool refdrift = getenv("GSV_DIT_REFDRIFT") != nullptr;
-    std::vector<float> ref0;
-    if (refdrift && !s.debug)
-        fprintf(stderr, "[refdrift] 需要 GSV_DIT_DEBUG=1 才有中间张量可读\n");
-    auto grab_ref_act = [&](std::vector<float> & dst) -> bool {
-        ggml_tensor * tt = s.dbg_b0_attn;
-        if (!tt) return false;
-        const int64_t D = tt->ne[0], TT = tt->ne[1];
-        if (TT < P) return false;
-        std::vector<float> full((size_t) D * (size_t) TT);
-        ggml_backend_tensor_get(tt, full.data(), 0, full.size() * 4);
-        dst.assign((size_t) D * (size_t) P, 0.0f);
-        for (int64_t k = 0; k < P; k++)
-            for (int64_t d = 0; d < D; d++) dst[(size_t) d + (size_t) D * (size_t) k] = full[(size_t) d + (size_t) D * (size_t) k];
-        return true;
-    };
     gsvprog::begin(3, steps);
     for (int j = 0; j < steps; j++) {
         gsvprog::tick();
@@ -1268,34 +1199,6 @@ bool gsv_dit::sample(const float * mu, const float * prompt, int P, int T, int s
             continue;
         }
         if (!velocity(x.data(), t, false, vel.data())) return false;
-        if (refdrift) {
-            std::vector<float> cur;
-            if (grab_ref_act(cur)) {
-                if (ref0.empty()) {
-                    ref0 = cur;
-                    fprintf(stderr, "[refdrift] alg(W=%d cfg_off=%.2f ur=%d ref_iso=%d) step=%2d t=%.3f  (baseline)\n",
-                            s.alg.window, s.alg.cfg_off_t, s.alg.uncond_reuse, s.alg.ref_iso, j, t);
-                } else {
-                    double num = 0, den = 0, sum_a = 0, sum_b = 0, sum_ab = 0, sum_sq = 0;
-                    const size_t n = std::min(ref0.size(), cur.size());
-                    for (size_t i = 0; i < n; i++) {
-                        num += std::fabs(cur[i] - ref0[i]);
-                        den += std::fabs(ref0[i]);
-                        sum_a += ref0[i]; sum_b += cur[i];
-                        sum_ab += (double) ref0[i] * cur[i];
-                        sum_sq += (double) ref0[i] * ref0[i];
-                    }
-                    const double ma = sum_a / (double) n, mb = sum_b / (double) n;
-                    double num_c = 0, da = 0, db = 0;
-                    for (size_t i = 0; i < n; i++) {
-                        const double u = ref0[i] - ma, v = cur[i] - mb;
-                        num_c += u * v; da += u * u; db += v * v;
-                    }
-                    const double corr = (da > 0 && db > 0) ? num_c / std::sqrt(da * db) : 1.0;
-                    fprintf(stderr, "[refdrift] step=%2d t=%.3f  ref-rows vs step0: relL1=%.4e corr=%.6f\n",
-                            j, t, num / (den > 0 ? den : 1.0), corr);                }
-            }
-        }
         const bool cfg_on = cfg > 1e-5f && !(cfg_off > 0.0f && t >= cfg_off);
         if (cfg_on) {
             const bool odd = (j & 1) != 0;

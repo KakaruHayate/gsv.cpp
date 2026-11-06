@@ -26,8 +26,6 @@ int main(int argc, char ** argv) {
     std::string models = "models", device = "vulkan", dit_path;
     int gen = 200, steps = 32, reps = 2;
     bool quad = false;
-    bool winsweep = false;
-    int P0 = 0;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         auto nx = [&]() { return std::string(argv[++i]); };
@@ -38,8 +36,6 @@ int main(int argc, char ** argv) {
         else if (a == "--steps") steps = atoi(nx().c_str());
         else if (a == "--reps") reps = atoi(nx().c_str());
         else if (a == "--quad") quad = true;
-        else if (a == "--winsweep") winsweep = true;
-        else if (a == "--P0") P0 = atoi(nx().c_str());
     }
     if (dit_path.empty()) dit_path = models + "/gsv-dev-placeholder.gguf";
     if (dit_path.find("placeholder") != std::string::npos)
@@ -50,41 +46,10 @@ int main(int argc, char ** argv) {
     if (!dit) { printf("[fail] load %s\n", dit_path.c_str()); return 1; }
     printf("dit=%s device=%s gen(frames)=%d steps=%d\n", dit_path.c_str(), device.c_str(), gen, steps);
 
-    gsv_dit_alg alg;                       // all-off: no window, no cfg truncation
-    alg.window = 0; alg.cfg_off_t = 0.0f; alg.uncond_reuse = 0; alg.ref_iso = 0;
+    gsv_dit_alg alg;                       // all-off: no cfg truncation
+    alg.cfg_off_t = 0.0f; alg.uncond_reuse = 0;
     dit->set_alg(alg);
 
-    if (winsweep) {
-        // 窗口掩码能否被 Vulkan FA 的 tile-skip 兑现成时间:
-        // 固定 P/gen, 只改 window. T 必须 >= block_cols*16 (~1024) 才会启用 mask_opt.
-        const int P = P0 > 0 ? P0 : P0 == 0 ? 1024 : 1024;
-        const int T = P + gen;
-        std::vector<float> mu((size_t) 512 * T), prompt((size_t) 100 * P), noise((size_t) 100 * T), mel;
-        fill(mu, 1u); fill(prompt, 2u); fill(noise, 3u);
-        printf("\nwinsweep: P=%d gen=%d T=%d steps=%d\n", P, gen, T, steps);
-        printf("%8s %12s %12s %10s\n", "window", "ms(warm)", "vs w=0", "speedup");
-        double base = 0;
-        std::vector<int> ws = { 0, 32, 64, 128, 256, 512, 0 };   // 末尾再测一次 w=0 作噪声对照
-        for (int W : ws) {
-            alg.window = W;
-            dit->set_alg(alg);
-            double warm = 0;
-            for (int r = 0; r < reps + 1; r++) {
-                const auto t0 = std::chrono::steady_clock::now();
-                const bool ok = dit->sample(mu.data(), prompt.data(), P, T, steps, 1.3f, 0,
-                                            noise.data(), mel);
-                const double ms = std::chrono::duration<double, std::milli>(
-                                      std::chrono::steady_clock::now() - t0).count();
-                if (!ok) { printf("[fail] W=%d\n", W); return 1; }
-                if (r > 0) warm = ms;
-            }
-            if (W == 0) base = warm;
-            printf("%8d %12.0f %12s %10s\n", W, warm, W == 0 ? "-" : "",
-                   W == 0 ? "-" : (std::to_string(base / warm).substr(0, 5) + "x").c_str());
-        }
-        delete dit;
-        return 0;
-    }
 
     printf("\n%6s %6s %10s %10s %10s\n", "P", "T", "ms(cold)", "ms(warm)", "ms/frame(P)");
     std::vector<std::pair<int, double>> pts;   // (P, warm ms)
