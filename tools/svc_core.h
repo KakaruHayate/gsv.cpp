@@ -823,7 +823,7 @@ inline bool synth_segment(State & st, gsv_engine & eng, const SidecarCfg & side,
     stage = 4;
     const double t_sy = now_s();
     if (!eng.synthesize(sem, tgt_phones, ref->codes, prm->phones, ref->ge, ref->mel2, ref->mel2_T,
-                        p.steps, p.cfg, (uint64_t) seed, wav, p.speed)) {
+                        p.steps, p.cfg, (uint64_t) seed, wav, p.speed, p.skip_steps)) {
         err = "synthesize failed";
         return false;
     }
@@ -964,7 +964,7 @@ inline bool synth_batch_segments(State & st, const SidecarCfg & side, const Synt
             std::vector<float> wav;
             if (!eng->synthesize(sems[k - off], tps[i]->g2p.phones, ref->codes, prm->phones, ref->ge,
                                  ref->mel2, ref->mel2_T, p.steps, p.cfg, (uint64_t) seed, wav,
-                                 p.speed)) {
+                                 p.speed, p.skip_steps)) {
                 errs[i] = "synthesize failed";
                 continue;
             }
@@ -1419,7 +1419,7 @@ inline bool synth_segment_q(State & st, const SidecarCfg & side, const SynthPara
     eng3->set_dit_alg(svc::dit_alg_of(p));
     const double t_sy = now_s();
     if (!eng3->synthesize(sem, tgt_phones, ref->codes, prm->phones, ref->ge, ref->mel2, ref->mel2_T,
-                          p.steps, p.cfg, (uint64_t) seed, wav, p.speed)) {
+                          p.steps, p.cfg, (uint64_t) seed, wav, p.speed, p.skip_steps)) {
         err = "synthesize failed";
         return false;
     }
