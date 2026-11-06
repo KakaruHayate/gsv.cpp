@@ -112,6 +112,10 @@ struct gsv_dit::impl {
     bool force_rebuild = false;            // cache-dit 切换后强制 prepare 重建图
 
     int T = 0, x_lens = 0, prompt_T = 0;
+    // 实验开关 (GSV_DIT_REF_ISO=1): 禁止参考段查询看到生成段键 (block-diagonal 注意力).
+    // 这是"参考段 KV 预计算"这一加速路线的可行性前提: 只有参考行与噪声目标解耦,
+    // 它的 K/V 才能在 chunk 内只算一次. 仅用于实验报告, 不进公开 API.
+    int ref_iso = 0;
     bool debug = false;                      // GSV_DIT_DEBUG=1: 把中间张量标为 output 供读回
     bool mark_on = false;                    // 仅对 pos 图开启标记 (避免 neg 图重名)
     std::vector<float> cos_host, sin_host;   // [32*T]
@@ -450,9 +454,19 @@ bool gsv_dit::impl::make_persistents() {
                 const int d = k - q;
                 keep = (d >= -W && d <= W);
             }
+            // 参考段隔离 (实验): 参考查询禁止看到生成段键 -> 参考行跨步恒定, 可预计算
+            if (keep && s->ref_iso && q < P && k >= P) keep = false;
             am[(size_t) k + (size_t) T * q] = keep ? f_keep : f_mask;
         }
     ggml_backend_tensor_set(s->p_amask, am.data(), 0, am.size() * 2);
+    if (getenv("GSV_DIT_ALG_DEBUG")) {
+        size_t nmask = 0, nwin = 0;
+        for (size_t i = 0; i < am.size(); i++) if (am[i] == f_mask) nmask++;
+        for (int q = P; q < T; q++)
+            for (int k = P; k < T; k++) if (am[(size_t) k + (size_t) T * q] == f_mask) nwin++;
+        fprintf(stderr, "[dit-alg] T=%d x_lens=%d P=%d W=%d masked_total=%zu masked_beyond_P=%zu\n",
+                T, x_lens, P, W, nmask, nwin);
+    }
 
     ggml_backend_tensor_set(s->p_cos, s->cos_host.data(), 0, s->cos_host.size() * 4);
     ggml_backend_tensor_set(s->p_sin, s->sin_host.data(), 0, s->sin_host.size() * 4);
@@ -776,6 +790,13 @@ bool gsv_dit::prepare(const float * prompt_mel, const float * mu, int T, int x_l
             s.sin_host[(size_t) i + 32 * (size_t) n] = sinf(a);
         }
 
+    {
+        // ref_iso 是结构性开关 (改掩码) -> 变化时重建图; 必须在 first 之前求值
+        if (s.ref_iso != (s.alg.ref_iso ? 1 : 0)) {
+            s.ref_iso = s.alg.ref_iso ? 1 : 0;
+            s.force_rebuild = true;
+        }
+    }
     const bool first = (s.T != T || s.x_lens != x_lens || s.force_rebuild);
     if (first) {
         s.force_rebuild = false;
@@ -1127,7 +1148,8 @@ void gsv_dit::set_alg(const gsv_dit_alg & a) {
     if (n.cfg_off_t < 0.0f) n.cfg_off_t = 0.0f;
     if (n.cfg_off_t > 1.0f) n.cfg_off_t = 1.0f;
     if (n.uncond_reuse < 0 || n.uncond_reuse > 2) n.uncond_reuse = 0;
-    const bool structural = (n.window != s.alg.window);
+    n.ref_iso = n.ref_iso ? 1 : 0;
+    const bool structural = (n.window != s.alg.window) || (n.ref_iso != s.alg.ref_iso);
     s.alg = n;
     if (!structural) return;
     s.force_rebuild = true;

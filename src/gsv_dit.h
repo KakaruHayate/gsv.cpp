@@ -57,6 +57,9 @@ struct gsv_dit_alg {
     int   window        = 128;
     float cfg_off_t     = 0.7f;
     int   uncond_reuse  = 0;
+    // 实验用 (不进公开 API): 1 = 参考段查询禁止看到生成段键 (block-diagonal 注意力).
+    // 用于验证"参考段 KV 预计算"这条加速路线的前提是否成立.
+    int   ref_iso       = 0;
 };
 
 class gsv_dit {
