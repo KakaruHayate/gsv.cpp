@@ -39,3 +39,6 @@ frontend/GPT_SoVITS/text/G2PWModel/
 
 # packaging output
 dist/
+
+# build output / local experiment scratch
+tests/relcpu/
