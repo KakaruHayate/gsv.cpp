@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
@@ -386,6 +387,12 @@ TtsOutcome run_tts(State & st, const SidecarCfg & side, ReqLog & rlog, const jso
     }
     const double total_ms = (now_s() - t0) * 1000;
 
+    // 生效的 cfg/steps: cfg_rate 不传时按 voice 版本自动解析 (v5dev 1.30 / 其它 0),
+    // 而 cfg=0 时 **CFG 支路根本不跑**, dit_cfg_off_t (界面上的 "CFG跳过") 也就无从生效。
+    // 不打印出来, "到底跳过了吗" 这类问题在日志里完全看不出来。
+    SynthParams eff = p;
+    resolve_auto_params(st, eff);
+
     if (!ok) {
         st.n_errors++;
         o.code = (ec == "busy") ? 503 : (ec == "timeout") ? 504 : (ec == "sidecar") ? 503 : 500;
@@ -398,11 +405,17 @@ TtsOutcome run_tts(State & st, const SidecarCfg & side, ReqLog & rlog, const jso
         o.meta = json{{"audio_s", (double) wav.size() / kSampleRate},
                       {"segments", tm.segments},
                       {"phones", tm.phones},
-                      {"ms", total_ms}};
-        std::printf("[tts %s] voice=%s segs=%d phones=%d audio=%.2fs | g2p %.0f prep %.0f bert %.0f "
-                    "ar %.0f cond %.0f dit %.0f voc %.0f synth %.0f | cache %d/%d | reuse ref=%d text=%d fea=%d/%d | total %.0f ms\n",
-                    rid.c_str(), st.voice.c_str(), tm.segments, tm.phones,
-                    (double) wav.size() / kSampleRate, tm.g2p_ms, tm.prep_ms, tm.bert_ms, tm.ar_ms,
+                      {"ms", total_ms},
+                      {"cfg_rate", eff.cfg},
+                      {"sample_steps", eff.steps},
+                      {"voice_version", st.version}};
+        std::printf("[tts %s] voice=%s(%s) segs=%d phones=%d audio=%.2fs cfg=%.2f steps=%d skip_cfg=%d%% | "
+                    "g2p %.0f prep %.0f bert %.0f ar %.0f cond %.0f dit %.0f voc %.0f synth %.0f | "
+                    "cache %d/%d | reuse ref=%d text=%d fea=%d/%d | total %.0f ms\n",
+                    rid.c_str(), st.voice.c_str(), st.version.c_str(), tm.segments, tm.phones,
+                    (double) wav.size() / kSampleRate, eff.cfg, eff.steps,
+                    (int) std::lround((1.0f - eff.dit_cfg_off_t) * 100.0f),
+                    tm.g2p_ms, tm.prep_ms, tm.bert_ms, tm.ar_ms,
                     tm.cond_ms, tm.dit_ms, tm.voc_ms, tm.synth_ms, tm.cache_hits,
                     tm.cache_hits + tm.cache_misses, tm.ref_hits, tm.text_hits, tm.fea_hits,
                     tm.fea_hits + tm.fea_misses, total_ms);
@@ -425,7 +438,10 @@ TtsOutcome run_tts(State & st, const SidecarCfg & side, ReqLog & rlog, const jso
                     {"phones", tm.phones},
                     {"reuse_ref", tm.ref_hits},
                     {"reuse_text", tm.text_hits},
-                    {"reuse_fea", tm.fea_hits}});
+                    {"reuse_fea", tm.fea_hits},
+                    {"cfg_rate", eff.cfg},
+                    {"sample_steps", eff.steps},
+                    {"dit_cfg_off_t", eff.dit_cfg_off_t}});
     return o;
 }
 
