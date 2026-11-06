@@ -1,4 +1,4 @@
-"""Is the per-sentence degradation caused by the fragmented synthesis path re-priming each
+﻿"""Is the per-sentence degradation caused by the fragmented synthesis path re-priming each
 fragment from the reference prompt?
 
 The user describes: every sentence starts by repeating the reference audio's content, then the
@@ -35,7 +35,7 @@ def tts(text, split, prompt_text, seed=3047):
         'ref_audio_path': ZH_REF.replace('\\', '/'), 'prompt_text': prompt_text,
         'prompt_lang': 'zh', 'seed': seed, 'sample_steps': 32, 'dbcache': 'off',
         'text_split_method': split, 'fragment_interval': 0.3,
-        'dit_cfg_off_t': 0.0, 'dit_uncond_reuse': 0, 'skip_first_step': 0,
+        'dit_uncond_reuse': 0, 'skip_first_step': 0,
     }
     data = json.dumps(body, ensure_ascii=False).encode('utf-8')
     req = urllib.request.Request('http://127.0.0.1:%d/tts' % PORT, data=data,

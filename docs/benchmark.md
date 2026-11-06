@@ -70,23 +70,18 @@ the Vulkan shader branch (max|diff| 2.4e-7).
 
 ## DiT algorithm switches (2026-11-06, same machine/text/seed)
 
-Optional per-request switches; the defaults below are the shipped production values.
-Quality is measured on the DiT mel output (`mel_out`) against the all-off run — vocoded waveform
-correlation is dominated by phase and is not a usable fidelity proxy. The DiT column is the
-stage time from the server log (`dit`).
+Optional per-request switch. Quality is measured on the DiT mel output (`mel_out`) against the
+all-off run — vocoded waveform correlation is dominated by phase and is not a usable fidelity
+proxy. The DiT column is the stage time from the server log (`dit`).
 
 | setting | mel relL1 | mel corr | DiT time | verdict |
 |---|---|---|---|---|
-| `dit_cfg_off_t=0.95` (skip 5%) | 0.027 | 0.999544 | ~-2% | safest skip |
-| `dit_cfg_off_t=0.90` (skip 10%) | 0.058 | 0.997941 | ~-5% | good trade |
-| `dit_cfg_off_t=0.7` (default, skip 30%) | 0.120 | 0.991247 | ~-9% | shipped default; audible fidelity trade |
-| `dit_cfg_off_t=0.7` + `dit_uncond_reuse=1` | ~0.12 | ~0.99 | -32% | aggressive |
-| `dit_cfg_off_t=0.6` + `dit_uncond_reuse=1` | ~0.15 | ~0.99 | -35% | aggressive |
+| all off (upstream behaviour) | 0 | 1.0 | — | default |
+| `dit_uncond_reuse=1` | 4.2e-3 | 0.99999 | ~-30% | only for voices with cfg > 0 (v5dev) |
+| `dit_uncond_reuse=2` | 2.6e-3 | 0.99999 | ~-28% | safer variant of the above |
 
-Notes: the CFG skip is **not** lossless — the mel delta grows roughly linearly with the skip
-ratio, so opt down (0.9 = 10%) or off (0) when fidelity matters more than throughput.
-`dit_cfg_off_t` is an exact no-op for v5turbo (cfg=0, verified bit-identical). Both switches
-stack with cache-dit.
+Notes: the switch does nothing when cfg = 0 (v5turbo / the `default` voice), because there is no
+Uncond branch to reuse then. It stacks with cache-dit.
 
 ## CPU backend threading
 

@@ -1,4 +1,4 @@
-"""Is the degradation a bad AR seed? Measure repetition directly on the AR token stream.
+﻿"""Is the degradation a bad AR seed? Measure repetition directly on the AR token stream.
 
 The AR (t2s) output is dumped as sem.i32 by the engine (GSV_ENGINE_DUMP). Autoregressive
 models can lock into a loop for particular seeds: the token stream then repeats an n-gram
@@ -33,7 +33,7 @@ def tts(seed):
         'ref_audio_path': REF, 'prompt_text': PROMPT, 'prompt_lang': 'en',
         'seed': seed, 'sample_steps': 32, 'dbcache': 'off',
         'text_split_method': 'cut0', 'fragment_interval': 0,
-        'dit_cfg_off_t': 0.0, 'dit_uncond_reuse': 0, 'skip_first_step': 0,
+        'dit_uncond_reuse': 0, 'skip_first_step': 0,
     }
     data = json.dumps(body, ensure_ascii=False).encode('utf-8')
     req = urllib.request.Request('http://127.0.0.1:%d/tts' % PORT, data=data,

@@ -1,13 +1,11 @@
-"""Verification for the 0.1.2 re-release: vocoder health + same-seed reproducibility.
+﻿"""Verification for the 0.1.2 re-release: vocoder health + same-seed reproducibility.
 
 Checks, in order:
   1. vocoder health   - waveform must be roughly symmetric and free of sub-100 Hz energy
                         (the stale-ggml bug produced min ~ -1548 vs max +23199 and 46% LF)
   2. same-seed rerun  - the identical request twice must be bit-identical
-  3. setting round-trip - A -> B(changed switch) -> A must return to A bit-identically
+  3. setting round-trip - A -> B(dit_uncond_reuse=1) -> A must return to A bit-identically
                         (catches cross-request state pollution when a switch changes)
-  4. switch effect    - the CFG switch must actually change the output, and by an amount
-                        consistent with the fixture measurements
 
 Requests are sent as UTF-8 bytes: PowerShell/urllib string bodies mangle non-ASCII.
 """
@@ -81,7 +79,7 @@ def main():
     fails = []
 
     print('=== 1. vocoder health (waveform symmetry, no DC/low-freq blow-up) ===')
-    off1 = stats(tts({'dit_cfg_off_t': 0, 'dit_uncond_reuse': 0}), 'all-off #1')
+    off1 = stats(tts({'dit_uncond_reuse': 0}), 'all-off #1')
     # the stale-DLL bug: min stayed near -1548 while max hit +23199, and LF>100Hz was ~46%
     if off1['min'] > -8000:
         fails.append('vocoder: waveform is one-sided (min=%.0f), suspect broken ggml' % off1['min'])
@@ -89,7 +87,7 @@ def main():
         fails.append('vocoder: %.1f%% of energy below 100 Hz (should be <8%%)' % off1['lf'])
 
     print('\n=== 2. same-seed rerun (must be bit-identical) ===')
-    off2 = stats(tts({'dit_cfg_off_t': 0, 'dit_uncond_reuse': 0}), 'all-off #2')
+    off2 = stats(tts({'dit_uncond_reuse': 0}), 'all-off #2')
     same = np.array_equal(off1['x'], off2['x'])
     print('  bit-identical:', same)
     if not same:
@@ -97,23 +95,17 @@ def main():
                      % relL1(off1['x'], off2['x']))
 
     print('\n=== 3. switch round-trip A -> B -> A (must return to A exactly) ===')
-    b = stats(tts({'dit_cfg_off_t': 0.7, 'dit_uncond_reuse': 0}), 'B: cfg_off=0.7')
+    b = stats(tts({'dit_uncond_reuse': 1}), 'B: uncond_reuse=1')
     print('  A vs B  relL1=%.6f corr=%.6f  (switch must have an effect)'
           % (relL1(off1['x'], b['x']), corr(off1['x'], b['x'])))
     if np.array_equal(off1['x'], b['x']):
-        fails.append('cfg_off_t=0.7 produced identical output to all-off; the switch is inert')
-    a2 = stats(tts({'dit_cfg_off_t': 0, 'dit_uncond_reuse': 0}), 'A again (after B)')
+        fails.append('dit_uncond_reuse=1 produced identical output; the switch is inert')
+    a2 = stats(tts({'dit_uncond_reuse': 0}), 'A again (after B)')
     back = np.array_equal(off1['x'], a2['x'])
     print('  A vs A(after B) bit-identical:', back)
     if not back:
         fails.append('changing a switch and changing it back does not reproduce A (relL1=%.6f)'
                      % relL1(off1['x'], a2['x']))
-
-    print('\n=== 4. reuse switch sanity ===')
-    u1 = stats(tts({'dit_cfg_off_t': 0.7, 'dit_uncond_reuse': 1}), 'cfg0.7 + u1')
-    print('  cfg0.7 vs cfg0.7+u1  relL1=%.6f' % relL1(b['x'], u1['x']))
-    if np.array_equal(b['x'], u1['x']):
-        fails.append('uncond_reuse had no effect')
 
     print('\n=== summary ===')
     if fails:

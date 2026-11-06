@@ -1,4 +1,4 @@
-"""Probe whether the seed (3047) or skip_first_step causes the reported degradation.
+﻿"""Probe whether the seed (3047) or skip_first_step causes the reported degradation.
 
 The user reported: after typing seed 3047, generation repeats the prompt text and loses the
 timbre. Two candidate causes: AR seed sensitivity, or skip_first_step (which skips the first
@@ -35,7 +35,7 @@ def tts(seed, skip, steps=32, dbcache='auto'):
         'seed': seed, 'sample_steps': steps, 'dbcache': dbcache,
         'skip_first_step': skip,
         'text_split_method': 'cut4', 'fragment_interval': 0.3,
-        'dit_cfg_off_t': 0.0, 'dit_uncond_reuse': 0,
+        'dit_uncond_reuse': 0,
     }
     data = json.dumps(body, ensure_ascii=False).encode('utf-8')
     req = urllib.request.Request('http://127.0.0.1:%d/tts' % PORT, data=data,

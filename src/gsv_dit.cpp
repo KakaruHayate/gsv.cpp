@@ -116,8 +116,8 @@ struct gsv_dit::impl {
     bool mark_on = false;                    // 仅对 pos 图开启标记 (避免 neg 图重名)
     std::vector<float> cos_host, sin_host;   // [32*T]
 
-    // ---- 算法级加速开关 (2026-11-06; 见 gsv_dit.h 的 alg_* 说明) ----
-    // CFG 截断 (alg_cfg_off_t) + Uncond 复用 (alg_uncond_reuse), 均为运行期闸门.
+    // ---- 算法级加速开关 (见 gsv_dit.h 的 alg_* 说明) ----
+    // Uncond 复用 (alg_uncond_reuse), 运行期闸门.
     gsv_dit_alg alg;
 
     void mark(ggml_tensor * t, const char * n) {
@@ -613,7 +613,6 @@ gsv_dit * gsv_dit::load(const std::string & gguf_path, const gsv_dit_cfg & cfg) 
     s.dbc.max_cont        = cfg.dbcache_max_cont;
     s.dbc.max_accum       = cfg.dbcache_max_accum;
     s.dbc.ds              = cfg.dbcache_downsample >= 1 ? cfg.dbcache_downsample : 1;
-    s.alg.cfg_off_t       = cfg.alg_cfg_off_t < 0.0f ? 0.0f : (cfg.alg_cfg_off_t > 1.0f ? 1.0f : cfg.alg_cfg_off_t);
     s.alg.uncond_reuse    = (cfg.alg_uncond_reuse < 0 || cfg.alg_uncond_reuse > 2) ? 0 : cfg.alg_uncond_reuse;
 
     ggml_backend_dev_t dev = nullptr;
@@ -1105,12 +1104,10 @@ void gsv_dit::set_dbcache(int fn, float threshold, int warmup, int downsample) {
 
 int gsv_dit::dbcache_fn() const { return p->dbc.fn; }
 
-// 运行时算法开关: cfg_off_t / uncond_reuse 都是运行期闸门, 不改变图结构, 直接生效.
+// 运行时算法开关: uncond_reuse 是运行期闸门, 不改变图结构, 直接生效.
 void gsv_dit::set_alg(const gsv_dit_alg & a) {
     impl & s = *p;
     gsv_dit_alg n = a;
-    if (n.cfg_off_t < 0.0f) n.cfg_off_t = 0.0f;
-    if (n.cfg_off_t > 1.0f) n.cfg_off_t = 1.0f;
     if (n.uncond_reuse < 0 || n.uncond_reuse > 2) n.uncond_reuse = 0;
     s.alg = n;
 }
@@ -1182,9 +1179,7 @@ bool gsv_dit::sample(const float * mu, const float * prompt, int P, int T, int s
 
     const float step = 1.0f / (float) steps;
     std::vector<float> vel((size_t) MEL * T), neg((size_t) MEL * T);
-    // CFG 截断 (t >= cfg_off_t 的步跳过 Uncond, 等价 cfg_scale=1.0) +
-    //        Uncond 复用 (偶数步算 neg; 奇数步复用/线性外推, 不走网络)
-    const float cfg_off = s.alg.cfg_off_t;
+    // Uncond 复用 (偶数步算 neg; 奇数步复用/线性外推, 不走网络); cfg = 0 时没有 Uncond 分支
     const int   ur      = s.alg.uncond_reuse;
     std::vector<float> neg_p1((size_t) MEL * T), neg_p2((size_t) MEL * T);
     int neg_count = 0;                        // 已实际算过的 neg 数 (外推至少要 2 个)
@@ -1199,7 +1194,7 @@ bool gsv_dit::sample(const float * mu, const float * prompt, int P, int T, int s
             continue;
         }
         if (!velocity(x.data(), t, false, vel.data())) return false;
-        const bool cfg_on = cfg > 1e-5f && !(cfg_off > 0.0f && t >= cfg_off);
+        const bool cfg_on = cfg > 1e-5f;
         if (cfg_on) {
             const bool odd = (j & 1) != 0;
             if (odd && neg_count >= 1 && ur == 1) {

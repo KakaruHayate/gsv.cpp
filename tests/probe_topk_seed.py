@@ -1,4 +1,4 @@
-"""Does the user's sampler setting (top_k=5) make some seeds loop?
+﻿"""Does the user's sampler setting (top_k=5) make some seeds loop?
 
 The GUI sends top_k=5, top_p=1.0, temperature=1.0, repetition_penalty=1.35 while the engine
 default is top_k=15. A very peaked sampler raises the chance that an autoregressive model
@@ -32,7 +32,7 @@ def tts(seed, top_k):
         'prompt_lang': 'zh', 'seed': seed, 'sample_steps': 32, 'dbcache': 'off',
         'top_k': top_k, 'top_p': 1.0, 'temperature': 1.0, 'repetition_penalty': 1.35,
         'text_split_method': 'cut4', 'fragment_interval': 0.3,
-        'dit_cfg_off_t': 0.0, 'dit_uncond_reuse': 0, 'skip_first_step': 0,
+        'dit_uncond_reuse': 0, 'skip_first_step': 0,
     }
     data = json.dumps(body, ensure_ascii=False).encode('utf-8')
     req = urllib.request.Request('http://127.0.0.1:%d/tts' % PORT, data=data,

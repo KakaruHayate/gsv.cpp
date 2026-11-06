@@ -1,4 +1,4 @@
-"""Does every fragment start with the same lead-in (the prompt's content re-spoken)?
+﻿"""Does every fragment start with the same lead-in (the prompt's content re-spoken)?
 
 Takes the first N seconds of the fragmented output as a template and correlates it across the
 whole output. If each fragment opens by re-speaking the reference prompt, the template shows up
@@ -30,7 +30,7 @@ def tts(split, seed=3047):
         'ref_audio_path': ZH_REF.replace('\\', '/'), 'prompt_text': ZH_REF_TEXT,
         'prompt_lang': 'zh', 'seed': seed, 'sample_steps': 32, 'dbcache': 'off',
         'text_split_method': split, 'fragment_interval': 0.3,
-        'dit_cfg_off_t': 0.0, 'dit_uncond_reuse': 0, 'skip_first_step': 0,
+        'dit_uncond_reuse': 0, 'skip_first_step': 0,
     }
     data = json.dumps(body, ensure_ascii=False).encode('utf-8')
     req = urllib.request.Request('http://127.0.0.1:%d/tts' % PORT, data=data,

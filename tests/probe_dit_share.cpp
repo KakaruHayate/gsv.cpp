@@ -1,4 +1,4 @@
-// Probe how the DiT forward cost splits between the reference (prompt) segment and the
+﻿// Probe how the DiT forward cost splits between the reference (prompt) segment and the
 // generated segment. Direction 2 (precompute the reference rows once per chunk) can only pay
 // off in proportion to the reference share, so measure it instead of assuming it.
 //
@@ -47,7 +47,7 @@ int main(int argc, char ** argv) {
     printf("dit=%s device=%s gen(frames)=%d steps=%d\n", dit_path.c_str(), device.c_str(), gen, steps);
 
     gsv_dit_alg alg;                       // all-off: no cfg truncation
-    alg.cfg_off_t = 0.0f; alg.uncond_reuse = 0;
+    alg.uncond_reuse = 0;
     dit->set_alg(alg);
 
 

@@ -105,8 +105,8 @@ public:
     // cache-dit 运行时配置（fn<=0 关闭；仅影响 DiT，调用方需持有 engine 锁）
     void set_dbcache(int fn, float threshold, int warmup, int downsample);
     int  dbcache_fn() const;
-    // DiT 算法级加速开关 (CFG 截断 + Uncond 复用; 默认即生产配置).
-    // 两者都是运行期闸门, 切档不需要重建图.
+    // DiT 算法级加速开关 (Uncond 复用).
+    // 运行期闸门, 切档不需要重建图.
     void set_dit_alg(const gsv_dit_alg & a);
     gsv_dit_alg dit_alg() const;
     // 最近一次 DiT 采样的 cache-dit 命中统计（pos+neg 合计）

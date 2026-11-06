@@ -1,4 +1,4 @@
-"""Does the reference audio's sample rate change how faithfully the engine conditions on it?
+﻿"""Does the reference audio's sample rate change how faithfully the engine conditions on it?
 
 GAG converts non-wav references with soundfile and keeps the source rate, so an mp3 typically
 arrives as 44.1 kHz mono PCM16. This checks the same audio content at 16/22.05/32/44.1/48 kHz:
@@ -56,7 +56,7 @@ def tts(ref_path):
         'ref_audio_path': ref_path, 'prompt_text': PROMPT, 'prompt_lang': 'en',
         'seed': 12345, 'sample_steps': 32, 'dbcache': 'off',
         'text_split_method': 'cut0', 'fragment_interval': 0,
-        'dit_cfg_off_t': 0.0, 'dit_uncond_reuse': 0, 'skip_first_step': 0,
+        'dit_uncond_reuse': 0, 'skip_first_step': 0,
     }
     data = json.dumps(body, ensure_ascii=False).encode('utf-8')
     req = urllib.request.Request('http://127.0.0.1:%d/tts' % PORT, data=data,

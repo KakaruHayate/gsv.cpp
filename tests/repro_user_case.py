@@ -1,4 +1,4 @@
-"""Reproduce the reported case: matched Chinese reference, long Chinese text, cut4, seed sweep.
+﻿"""Reproduce the reported case: matched Chinese reference, long Chinese text, cut4, seed sweep.
 
 Step 1 builds a reference whose audio really says the prompt text (bootstrap from the English
 VCTK clip), so the AR prompt conditioning is sound -- that is the user's situation.
@@ -81,7 +81,7 @@ def main():
                    'ref_audio_path': zh_ref.replace('\\', '/'), 'prompt_text': ZH_REF_TEXT,
                    'prompt_lang': 'zh', 'seed': seed, 'sample_steps': 32, 'dbcache': 'off',
                    'text_split_method': 'cut4', 'fragment_interval': 0.3,
-                   'dit_cfg_off_t': 0.0, 'dit_uncond_reuse': 0, 'skip_first_step': 0})
+                   'dit_uncond_reuse': 0, 'skip_first_step': 0})
         sec = wave.open(io.BytesIO(wav), 'rb').getnframes() / 48000.0
         if not os.path.exists(sem_path):
             print('%-8d %8s %10s %10s %8.2f (no dump)' % (seed, '?', '?', '?', sec))

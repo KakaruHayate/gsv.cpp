@@ -200,21 +200,19 @@ curl -X POST http://127.0.0.1:9880/tts -H "Content-Type: application/json" -d @r
 If `sample_steps` / `cfg_rate` are omitted they follow the voice version (v5turbo 4 / 0.0,
 v5dev 32 / 1.30). Bind to loopback only unless `--token <secret>` is set.
 
-### DiT algorithm switches (optional, default = production config)
+### DiT algorithm switch (optional)
 
-Per-request JSON fields (also accepted as GET query params). The defaults are the shipped
-production values; both switches are runtime gates, so changing them does not rebuild the
-DiT graph.
+Per-request JSON field (also accepted as a GET query param). It is a runtime gate, so changing it
+does not rebuild the DiT graph.
 
 | field | default | meaning |
 |---|---|---|
-| `dit_cfg_off_t` | 0.7 | skip the Uncond branch once `t >= dit_cfg_off_t` (equivalent to cfg_scale = 1.0 for those steps). **The skip ratio is `1 - dit_cfg_off_t`**: 0.7 skips the last 30% of steps. Only affects voices with cfg > 0 (v5dev); for v5turbo (cfg 0) it is an exact no-op. This is a real fidelity/speed trade, not a free win — see the table below. |
 | `dit_uncond_reuse` | 0 | 0 = off; 1 = compute the Uncond branch only on even steps and reuse it on odd steps; 2 = linear extrapolation `2*neg[k-1] - neg[k-2]` on odd steps. |
 
-Example (v5dev, skip the last 40% of steps + odd-step Uncond reuse):
+Example (v5dev, odd-step Uncond reuse):
 
 ```json
-{ "text": "...", "voice": "v5dev", "dit_cfg_off_t": 0.6, "dit_uncond_reuse": 1 }
+{ "text": "...", "voice": "v5dev", "dit_uncond_reuse": 1 }
 ```
 
 Measured on RTX 2070 / Vulkan with the DiT-only fixture (T=1000 frames = 500 reference + 500
@@ -222,29 +220,19 @@ generated, 32 steps, cfg 1.30) against the all-off run at the same seed. Deltas 
 mel output (`relL1` / correlation of `mel_out`) — vocoded waveform correlation is dominated by
 phase and is not a usable fidelity proxy:
 
-| setting | skip | mel relL1 | mel corr | DiT time |
-|---|---|---|---|---|
-| `dit_cfg_off_t=0.95` | 5% | 2.5e-4 | 1.00000 | 1.01x |
-| `dit_cfg_off_t=0.90` | 10% | 6.5e-4 | 1.00000 | 1.02x |
-| `dit_cfg_off_t=0.85` | 15% | 8.3e-4 | 1.00000 | 1.02x |
-| `dit_cfg_off_t=0.80` | 20% | 1.2e-3 | 1.00000 | 1.06x |
-| `dit_cfg_off_t=0.7` (default) | 30% | 1.6e-3 | 0.99999 | 1.11x |
-| `dit_cfg_off_t=0.60` | 40% | 2.0e-3 | 0.99999 | 1.20x |
-| `dit_cfg_off_t=0.50` | 50% | 2.4e-3 | 0.99998 | 1.33x |
-| `dit_cfg_off_t=0.7` + `dit_uncond_reuse=1` | 30% | 4.2e-3 | 0.99999 | 1.45x |
-| `dit_cfg_off_t=0.7` + `dit_uncond_reuse=2` | 30% | 2.6e-3 | 0.99999 | 1.39x |
-| `dit_cfg_off_t=0.6` + `dit_uncond_reuse=1` | 40% | 4.1e-3 | 0.99998 | 1.54x |
+| setting | mel relL1 | mel corr | DiT time |
+|---|---|---|---|
+| `dit_uncond_reuse=1` | 4.2e-3 | 0.99999 | 1.45x |
+| `dit_uncond_reuse=2` | 2.6e-3 | 0.99999 | 1.39x |
 
-The mel delta grows roughly linearly with the skip ratio, so pick the point you can afford:
-0.90 (10%) is nearly free, 0.70 with `dit_uncond_reuse=1` is the speed sweet spot. Both stack
-with cache-dit, and both are exact no-ops on v5turbo (cfg = 0, verified bit-identical).
+It stacks with cache-dit and is an exact no-op on voices with cfg = 0 (v5turbo and `default`,
+verified bit-identical) because there is no Uncond branch to reuse there.
 
 #### Reference
 
-The trick is to stop paying for the Uncond branch once the trajectory is close to clean data:
-`x_t` is nearly denoised there, so the cond/uncond velocity fields have converged and dropping
-the CFG amplification costs little. `dit_uncond_reuse` goes one step further and reuses (or
-linearly extrapolates) the last computed Uncond velocity instead of evaluating the network.
+The trick is to stop paying for the Uncond branch on every step once the trajectory is close to
+clean data: reuse (or linearly extrapolate) the last computed Uncond velocity instead of
+evaluating the network again.
 
 ### Timeouts
 

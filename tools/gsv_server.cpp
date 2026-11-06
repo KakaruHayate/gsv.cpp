@@ -135,7 +135,6 @@ std::string openapi_json() {
     P("text_split_method", "string", "cut0..cut5 (default cut5)");
     P("fragment_interval", "number", "silence between segments, seconds");
     P("dbcache", "string", "cache-dit: off / auto / f4 / f8 / f16");
-    P("dit_cfg_off_t", "number", "DiT alg: skip the Uncond branch for t >= this value (default 0.7 = skip last 30%)");
     P("dit_uncond_reuse", "integer", "DiT alg: 0 off / 1 reuse neg on odd steps / 2 linear extrapolation");
     P("timeout_ms", "integer", "override engine lock / scheduler / AR wait timeout in ms (<=0 = server default)");
     P("stream", "boolean", "true = chunked audio/wav, PCM is flushed per text segment");
@@ -231,8 +230,7 @@ void parse_params(const json & b, SynthParams & p) {
         p.dbcache_warmup = (int) jnum(b, "dbcache_warmup", p.dbcache_warmup);
         p.dbcache_ds = (int) jnum(b, "dbcache_downsample", p.dbcache_ds);
     }
-    // DiT 算法级加速 (默认即生产配置; 见 docs/usage.md "DiT 算法开关")
-    p.dit_cfg_off_t = (float) jnum(b, "dit_cfg_off_t", p.dit_cfg_off_t);
+    // DiT 算法级加速 (见 docs/usage.md "DiT 算法开关")
     p.dit_uncond_reuse = (int) jnum(b, "dit_uncond_reuse", p.dit_uncond_reuse);
     // 超时覆盖 (毫秒; <=0 = 服务端默认)
     p.timeout_ms = (int) jnum(b, "timeout_ms", p.timeout_ms);
@@ -387,9 +385,8 @@ TtsOutcome run_tts(State & st, const SidecarCfg & side, ReqLog & rlog, const jso
     }
     const double total_ms = (now_s() - t0) * 1000;
 
-    // 生效的 cfg/steps: cfg_rate 不传时按 voice 版本自动解析 (v5dev 1.30 / 其它 0),
-    // 而 cfg=0 时 **CFG 支路根本不跑**, dit_cfg_off_t (界面上的 "CFG跳过") 也就无从生效。
-    // 不打印出来, "到底跳过了吗" 这类问题在日志里完全看不出来。
+    // 生效的 cfg/steps: cfg_rate 不传时按 voice 版本自动解析 (v5dev 1.30 / 其它 0)。
+    // cfg=0 时 CFG 支路根本不跑, 打出来才能一眼看出这次到底有没有 CFG。
     SynthParams eff = p;
     resolve_auto_params(st, eff);
 
@@ -409,12 +406,11 @@ TtsOutcome run_tts(State & st, const SidecarCfg & side, ReqLog & rlog, const jso
                       {"cfg_rate", eff.cfg},
                       {"sample_steps", eff.steps},
                       {"voice_version", st.version}};
-        std::printf("[tts %s] voice=%s(%s) segs=%d phones=%d audio=%.2fs cfg=%.2f steps=%d skip_cfg=%d%% | "
+        std::printf("[tts %s] voice=%s(%s) segs=%d phones=%d audio=%.2fs cfg=%.2f steps=%d | "
                     "g2p %.0f prep %.0f bert %.0f ar %.0f cond %.0f dit %.0f voc %.0f synth %.0f | "
                     "cache %d/%d | reuse ref=%d text=%d fea=%d/%d | total %.0f ms\n",
                     rid.c_str(), st.voice.c_str(), st.version.c_str(), tm.segments, tm.phones,
                     (double) wav.size() / kSampleRate, eff.cfg, eff.steps,
-                    (int) std::lround((1.0f - eff.dit_cfg_off_t) * 100.0f),
                     tm.g2p_ms, tm.prep_ms, tm.bert_ms, tm.ar_ms,
                     tm.cond_ms, tm.dit_ms, tm.voc_ms, tm.synth_ms, tm.cache_hits,
                     tm.cache_hits + tm.cache_misses, tm.ref_hits, tm.text_hits, tm.fea_hits,
@@ -440,8 +436,7 @@ TtsOutcome run_tts(State & st, const SidecarCfg & side, ReqLog & rlog, const jso
                     {"reuse_text", tm.text_hits},
                     {"reuse_fea", tm.fea_hits},
                     {"cfg_rate", eff.cfg},
-                    {"sample_steps", eff.steps},
-                    {"dit_cfg_off_t", eff.dit_cfg_off_t}});
+                    {"sample_steps", eff.steps}});
     return o;
 }
 
@@ -1179,7 +1174,7 @@ int main(int argc, char ** argv) {
                                       "fragment_interval", "max_steps", "early_stop", "speed_factor", "skip_first_step",
                                       "dbcache", "dbcache_fn", "dbcache_threshold", "dbcache_warmup",
                                       "dbcache_downsample", "stream",
-                                      "dit_cfg_off_t", "dit_uncond_reuse",
+                                      "dit_uncond_reuse",
                                       "timeout_ms"};
         json body = json::object();
         for (const char * k : keys) if (req.has_param(k)) body[k] = req.get_param_value(k);

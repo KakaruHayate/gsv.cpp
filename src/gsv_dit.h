@@ -36,18 +36,15 @@ struct gsv_dit_cfg {
     float dbcache_max_accum       = 0.0f;   // max_accumulated_residual_diff_threshold (0 关)
     int   dbcache_downsample      = 4;      // Fn 残差缓冲时间下采样 (上游 downsample_factor; 1=关)
 
-    // ---- 算法级加速开关 (2026-11-06; 默认值即生产配置) ----
-    //   alg_cfg_off_t: t >= 该值的步跳过 Uncond 分支 (跳过比率 = 1 - alg_cfg_off_t).
-    //   默认 0.7 = 跳过末 30% 步; 实测 mel relL1 1.6e-3, DiT 1.11x.
-    float alg_cfg_off_t    = 0.7f;
+    // ---- 算法级加速开关 ----
     //   0 = 关; 1 = 偶数步算 neg、奇数步直接复用上一步的 neg; 2 = 奇数步线性外推 2*neg[k-1]-neg[k-2]
+    //   (只在 cfg > 0 时有意义: cfg = 0 时根本没有 Uncond 分支)
     int   alg_uncond_reuse = 0;
 };
 
 // 运行时算法开关 (结构同 gsv_dit_cfg 的 alg_* 字段; 供前端逐请求切换).
-// 两个字段都是运行期闸门, 不改变图结构, 因此切档不需要重建图.
+// 运行期闸门, 不改变图结构, 因此切档不需要重建图.
 struct gsv_dit_alg {
-    float cfg_off_t     = 0.7f;
     int   uncond_reuse  = 0;
 };
 
