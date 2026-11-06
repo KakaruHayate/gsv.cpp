@@ -35,6 +35,11 @@ if errorlevel 1 exit /b 1
 cl /nologo /O2 /EHsc /W1 %INC% tests\test_cond_bridge.cpp src\gsv_cond.cpp /Fe:tests\test_cond_bridge.exe /Fo:tests\ /link %LIBS%
 if errorlevel 1 exit /b 1
 
+REM reference chain must be repeatable (regression: from the 2nd prepare on, prompt_codes degenerated
+REM into a single constant because the hubert g2 attention mask lived in the galloc arena)
+cl /nologo /O2 /EHsc /W1 /std:c++17 /arch:AVX2 /openmp %INC% /I third_party tests\test_prep_repeat.cpp src\gsv_hubert.cpp src\gsv_refcode.cpp src\gsv_mel.cpp /Fe:tests\test_prep_repeat.exe /Fo:tests\ /link %LIBS%
+if errorlevel 1 exit /b 1
+
 copy /y llama.cpp\build-cpu\bin\Debug\ggml*.dll tests\ >nul
 echo.
 echo [ok] build done. parity:
@@ -46,3 +51,4 @@ echo      tests\test_ar_engine.exe  models\gsv-ar-f32.gguf tests\golden
 echo      tests\test_bert_ggml.exe  (GSV_BERT_DEVICE=vulkan for GPU)
 echo      tests\test_cond_rvq.exe models\gsv-cond-f32.gguf tests\golden
 echo      tests\test_cond_bridge.exe models\gsv-cond-f32.gguf tests\golden  (GSV_COND_DEVICE=vulkan for GPU)
+echo      tests\test_prep_repeat.exe models <ref.wav> [other.wav]  (reference chain must be repeatable)

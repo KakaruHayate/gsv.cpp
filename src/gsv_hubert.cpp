@@ -60,6 +60,10 @@ struct gsv_hubert::impl {
     ggml_cgraph  * g2 = nullptr;
     ggml_tensor  * g2_in = nullptr;
     ggml_tensor  * g2_out = nullptr;     // [768, T]
+    // g2 的常驻 mask: 独占 ctx + buffer, 不参与 galloc 的 arena 复用 (见 build_g2 的说明)
+    ggml_context * msk_ctx = nullptr;
+    ggml_backend_buffer_t msk_buf = nullptr;
+    ggml_tensor  * g2_msk = nullptr;     // [T, T] F16 全零
 
     // pos_conv / enc LN 的权重由 host 使用 —— load 时拷回一份常驻, 避免每次 encode 传输 18.9MB
     std::vector<float> pos_w, pos_b, enc_nw, enc_nb;
@@ -176,15 +180,32 @@ struct gsv_hubert::impl {
 
     void build_g2() {
         if (g2_ctx) { if (g2_galloc) { ggml_gallocr_free(g2_galloc); g2_galloc = nullptr; } ggml_free(g2_ctx); g2_ctx = nullptr; g2 = nullptr; g2_in = g2_out = nullptr; }
+        if (msk_ctx) { if (msk_buf) { ggml_backend_buffer_free(msk_buf); msk_buf = nullptr; } ggml_free(msk_ctx); msk_ctx = nullptr; g2_msk = nullptr; }
         if (getenv("GSV_HUBERT_DEBUG")) fprintf(stderr, "  [g2] ctx init...\n");
         ggml_init_params ip = { ggml_tensor_overhead() * 16384, NULL, true };
         g2_ctx = ggml_init(ip);
         ggml_tensor * cur = ggml_new_tensor_2d(g2_ctx, GGML_TYPE_F32, D, T);
         ggml_set_input(cur);
         g2_in = cur;
-        // 全零 F16 mask (FA 要求 F16 mask; 无 padding, 等价无 mask —— 与 BERT 同款)
-        ggml_tensor * msk = ggml_new_tensor_4d(g2_ctx, GGML_TYPE_F16, T, T, 1, 1);
-        ggml_set_input(msk);
+        // 全零 F16 mask (FA 要求 F16 mask; 无 padding, 等价无 mask —— 与 BERT 同款)。
+        //
+        // ★ 这张 mask 只在建图时写一次, 所以**必须**放在常驻 buffer 里, 不能留在 galloc 的 arena:
+        //   gallocr 按"最后一次使用"回收区域, mask 在最后一层注意力之后即可被复用, 于是同一张图的
+        //   第一次 compute 结束时它就被 FFN 中间结果涂改了 (实测 T×T F16 里全是别的张量的位模式)。
+        //   后果: encode() 第二次起读到的 mask 是垃圾 (注意力被随机加权) -> g2 输出帧间几乎恒定 ->
+        //   refcode 的 ssl 每帧相同 -> prompt_codes 退化成一个常数 -> 第二次渲染起语无伦次/时长暴涨。
+        //   与 DiT 的 make_persistents() 同一套做法: 常驻张量独占 ctx + buffer, galloc 见到
+        //   t->data != NULL / t->buffer != NULL 就会跳过它 (ggml-alloc.c: ggml_gallocr_is_allocated)。
+        {
+            ggml_init_params mip = { ggml_tensor_overhead() * 8, NULL, true };
+            msk_ctx = ggml_init(mip);
+            g2_msk = ggml_new_tensor_4d(msk_ctx, GGML_TYPE_F16, T, T, 1, 1);
+            ggml_set_name(g2_msk, "hubert.g2.mask");
+            ggml_set_input(g2_msk);
+            msk_buf = ggml_backend_alloc_ctx_tensors(msk_ctx, s_back);
+            if (!msk_buf) { fprintf(stderr, "[gsv_hubert] mask buffer alloc failed\n"); }
+        }
+        ggml_tensor * msk = g2_msk;
 
         char nm[192], base[128];
         const bool dbg = getenv("GSV_HUBERT_DEBUG") != nullptr;
@@ -262,7 +283,7 @@ struct gsv_hubert::impl {
         g2_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(s_back));
         ggml_gallocr_alloc_graph(g2_galloc, g2);
         if (getenv("GSV_HUBERT_DEBUG")) fprintf(stderr, "  [g2] alloc ok\n");
-        // mask 是 input 张量, galloc 内存不清零 —— 必须显式写 0 (全零 = 无 padding 的自注意)
+        // mask 是常驻张量 (见上): 建图时写一次全零, 之后每次 compute 都还在
         {
             const size_t nb = ggml_nbytes(msk);
             std::vector<char> z(nb, 0);
@@ -277,6 +298,8 @@ gsv_hubert::~gsv_hubert() {
     impl & s = *p;
     if (s.g1_ctx) ggml_free(s.g1_ctx);
     if (s.g2_ctx) ggml_free(s.g2_ctx);
+    if (s.msk_ctx) ggml_free(s.msk_ctx);
+    if (s.msk_buf) ggml_backend_buffer_free(s.msk_buf);
     if (s.g1_galloc) ggml_gallocr_free(s.g1_galloc);
     if (s.g2_galloc) ggml_gallocr_free(s.g2_galloc);
     if (s.backend) ggml_backend_free(s.backend);
@@ -671,6 +694,12 @@ bool gsv_hubert::encode(const float * audio_norm, int n_samples, std::vector<flo
     }
     out.assign((size_t) D_HID * s.T, 0.0f);
     ggml_backend_tensor_get(s.g2_out, out.data(), 0, out.size() * 4);
+    if (getenv("GSV_HUBERT_DEBUG")) {
+        double ma = 0; size_t nz = 0;
+        for (float v : out) { ma += std::fabs((double) v); if (v != 0.0f) nz++; }
+        fprintf(stderr, "  g2_out: n=%zu nonzero=%zu mean_abs=%.6g\n",
+                out.size(), nz, ma / (double) out.size());
+    }
     if (dbg_t) {
         t_d = tpc();
         fprintf(stderr, "  [time] g1 %.2f ms | host(pos_conv+LN) %.2f ms | g2 %.2f ms\n",
