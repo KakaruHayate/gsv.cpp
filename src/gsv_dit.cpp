@@ -124,10 +124,13 @@ struct gsv_dit::impl {
     // 只保留两个实测可投产的: DiTFastAttn 窗口注意力 (alg_window) 与 CFG 截断 (alg_cfg_off_t).
     gsv_dit_alg alg;
 
+    ggml_tensor * dbg_b0_attn = nullptr;     // 实验: 供参考段跨步漂移测量读回
+
     void mark(ggml_tensor * t, const char * n) {
         if (!debug || !mark_on) return;
         ggml_set_output(t);
         ggml_set_name(t, n);
+        if (n && std::strcmp(n, "dbg_b0_attn") == 0) dbg_b0_attn = t;
     }
 
     // ---------------- 图内算子助手 (Domain B: ggml ne{C,T}) ----------------
@@ -1228,6 +1231,24 @@ bool gsv_dit::sample(const float * mu, const float * prompt, int P, int T, int s
     const int   ur      = s.alg.uncond_reuse;
     std::vector<float> neg_p1((size_t) MEL * T), neg_p2((size_t) MEL * T);
     int neg_count = 0;                        // 已实际算过的 neg 数 (外推至少要 2 个)
+    // ---- 实验: 参考段隐状态跨去噪步的漂移 (方向2 "冻结" 近似误差的直接度量) ----
+    // 需要 GSV_DIT_DEBUG=1 (让 dbg_b0_attn 成为图输出) + GSV_DIT_REFDRIFT=1.
+    const bool refdrift = getenv("GSV_DIT_REFDRIFT") != nullptr;
+    std::vector<float> ref0;
+    if (refdrift && !s.debug)
+        fprintf(stderr, "[refdrift] 需要 GSV_DIT_DEBUG=1 才有中间张量可读\n");
+    auto grab_ref_act = [&](std::vector<float> & dst) -> bool {
+        ggml_tensor * tt = s.dbg_b0_attn;
+        if (!tt) return false;
+        const int64_t D = tt->ne[0], TT = tt->ne[1];
+        if (TT < P) return false;
+        std::vector<float> full((size_t) D * (size_t) TT);
+        ggml_backend_tensor_get(tt, full.data(), 0, full.size() * 4);
+        dst.assign((size_t) D * (size_t) P, 0.0f);
+        for (int64_t k = 0; k < P; k++)
+            for (int64_t d = 0; d < D; d++) dst[(size_t) d + (size_t) D * (size_t) k] = full[(size_t) d + (size_t) D * (size_t) k];
+        return true;
+    };
     gsvprog::begin(3, steps);
     for (int j = 0; j < steps; j++) {
         gsvprog::tick();
@@ -1239,6 +1260,34 @@ bool gsv_dit::sample(const float * mu, const float * prompt, int P, int T, int s
             continue;
         }
         if (!velocity(x.data(), t, false, vel.data())) return false;
+        if (refdrift) {
+            std::vector<float> cur;
+            if (grab_ref_act(cur)) {
+                if (ref0.empty()) {
+                    ref0 = cur;
+                    fprintf(stderr, "[refdrift] alg(W=%d cfg_off=%.2f ur=%d ref_iso=%d) step=%2d t=%.3f  (baseline)\n",
+                            s.alg.window, s.alg.cfg_off_t, s.alg.uncond_reuse, s.alg.ref_iso, j, t);
+                } else {
+                    double num = 0, den = 0, sum_a = 0, sum_b = 0, sum_ab = 0, sum_sq = 0;
+                    const size_t n = std::min(ref0.size(), cur.size());
+                    for (size_t i = 0; i < n; i++) {
+                        num += std::fabs(cur[i] - ref0[i]);
+                        den += std::fabs(ref0[i]);
+                        sum_a += ref0[i]; sum_b += cur[i];
+                        sum_ab += (double) ref0[i] * cur[i];
+                        sum_sq += (double) ref0[i] * ref0[i];
+                    }
+                    const double ma = sum_a / (double) n, mb = sum_b / (double) n;
+                    double num_c = 0, da = 0, db = 0;
+                    for (size_t i = 0; i < n; i++) {
+                        const double u = ref0[i] - ma, v = cur[i] - mb;
+                        num_c += u * v; da += u * u; db += v * v;
+                    }
+                    const double corr = (da > 0 && db > 0) ? num_c / std::sqrt(da * db) : 1.0;
+                    fprintf(stderr, "[refdrift] step=%2d t=%.3f  ref-rows vs step0: relL1=%.4e corr=%.6f\n",
+                            j, t, num / (den > 0 ? den : 1.0), corr);                }
+            }
+        }
         const bool cfg_on = cfg > 1e-5f && !(cfg_off > 0.0f && t >= cfg_off);
         if (cfg_on) {
             const bool odd = (j & 1) != 0;
