@@ -400,11 +400,12 @@ TtsOutcome run_tts(State & st, const SidecarCfg & side, ReqLog & rlog, const jso
                       {"phones", tm.phones},
                       {"ms", total_ms}};
         std::printf("[tts %s] voice=%s segs=%d phones=%d audio=%.2fs | g2p %.0f prep %.0f bert %.0f "
-                    "ar %.0f cond %.0f dit %.0f voc %.0f synth %.0f | cache %d/%d | total %.0f ms\n",
+                    "ar %.0f cond %.0f dit %.0f voc %.0f synth %.0f | cache %d/%d | reuse ref=%d text=%d fea=%d/%d | total %.0f ms\n",
                     rid.c_str(), st.voice.c_str(), tm.segments, tm.phones,
                     (double) wav.size() / kSampleRate, tm.g2p_ms, tm.prep_ms, tm.bert_ms, tm.ar_ms,
                     tm.cond_ms, tm.dit_ms, tm.voc_ms, tm.synth_ms, tm.cache_hits,
-                    tm.cache_hits + tm.cache_misses, total_ms);
+                    tm.cache_hits + tm.cache_misses, tm.ref_hits, tm.text_hits, tm.fea_hits,
+                    tm.fea_hits + tm.fea_misses, total_ms);
     }
 
     rlog.write(json{{"ts", now_s()},
@@ -421,7 +422,10 @@ TtsOutcome run_tts(State & st, const SidecarCfg & side, ReqLog & rlog, const jso
                     {"ar_ms", tm.ar_ms},
                     {"synth_ms", tm.synth_ms},
                     {"segments", tm.segments},
-                    {"phones", tm.phones}});
+                    {"phones", tm.phones},
+                    {"reuse_ref", tm.ref_hits},
+                    {"reuse_text", tm.text_hits},
+                    {"reuse_fea", tm.fea_hits}});
     return o;
 }
 

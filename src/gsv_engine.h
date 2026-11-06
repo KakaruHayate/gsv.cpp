@@ -111,6 +111,8 @@ public:
     gsv_dit_alg dit_alg() const;
     // 最近一次 DiT 采样的 cache-dit 命中统计（pos+neg 合计）
     void dbcache_stats(int & hits, int & misses) const;
+    // 参考侧 fea_ref 复用统计（同一参考 + 同一参考文本在多段之间只算一次）
+    void fea_cache_stats(int & hits, int & misses) const;
     // 最近一次 synthesize_mel 内部耗时：cond(decode_encp 参考+目标) / DiT
     void last_stage_ms(double & cond_ms, double & dit_ms) const;
 

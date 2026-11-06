@@ -29,6 +29,12 @@
 #include "httplib.h"
 #include "json.hpp"
 
+// 参考音频缓存键要按**内容**算: GAG 每次渲染都把参考音频重新 POST 成新的临时路径
+// (%TEMP%\gsv_refs\<ts>_gsv_ref_<rand>.wav), 若用路径做键则每次都 miss。
+// XXH_INLINE_ALL = 头文件内联版, 只有 gsv_server.cpp 这一个 TU 用它, 不需要额外 .cpp。
+#define XXH_INLINE_ALL
+#include "xxhash.h"
+
 #include "gsv_engine.h"
 #include "gsv_path.h"
 
@@ -141,6 +147,29 @@ inline bool sidecar_alive(const SidecarCfg & sc) {
 // ---------------------------------------------------------------- utils
 inline double now_s() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// 参考音频的**内容**键: 整文件 XXH3-64 + 字节数。
+// prep_reference (HuBERT -> ssl_proj/RVQ -> ref_enc -> mel) 只取决于音频内容, 与路径无关;
+// GAG 每次渲染都重新上传到新的临时路径, 用路径做键等于每次都重算 (~0.4-0.6 s / 次)。
+inline std::string file_content_key(const std::string & path) {
+    FILE * f = gsvpath::open_read(path);
+    if (!f) return "path:" + path;                  // 读不到就退回路径 (让 prep 自己报错)
+    XXH3_state_t * stt = XXH3_createState();
+    if (!stt) { fclose(f); return "path:" + path; }
+    XXH3_64bits_reset(stt);
+    std::vector<char> buf(1 << 16);
+    size_t rd = 0, total = 0;
+    while ((rd = fread(buf.data(), 1, buf.size(), f)) > 0) {
+        XXH3_64bits_update(stt, buf.data(), rd);
+        total += rd;
+    }
+    fclose(f);
+    const XXH64_hash_t h = XXH3_64bits_digest(stt);
+    XXH3_freeState(stt);
+    char out[48];
+    std::snprintf(out, sizeof(out), "%016llx:%zu", (unsigned long long) h, total);
+    return std::string(out);
 }
 
 inline void put_u32(std::string & b, uint32_t v) {
@@ -422,6 +451,10 @@ struct SynthTiming {
     int phones = 0;
     int cache_hits = 0, cache_misses = 0;   // cache-dit (pos+neg)
     double cond_ms = 0, dit_ms = 0, voc_ms = 0;
+    // 跨请求复用命中数 (0 表示这一段/这次是真的算了)
+    int ref_hits = 0;    // 参考预处理 (按参考音频内容命中)
+    int text_hits = 0;   // 文本前端 (G2P + BERT, 按 (lang, text) 命中)
+    int fea_hits = 0, fea_misses = 0;   // 参考侧 decode_encp (段间复用)
 };
 
 // ---------------------------------------------------------------- voices
@@ -563,6 +596,14 @@ struct PromptPrep {
     std::vector<float> bert;
 };
 
+// 目标文本的前端结果: G2P (sidecar) + BERT 特征 [1024, P]。
+// 之前每段每次请求都重算 (sidecar HTTP 50-450 ms + BERT 前向 + word2ph 展开),
+// 反复试听同一段文本/批量重跑时是纯重复劳动 -> 按 (lang, text) 缓存。
+struct TextPrep {
+    G2POut g2p;
+    std::vector<float> bert;
+};
+
 struct ArBatcher;      // AR 级聚合（保留，供单请求直连路径）
 struct SynthScheduler; // 请求级聚合（/tts 与 /batch 都走这里）
 
@@ -577,6 +618,7 @@ struct State {
     VoiceRegistry voices;
     Lru<std::shared_ptr<const RefPrep>> ref_cache{8};
     Lru<std::shared_ptr<const PromptPrep>> prompt_cache{16};
+    Lru<std::shared_ptr<const TextPrep>> text_cache{12};   // 目标文本前端 (G2P+BERT)
     std::atomic<uint64_t> n_tts{0}, n_errors{0}, n_jobs{0}, n_timeouts{0}, n_busy{0}, n_reloads{0};
     std::atomic<int> waiters{0};
     std::atomic<double> last_total_ms{0};
@@ -641,6 +683,7 @@ inline bool switch_voice(State & st, const std::string & name, std::string & err
     }
     st.ref_cache.clear();
     st.prompt_cache.clear();
+    st.text_cache.clear();   // 文本前端含 BERT 特征: 换了 voice 可能换了 BERT, 一起作废
     st.n_reloads++;
     std::printf("[voices] switched to '%s' (%.0f ms)\n", name.c_str(), load_ms);
     return true;
@@ -677,11 +720,46 @@ inline bool compute_bert(gsv_engine & eng, const G2POut & g, std::vector<float> 
     return eng.bert_feature(g.bert_ids, g.word2ph, out);
 }
 
+// ---------------------------------------------------------------- 文本前端缓存
+// 查表 (可能命中)；不碰引擎, 调用方可以在 miss 时才去取锁/取引擎。
+inline bool text_prep_lookup(State & st, const std::string & text, const std::string & lang,
+                             std::shared_ptr<const TextPrep> & out) {
+    return st.text_cache.get(lang + "|" + text, out);
+}
+
+// (lang, text) -> phones/word2ph/bert_ids + BERT 特征。命中时只花一次查表。
+// 调用方需保证 eng 可用 (miss 时会跑 BERT 前向, 因此应在 engine 锁内调用)。
+inline bool text_prep_cached(State & st, gsv_engine & eng, const SidecarCfg & side,
+                             const std::string & text, const std::string & lang,
+                             std::shared_ptr<const TextPrep> & out, SynthTiming & tm,
+                             std::string & err) {
+    if (text_prep_lookup(st, text, lang, out)) { tm.text_hits++; return true; }
+
+    auto tp = std::make_shared<TextPrep>();
+    const double t0 = now_s();
+    if (!sidecar_g2p(side, text, lang, tp->g2p, err)) return false;
+    tm.g2p_ms += (now_s() - t0) * 1000;
+    if (tp->g2p.phones.empty()) {
+        err = "no phonemes produced for this text (unsupported characters or empty input)";
+        return false;
+    }
+    if (!tp->g2p.bert_segs.empty() || !tp->g2p.bert_ids.empty()) {
+        const double tb = now_s();
+        if (!compute_bert(eng, tp->g2p, tp->bert)) { err = "bert_feature(target) failed"; return false; }
+        tm.bert_ms += (now_s() - tb) * 1000;
+    }
+    out = tp;
+    st.text_cache.put(lang + "|" + text, out);
+    return true;
+}
+
 // ---------------------------------------------------------------- synth
 inline bool ensure_ref(State & st, const std::string & voice, gsv_engine & eng, const SidecarCfg & side,
                        const SynthParams & p, std::shared_ptr<const RefPrep> & ref,
                        std::shared_ptr<const PromptPrep> & prm, SynthTiming & tm, std::string & err) {
-    const std::string ref_key = voice + "|" + p.ref_path + "|" + p.prompt_text + "|" + p.prompt_lang;
+    // 键 = voice + 参考音频**内容**哈希 (不含 prompt: prep_reference 与参考文本无关)。
+    // GAG 每渲染一次就把参考音频传成新的临时路径, 所以路径绝不能进键 —— 否则永远 miss。
+    const std::string ref_key = voice + "|" + file_content_key(p.ref_path);
     if (!st.ref_cache.get(ref_key, ref)) {
         auto rp = std::make_shared<RefPrep>();
         const double t0 = now_s();
@@ -692,20 +770,21 @@ inline bool ensure_ref(State & st, const std::string & voice, gsv_engine & eng, 
         tm.prep_ms += (now_s() - t0) * 1000;
         ref = rp;
         st.ref_cache.put(ref_key, ref);
+    } else {
+        tm.ref_hits++;
     }
 
     const std::string pkey = voice + "|" + p.prompt_text + "|" + p.prompt_lang;
     if (!st.prompt_cache.get(pkey, prm)) {
         auto pp = std::make_shared<PromptPrep>();
-        G2POut g;
-        const double t0 = now_s();
-        if (!sidecar_g2p(side, p.prompt_text, p.prompt_lang, g, err)) return false;
-        pp->phones = g.phones;
-        if (!compute_bert(eng, g, pp->bert)) {
-            err = "bert_feature(prompt) failed";
+        // 参考文本也走同一套文本前端缓存 (与目标文本共用条目)
+        std::shared_ptr<const TextPrep> tp;
+        if (!text_prep_cached(st, eng, side, p.prompt_text, p.prompt_lang, tp, tm, err)) {
+            if (err.empty()) err = "prompt text frontend failed";
             return false;
         }
-        tm.g2p_ms += (now_s() - t0) * 1000;
+        pp->phones = tp->g2p.phones;
+        pp->bert = tp->bert;
         prm = pp;
         st.prompt_cache.put(pkey, prm);
     }
@@ -719,26 +798,11 @@ inline bool synth_segment(State & st, gsv_engine & eng, const SidecarCfg & side,
     int stage = 0;
     try {
     stage = 1;
-    const double t0 = now_s();
-    G2POut tgt;
-    if (!sidecar_g2p(side, p.text, p.text_lang, tgt, err)) return false;
-    tm.g2p_ms += (now_s() - t0) * 1000;
-    tm.phones += (int) tgt.phones.size();
-    if (tgt.phones.empty()) {
-        err = "no phonemes produced for this text (unsupported characters or empty input)";
-        return false;
-    }
-
-    std::vector<float> bert;
-    if (!tgt.bert_segs.empty() || !tgt.bert_ids.empty()) {
-        stage = 2;
-        const double tb = now_s();
-        if (!compute_bert(eng, tgt, bert)) {
-            err = "bert_feature(target) failed";
-            return false;
-        }
-        tm.bert_ms += (now_s() - tb) * 1000;
-    }
+    std::shared_ptr<const TextPrep> tp;
+    if (!text_prep_cached(st, eng, side, p.text, p.text_lang, tp, tm, err)) return false;
+    tm.phones += (int) tp->g2p.phones.size();
+    const std::vector<int32_t> & tgt_phones = tp->g2p.phones;
+    const std::vector<float>   & bert = tp->bert;
 
     int seed = p.seed;
     if (seed < 0) {
@@ -749,7 +813,7 @@ inline bool synth_segment(State & st, gsv_engine & eng, const SidecarCfg & side,
     stage = 3;
     const double t_ar = now_s();
     std::vector<int32_t> sem;
-    if (!eng.ar_generate(tgt.phones, bert, prm->phones, prm->bert, ref->codes, p.max_steps,
+    if (!eng.ar_generate(tgt_phones, bert, prm->phones, prm->bert, ref->codes, p.max_steps,
                          p.early_stop, (uint64_t) seed, sem, &p.sampler)) {
         err = "ar_generate failed";
         return false;
@@ -758,7 +822,7 @@ inline bool synth_segment(State & st, gsv_engine & eng, const SidecarCfg & side,
 
     stage = 4;
     const double t_sy = now_s();
-    if (!eng.synthesize(sem, tgt.phones, ref->codes, prm->phones, ref->ge, ref->mel2, ref->mel2_T,
+    if (!eng.synthesize(sem, tgt_phones, ref->codes, prm->phones, ref->ge, ref->mel2, ref->mel2_T,
                         p.steps, p.cfg, (uint64_t) seed, wav, p.speed)) {
         err = "synthesize failed";
         return false;
@@ -852,18 +916,16 @@ inline bool synth_batch_segments(State & st, const SidecarCfg & side, const Synt
     SynthTiming pre;
     if (!ensure_ref(st, st.voice, *eng, side, p, ref, prm, pre, err)) { ec = "sidecar"; return false; }
 
-    std::vector<G2POut> g2p(n);
-    std::vector<std::vector<float>> berts(n);
+    std::vector<std::shared_ptr<const TextPrep>> tps(n);
     std::vector<size_t> valid;
     for (size_t i = 0; i < n; i++) {
-        if (!sidecar_g2p(side, texts[i], p.text_lang, g2p[i], errs[i])) { ec = "sidecar"; continue; }
-        if (g2p[i].phones.empty()) {
-            errs[i] = "no phonemes produced for this text";
+        if (!text_prep_cached(st, *eng, side, texts[i], p.text_lang, tps[i], tms[i], errs[i])) {
+            ec = "sidecar";
             continue;
         }
-        if (!compute_bert(*eng, g2p[i], berts[i])) { errs[i] = "bert_feature failed"; continue; }
-        tms[i].g2p_ms = pre.g2p_ms;
+        tms[i].g2p_ms = pre.g2p_ms + tms[i].g2p_ms;
         tms[i].prep_ms = pre.prep_ms;
+        tms[i].ref_hits = pre.ref_hits;
         valid.push_back(i);
     }
 
@@ -874,8 +936,8 @@ inline bool synth_batch_segments(State & st, const SidecarCfg & side, const Synt
         items.reserve(end - off);
         for (size_t k = off; k < end; k++) {
             gsv_engine::ar_batch_item it;
-            it.phones = g2p[valid[k]].phones;
-            it.bert = berts[valid[k]];
+            it.phones = tps[valid[k]]->g2p.phones;
+            it.bert = tps[valid[k]]->bert;
             items.push_back(std::move(it));
         }
         int seed = p.seed;
@@ -900,7 +962,7 @@ inline bool synth_batch_segments(State & st, const SidecarCfg & side, const Synt
             const size_t i = valid[k];
             tms[i].ar_ms += ms;
             std::vector<float> wav;
-            if (!eng->synthesize(sems[k - off], g2p[i].phones, ref->codes, prm->phones, ref->ge,
+            if (!eng->synthesize(sems[k - off], tps[i]->g2p.phones, ref->codes, prm->phones, ref->ge,
                                  ref->mel2, ref->mel2_T, p.steps, p.cfg, (uint64_t) seed, wav,
                                  p.speed)) {
                 errs[i] = "synthesize failed";
@@ -974,17 +1036,19 @@ inline bool synth_batch_texts(State & st, const SidecarCfg & side, const SynthPa
             BatchUnit u;
             u.item = i;
             u.text = seg;
-            if (!sidecar_g2p(side, seg, p.text_lang, u.g2p, u.err)) { errs[i] = u.err; continue; }
-            if (u.g2p.phones.empty()) {
-                errs[i] = "no phonemes produced for this text";
+            std::shared_ptr<const TextPrep> tp;
+            if (!text_prep_cached(st, *eng, side, seg, p.text_lang, tp, tms[i], u.err)) {
+                errs[i] = u.err;
                 continue;
             }
-            if (!compute_bert(*eng, u.g2p, u.bert)) { errs[i] = "bert_feature failed"; continue; }
+            u.g2p = tp->g2p;
+            u.bert = tp->bert;
             item_units[i].push_back(units.size());
             units.push_back(std::move(u));
         }
-        tms[i].g2p_ms = pre.g2p_ms;
+        tms[i].g2p_ms += pre.g2p_ms;
         tms[i].prep_ms = pre.prep_ms;
+        tms[i].ref_hits = pre.ref_hits;
     }
 
     static std::atomic<uint64_t> seed_seq{1};
@@ -1307,25 +1371,20 @@ inline bool synth_segment_q(State & st, const SidecarCfg & side, const SynthPara
                             const std::shared_ptr<const PromptPrep> & prm,
                             std::vector<float> & wav, SynthTiming & tm, std::string & err) {
     const double t0 = now_s();
-    G2POut tgt;
-    if (!sidecar_g2p(side, p.text, p.text_lang, tgt, err)) return false;
-    tm.g2p_ms += (now_s() - t0) * 1000;
-    tm.phones += (int) tgt.phones.size();
-    if (tgt.phones.empty()) {
-        err = "no phonemes produced for this text (unsupported characters or empty input)";
-        return false;
-    }
-
-    std::vector<float> bert;
-    if (!tgt.bert_segs.empty() || !tgt.bert_ids.empty()) {
+    (void) t0;
+    std::shared_ptr<const TextPrep> tp;
+    if (!text_prep_lookup(st, p.text, p.text_lang, tp)) {
         auto eng = snapshot(st);
         if (!eng) { err = "engine not ready"; return false; }
         std::unique_lock<std::timed_mutex> lk(st.compute_mu, std::defer_lock);
         if (!lk.try_lock_for(std::chrono::milliseconds(st.req_timeout_ms(p)))) { st.n_timeouts++; err = "engine lock timeout"; return false; }
-        const double tb = now_s();
-        if (!compute_bert(*eng, tgt, bert)) { err = "bert_feature(target) failed"; return false; }
-        tm.bert_ms += (now_s() - tb) * 1000;
+        if (!text_prep_cached(st, *eng, side, p.text, p.text_lang, tp, tm, err)) return false;
+    } else {
+        tm.text_hits++;
     }
+    tm.phones += (int) tp->g2p.phones.size();
+    const std::vector<int32_t> & tgt_phones = tp->g2p.phones;
+    const std::vector<float>   & bert = tp->bert;
 
     int seed = p.seed;
     if (seed < 0) {
@@ -1335,7 +1394,7 @@ inline bool synth_segment_q(State & st, const SidecarCfg & side, const SynthPara
     const double t_ar = now_s();
     std::vector<int32_t> sem;
     if (st.ar_batcher) {
-        auto task = ar_make_task(ar_key(st.voice, p), tgt.phones, bert, prm->phones, ref->codes,
+        auto task = ar_make_task(ar_key(st.voice, p), tgt_phones, bert, prm->phones, ref->codes,
                                  prm->bert, p.max_steps, p.early_stop, p.sampler, (uint64_t) seed);
         auto fut = st.ar_batcher->enqueue(task);
         if (!ar_take(fut, sem, err, st.req_timeout_ms(p))) return false;
@@ -1343,7 +1402,7 @@ inline bool synth_segment_q(State & st, const SidecarCfg & side, const SynthPara
         auto eng2 = snapshot(st);
         std::unique_lock<std::timed_mutex> lk(st.compute_mu, std::defer_lock);
         if (!lk.try_lock_for(std::chrono::milliseconds(st.req_timeout_ms(p)))) { st.n_timeouts++; err = "engine lock timeout"; return false; }
-        if (!eng2->ar_generate(tgt.phones, bert, prm->phones, prm->bert, ref->codes, p.max_steps,
+        if (!eng2->ar_generate(tgt_phones, bert, prm->phones, prm->bert, ref->codes, p.max_steps,
                                p.early_stop, (uint64_t) seed, sem, &p.sampler)) {
             err = "ar_generate failed";
             return false;
@@ -1359,7 +1418,7 @@ inline bool synth_segment_q(State & st, const SidecarCfg & side, const SynthPara
     eng3->set_dbcache(dbn, p.dbcache_thr, p.dbcache_warmup, p.dbcache_ds);
     eng3->set_dit_alg(svc::dit_alg_of(p));
     const double t_sy = now_s();
-    if (!eng3->synthesize(sem, tgt.phones, ref->codes, prm->phones, ref->ge, ref->mel2, ref->mel2_T,
+    if (!eng3->synthesize(sem, tgt_phones, ref->codes, prm->phones, ref->ge, ref->mel2, ref->mel2_T,
                           p.steps, p.cfg, (uint64_t) seed, wav, p.speed)) {
         err = "synthesize failed";
         return false;
@@ -1370,6 +1429,8 @@ inline bool synth_segment_q(State & st, const SidecarCfg & side, const SynthPara
         eng3->dbcache_stats(ch, cm);
         tm.cache_hits += ch;
         tm.cache_misses += cm;
+        eng3->fea_cache_stats(ch, cm);
+        tm.fea_hits += ch;
     }
     return true;
 }
@@ -1470,10 +1531,30 @@ inline bool synth_batch_texts_q(State & st, const SidecarCfg & side, const Synth
             BatchUnit u;
             u.item = i;
             u.text = seg;
+            std::shared_ptr<const TextPrep> tp;
             const double tg = now_s();
-            if (!sidecar_g2p(side, seg, p.text_lang, u.g2p, u.err)) { errs[i] = u.err; continue; }
+            if (!text_prep_lookup(st, seg, p.text_lang, tp)) {
+                // miss 时才碰引擎 (BERT 前向需要锁); 命中就完全省掉 sidecar + 前向
+                auto eng0 = snapshot(st);
+                if (!eng0) { errs[i] = "engine not ready"; continue; }
+                std::unique_lock<std::timed_mutex> lk(st.compute_mu, std::defer_lock);
+                if (!lk.try_lock_for(std::chrono::milliseconds(st.req_timeout_ms(p)))) {
+                    errs[i] = "engine lock timeout";
+                    continue;
+                }
+                SynthTiming ttmp;
+                if (!text_prep_cached(st, *eng0, side, seg, p.text_lang, tp, ttmp, u.err)) {
+                    errs[i] = u.err;
+                    continue;
+                }
+                t_bert[i] += ttmp.bert_ms;
+                tms[i].text_hits += ttmp.text_hits;
+            } else {
+                tms[i].text_hits++;
+            }
             t_g2p[i] += (now_s() - tg) * 1000.0;
-            if (u.g2p.phones.empty()) { errs[i] = "no phonemes produced for this text"; continue; }
+            u.g2p = tp->g2p;
+            u.bert = tp->bert;
             if (const char * dbg = std::getenv("GSV_DEBUG_BATCH")) {
                 std::fprintf(stderr, "[batch_q] unit i=%zu lang='%s' phones=%zu text='%.20s'\n", i,
                              p.text_lang.c_str(), u.g2p.phones.size(), seg.c_str());
@@ -1482,20 +1563,12 @@ inline bool synth_batch_texts_q(State & st, const SidecarCfg & side, const Synth
             units.push_back(std::move(u));
         }
         tms[i].prep_ms = pre.prep_ms;
+        tms[i].ref_hits = pre.ref_hits;
     }
 
     static std::atomic<uint64_t> seed_seq{1};
     std::vector<std::future<std::vector<int32_t>>> futs(units.size());
-    for (size_t k = 0; k < units.size(); k++) {
-        if (units[k].err.empty() && !units[k].g2p.phones.empty()) {
-            auto eng = snapshot(st);
-            std::unique_lock<std::timed_mutex> lk(st.compute_mu, std::defer_lock);
-            if (!lk.try_lock_for(std::chrono::milliseconds(st.req_timeout_ms(p)))) { units[k].err = "engine lock timeout"; continue; }
-            const double tb = now_s();
-            if (!compute_bert(*eng, units[k].g2p, units[k].bert)) { units[k].err = "bert_feature failed"; continue; }
-            t_bert[units[k].item] += (now_s() - tb) * 1000.0;
-        }
-    }
+    // (BERT 特征已在上面的文本前端缓存里算好, 这里不再重算)
     // 先全部入队（enqueue 很快），让批处理线程尽量攒满
     for (size_t k = 0; k < units.size(); k++) {
         if (!units[k].err.empty()) continue;
@@ -1590,6 +1663,8 @@ inline bool synth_batch_texts_q(State & st, const SidecarCfg & side, const Synth
                 eng2->dbcache_stats(ch, cm);
                 tms[u.item].cache_hits += ch;
                 tms[u.item].cache_misses += cm;
+                eng2->fea_cache_stats(ch, cm);
+                tms[u.item].fea_hits += ch;
             }
             if (voc_th.joinable()) {
                 {

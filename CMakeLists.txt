@@ -120,9 +120,14 @@ if(GSV_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/tools"
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/xxhash"
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann")
     target_link_libraries(test_svc PRIVATE gsv_engine)
     add_test(NAME test_svc COMMAND test_svc)
+
+    # reference chain must be repeatable: test_prep_repeat <models_dir> <ref.wav> [other.wav]
+    add_executable(test_prep_repeat "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_prep_repeat.cpp")
+    target_link_libraries(test_prep_repeat PRIVATE gsv_engine)
 
     # add_act kernel (CPU + Vulkan) incl. the mish activation used by the DiT trunk
     add_executable(test_add_act "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_add_act.cpp")

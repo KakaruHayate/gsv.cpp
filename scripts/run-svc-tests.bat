@@ -13,7 +13,7 @@ exit /b 1
 :gsv_have_cl
 cd /d "%~dp0.."
 if not exist tests\relcpu mkdir tests\relcpu
-set INC=/utf-8 /std:c++17 /O2 /EHsc /W1 /I src /I third_party /I third_party\httplib /I third_party\nlohmann /I tools
+set INC=/utf-8 /std:c++17 /O2 /EHsc /W1 /I src /I third_party /I third_party\httplib /I third_party\xxhash /I third_party\nlohmann /I tools
 cl /nologo %INC% tests\test_svc.cpp /Fe:tests\relcpu\test_svc.exe /Fo:tests\relcpu\ || exit /b 1
 tests\relcpu\test_svc.exe || exit /b 1
 echo TESTS_OK

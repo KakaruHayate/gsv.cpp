@@ -46,6 +46,32 @@ _frontends = {}
 _ready = threading.Event()          # zh frontend 预热完成
 _warm_ms = {"v": 0.0}
 
+# G2P 结果缓存: (lang, text) -> 响应体。前端是纯函数 (规范化 + G2PW + 分词 + 音素),
+# 同一段文本反复合成/批量重跑时重复调用完全一样, 没必要每次重跑 ONNX 推理。
+# 一个长句切 6 段, 每段每次请求都要一次 HTTP + 一次前端; 命中后只剩字符串拷贝。
+_G2P_CACHE_MAX = 256
+_g2p_cache = {}
+_g2p_cache_order = []               # 简易 FIFO (够用, 且顺序确定)
+_g2p_stats = {"hit": 0, "miss": 0}
+
+
+def g2p_cached(text, lang):
+    key = (lang, text)
+    with _lock:
+        hit = _g2p_cache.get(key)
+        if hit is not None:
+            _g2p_stats["hit"] += 1
+            return hit
+        _g2p_stats["miss"] += 1
+    body = g2p(text, lang)          # 慢路径 (持 _lock 做前端前向)
+    with _lock:
+        if key not in _g2p_cache:
+            if len(_g2p_cache_order) >= _G2P_CACHE_MAX:
+                _g2p_cache.pop(_g2p_cache_order.pop(0), None)
+            _g2p_cache[key] = body
+            _g2p_cache_order.append(key)
+    return body
+
 
 def get_frontend(lang):
     with _lock:
@@ -124,7 +150,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/health"):
             self._json(200, {"ok": True, "ready": _ready.is_set(),
-                             "warm_ms": round(_warm_ms["v"], 1)})
+                             "warm_ms": round(_warm_ms["v"], 1),
+                             "g2p_cache": dict(_g2p_stats),
+                             "g2p_cache_entries": len(_g2p_cache)})
         else:
             self._json(404, {"message": "not found"})
 
@@ -141,8 +169,10 @@ class Handler(BaseHTTPRequestHandler):
             text = req.get("text", "")
             lang = req.get("lang", "zh")
             t0 = time.perf_counter()
-            out = g2p(text, lang)
+            cached = (lang, text) in _g2p_cache
+            out = dict(g2p_cached(text, lang))   # 拷贝: 下面要写 ms, 不能改缓存里那一份
             out["ms"] = round((time.perf_counter() - t0) * 1000, 1)
+            out["cached"] = cached
             self._json(200, out)
         except Exception as e:
             traceback.print_exc()

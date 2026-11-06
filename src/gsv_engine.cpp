@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -45,6 +46,32 @@ struct gsv_engine::impl {
     int  ar_vocab = 1025;
     bool ready = false;
     double last_cond_ms = 0, last_dit_ms = 0;
+
+    // ---- 参考侧 fea_ref 复用 ----
+    // decode_encp(prompt_codes, prompt_phones, ge) 只依赖 (参考语义码, 参考文本音素, ge),
+    // 与目标文本无关 —— 但它的调用点在 synthesize_mel 里, 于是**每一段**都会重算一遍
+    // (一段长句切 6 段 = 6 次)。这里按这三者的哈希做一个小 LRU, 段间/请求间都复用。
+    struct fea_entry { uint64_t key; std::vector<float> fea; };
+    std::deque<fea_entry> fea_cache;      // 最近用过的在前, 上限见 kFeaCacheCap
+    static const size_t kFeaCacheCap = 4; // 4 x [512 x 4*Tc] floats, 参考 4 s 时约 2 MB
+    int fea_hits = 0, fea_misses = 0;     // 累计 (诊断用)
+    int fea_hit_last = 0;                 // 最近一次 synthesize_mel 是否命中
+
+    static uint64_t fnv1a(uint64_t h, const void * p, size_t n) {
+        const unsigned char * b = (const unsigned char *) p;
+        for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; }
+        return h;
+    }
+    static uint64_t fea_key(const std::vector<int32_t> & codes, const std::vector<int32_t> & phones,
+                            const std::vector<float> & ge) {
+        uint64_t h = 1469598103934665603ull;
+        for (int32_t v : codes)  h = fnv1a(h, &v, sizeof(v));
+        h = fnv1a(h, "|", 1);
+        for (int32_t v : phones) h = fnv1a(h, &v, sizeof(v));
+        h = fnv1a(h, "|", 1);
+        h = fnv1a(h, ge.data(), ge.size() * sizeof(float));
+        return h;
+    }
 
     ~impl() {
         delete vgm; delete dit; delete wns1; delete encp; delete cond;
@@ -139,6 +166,11 @@ void gsv_engine::dbcache_stats(int & hits, int & misses) const {
         hits += st.hits[b];
         misses += st.misses[b];
     }
+}
+void gsv_engine::fea_cache_stats(int & hits, int & misses) const {
+    // "最近一次 synthesize_mel" 的口径 (与 last_stage_ms 一致), 便于逐段累加
+    hits = p->fea_hit_last;
+    misses = 1 - p->fea_hit_last;
 }
 int gsv_engine::text_dim() const { return TXT_DIM; }
 int gsv_engine::ar_vocab() const { return p->ar_vocab; }
@@ -481,10 +513,37 @@ bool gsv_engine::synthesize_mel(const std::vector<int32_t> & sem,
     std::vector<float> fea_ref, fea_todo;
     const std::string diag_dir = getenv("GSV_ENGINE_DUMP") ? getenv("GSV_ENGINE_DUMP") : "";
     const auto t_cond0 = std::chrono::steady_clock::now();
-    // 参考侧: prompt_codes + **prompt_phones** (参考文本的音素)
-    if (!s.decode_encp_run(prompt_codes, prompt_phones, ge, fea_ref, &diag_dir)) {
-        fprintf(stderr, "[gsv_engine] decode_encp(参考侧) 失败\n");
-        return false;
+    // 参考侧: prompt_codes + **prompt_phones** (参考文本的音素)。
+    // 与目标文本无关 -> 命中缓存就跳过 (diag dump 需要在场时重算, 保证落盘的是这一次的中间量)
+    const float * fea_ref_ptr = nullptr;
+    int fea_ref_len = 0;
+    s.fea_hit_last = 0;
+    if (diag_dir.empty()) {
+        const uint64_t fk = impl::fea_key(prompt_codes, prompt_phones, ge);
+        for (auto & e : s.fea_cache) {
+            if (e.key == fk) { fea_ref_ptr = e.fea.data(); fea_ref_len = (int) e.fea.size(); break; }
+        }
+        if (fea_ref_ptr) {
+            s.fea_hits++;
+            s.fea_hit_last = 1;
+        } else {
+            s.fea_misses++;
+            if (!s.decode_encp_run(prompt_codes, prompt_phones, ge, fea_ref, nullptr)) {
+                fprintf(stderr, "[gsv_engine] decode_encp(参考侧) 失败\n");
+                return false;
+            }
+            fea_ref_ptr = fea_ref.data();
+            fea_ref_len = (int) fea_ref.size();
+            s.fea_cache.push_front(impl::fea_entry{fk, fea_ref});
+            while (s.fea_cache.size() > impl::kFeaCacheCap) s.fea_cache.pop_back();
+        }
+    } else {
+        if (!s.decode_encp_run(prompt_codes, prompt_phones, ge, fea_ref, &diag_dir)) {
+            fprintf(stderr, "[gsv_engine] decode_encp(参考侧) 失败\n");
+            return false;
+        }
+        fea_ref_ptr = fea_ref.data();
+        fea_ref_len = (int) fea_ref.size();
     }
     // 目标侧: sem + 目标文本的 phones (+ speed)
     if (!s.decode_encp_run(sem, phones, ge, fea_todo, nullptr, speed)) {
@@ -494,7 +553,7 @@ bool gsv_engine::synthesize_mel(const std::vector<int32_t> & sem,
     s.last_cond_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_cond0).count();
     const auto t_dit0 = std::chrono::steady_clock::now();
     // wns1 输出 [2T, 512] (idx = c*2T + t) 与 DiT 要的 [512, N] (idx = c*N + t) 同布, 无需转置
-    const int R = (int) (fea_ref.size() / TXT_DIM);
+    const int R = fea_ref_len / TXT_DIM;
     const int N = (int) (fea_todo.size() / TXT_DIM);
 
     // 诊断: 落盘 DiT 的输入 (GSV_ENGINE_DUMP=<dir>), 供 torch 复算对比
@@ -517,7 +576,7 @@ bool gsv_engine::synthesize_mel(const std::vector<int32_t> & sem,
     std::vector<float> mel_out;
     bool dit_ok = false;
     try {
-        dit_ok = s.dit->synthesize(fea_ref.data(), R, fea_todo.data(), N, mel2.data(), mel2_T,
+        dit_ok = s.dit->synthesize(fea_ref_ptr, R, fea_todo.data(), N, mel2.data(), mel2_T,
                                    steps, cfg, seed, 0, nullptr, mel_out, skip_steps);
     } catch (const std::exception & e) {
         fprintf(stderr, "[gsv_engine] DiT threw: %s (R=%d N=%d mel2T=%d steps=%d)\n", e.what(), R, N,
