@@ -1,8 +1,14 @@
 #include "gsv_engine.h"
 
+#include "gsv_path.h"
+
+#include "ggml.h"
+#include "gguf.h"
+
 #include "gsv_ar.h"
 #include "gsv_bert.h"
 #include "gsv_cond.h"
+#include "gsv_dhubert.h"
 #include "gsv_dit.h"
 #include "gsv_encp.h"
 #include "gsv_hubert.h"
@@ -10,10 +16,12 @@
 #include "gsv_refcode.h"
 #include "gsv_refenc.h"
 #include "gsv_sampler.h"
+#include "gsv_v2sovits.h"
 #include "gsv_vocoder_ggml.h"
 #include "gsv_progress.h"
 #include "gsv_wns1.h"
 
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -31,6 +39,8 @@ struct gsv_engine::impl {
 
     // 各段模型 (常驻; 与 demo_e2e.cpp 用的是同一批文件)
     gsv_hubert  * hub  = nullptr;
+    gsv_dhubert * dhub = nullptr;      // 蒸馏前端 (arch=gsv-dhubert), 与 hub 二选一
+    std::string hub_fe = "hubert";     // 当前生效的前端名
     gsv_refcode * rc   = nullptr;
     gsv_refenc  * re   = nullptr;
     gsv_bert    * bert = nullptr;
@@ -40,11 +50,15 @@ struct gsv_engine::impl {
     gsv_wns1    * wns1 = nullptr;
     gsv_dit     * dit  = nullptr;
     gsv_vocoder_ggml * vgm = nullptr;   // ggml HiFi-GAN vocoder
+    gsv_v2sovits * s2 = nullptr;        // v2 家族的 S2 (VITS) 解码器
     std::mutex   voc_mu;   // DML/WebGPU 都不保证并发安全：所有 vocoder 调用串行
 
     std::string md;                       // model_dir (带尾部 '/')
     int  ar_vocab = 1025;
     bool ready = false;
+    bool is_v2 = false;                   // true = v2 家族链路 (VITS)，false = v5 (cond+DiT)
+    std::string ver = "v5";
+    float v2_noise = 0.5f;
     double last_cond_ms = 0, last_dit_ms = 0;
 
     // ---- 参考侧 fea_ref 复用 ----
@@ -74,8 +88,8 @@ struct gsv_engine::impl {
     }
 
     ~impl() {
-        delete vgm; delete dit; delete wns1; delete encp; delete cond;
-        delete ar; delete bert; delete re; delete rc; delete hub;
+        delete s2; delete vgm; delete dit; delete wns1; delete encp; delete cond;
+        delete ar; delete bert; delete re; delete rc; delete dhub; delete hub;
     }
 
     std::string path(const char * leaf) const {
@@ -174,6 +188,39 @@ void gsv_engine::fea_cache_stats(int & hits, int & misses) const {
 }
 int gsv_engine::text_dim() const { return TXT_DIM; }
 int gsv_engine::ar_vocab() const { return p->ar_vocab; }
+const std::string & gsv_engine::version() const { return p->ver; }
+const std::string & gsv_engine::hubert_frontend() const { return p->hub_fe; }
+int gsv_engine::sample_rate() const { return p->is_v2 ? (p->s2 ? p->s2->sample_rate() : 32000) : 48000; }
+
+// 文件是否存在（走 gsvpath，Windows 上能处理非 ASCII 路径）
+static bool fe_exists(const std::string & p) {
+    FILE * f = gsvpath::open_read(p);
+    if (f) fclose(f);
+    return f != nullptr;
+}
+
+// 只读 GGUF 头，拿 general.architecture（不分配任何张量）
+static std::string peek_gguf_arch(const std::string & path) {
+    ggml_context * ctx = nullptr;
+    gguf_init_params p = { /*no_alloc*/ true, &ctx };
+    gguf_context * g = gguf_init_from_file(path.c_str(), p);
+    std::string arch;
+    if (g) {
+        const int64_t id = gguf_find_key(g, "general.architecture");
+        if (id >= 0) arch = gguf_get_val_str(g, id);
+        gguf_free(g);
+    }
+    if (ctx) ggml_free(ctx);
+    return arch;
+}
+
+// 版本归一化: ""/"v5" -> v5；"v2"/"v2pro"/"v2proplus" -> v2 家族（大小写无关）
+static std::string normalize_version(std::string v) {
+    for (char & ch : v) ch = (char) std::tolower((unsigned char) ch);
+    if (v == "v2" || v == "v2pro" || v == "v2proplus" || v == "v2pro+") return v;
+    if (v.rfind("v2", 0) == 0) return v;      // 其它 v2* 别名（导出时的 --version）原样传入
+    return "v5";
+}
 
 gsv_engine * gsv_engine::load(const gsv_engine_cfg & cfg) {
     gsv_engine * m = new gsv_engine();
@@ -183,16 +230,62 @@ gsv_engine * gsv_engine::load(const gsv_engine_cfg & cfg) {
     if (s.md.back() != '/' && s.md.back() != '\\') s.md.push_back('/');
     const std::string & dev = cfg.device;
     const bool vb = cfg.verbose;
+    {
+        std::string v = cfg.version;
+        if (v.empty()) { const char * e = getenv("GSV_VERSION"); if (e) v = e; }
+        s.ver = normalize_version(v);
+        s.is_v2 = s.ver != "v5";
+        s.v2_noise = cfg.v2_noise_scale;
+    }
+    const bool v2 = s.is_v2;
 
     // 参考音频三链
     {
-        gsv_hubert_cfg c; c.device = dev; c.n_threads = cfg.n_threads; c.verbose = vb;
-        s.hub = gsv_hubert::load(s.pick(cfg.hubert_file, "gsv-hubert-f16.gguf"), c);
+        // ---- HuBERT 前端: 教师 CN-HuBERT 或蒸馏版 (两者 encode() 契约一致) ----
+        //   cfg.hubert_frontend 显式指定 > GSV_HUBERT_FRONTEND > GGUF 的 general.architecture
+        //   (gsv-dhubert → 蒸馏；其余 → 教师)。v2 家族两种前端都能用；教师 GGUF 不是必需的。
+        {
+            std::string fe = cfg.hubert_frontend;
+            if (fe.empty()) { const char * e = getenv("GSV_HUBERT_FRONTEND"); if (e) fe = e; }
+            for (char & ch : fe) ch = (char) std::tolower((unsigned char) ch);
+            const bool is_dh = fe == "distilled" || fe == "dhubert" || fe == "distill";
+            const bool is_h = fe == "hubert" || fe == "teacher" || fe == "cnhubert";
+            std::string path;
+            if (!cfg.hubert_file.empty()) {
+                path = s.pick(cfg.hubert_file, "");
+            } else {
+                // 没显式给文件: 先看两个默认名哪个存在
+                const std::string def_h = s.pick("", "gsv-hubert-f16.gguf");
+                const std::string def_d = s.pick("", "gsv-dhubert.gguf");
+                path = (!is_dh && fe_exists(def_h)) ? def_h
+                     : (fe_exists(def_d) ? def_d : def_h);
+            }
+            const std::string arch = peek_gguf_arch(path);
+            const bool arch_dh = arch == "gsv-dhubert";
+            const bool use_dh = is_dh || (!is_h && arch_dh);
+            if (use_dh) {
+                gsv_dhubert_cfg c; c.device = dev; c.n_threads = cfg.n_threads; c.verbose = vb;
+                s.dhub = gsv_dhubert::load(path, c);
+                s.hub_fe = "distilled";
+            } else {
+                gsv_hubert_cfg c; c.device = dev; c.n_threads = cfg.n_threads; c.verbose = vb;
+                s.hub = gsv_hubert::load(path, c);
+                s.hub_fe = "hubert";
+            }
+            if (vb) printf("[gsv_engine] hubert frontend: %s (arch=%s, %s)\n",
+                           s.hub_fe.c_str(), arch.empty() ? "?" : arch.c_str(), path.c_str());
+            if (!s.hub && !s.dhub) {
+                fprintf(stderr, "[gsv_engine] HuBERT 前端加载失败 (%s)\n", path.c_str());
+                delete m; return nullptr;
+            }
+        }
         gsv_refcode_cfg r; r.device = dev; r.n_threads = cfg.n_threads; r.verbose = vb;
-        s.rc = gsv_refcode::load(s.pick(cfg.refcode_file, "gsv-refcode.gguf"), r);
+        // v2 家族的语义码走 s2 自己的 ssl_proj+VQ 码本，不需要 v5 的 refcode 模块
+        if (!v2) s.rc = gsv_refcode::load(s.pick(cfg.refcode_file, "gsv-refcode.gguf"), r);
         gsv_refenc_cfg g; g.device = dev; g.n_threads = cfg.n_threads; g.verbose = vb;
-        s.re = gsv_refenc::load(s.pick(cfg.cond_file, "gsv-cond-f16.gguf"), g);
-        if (!s.hub || !s.rc || !s.re) {
+        s.re = gsv_refenc::load(v2 ? s.pick(cfg.s2_file, "gsv-v2sovits.gguf")
+                                   : s.pick(cfg.cond_file, "gsv-cond-f16.gguf"), g);
+        if ((!s.hub && !s.dhub) || !s.re || (!v2 && !s.rc)) {
             fprintf(stderr, "[gsv_engine] 参考音频链加载失败 (hubert/refcode/refenc)\n");
             delete m; return nullptr;
         }
@@ -208,15 +301,36 @@ gsv_engine * gsv_engine::load(const gsv_engine_cfg & cfg) {
         gsv_bert_cfg b; b.device = dev; b.n_threads = cfg.n_threads; b.verbose = vb;
         b.feat_cache = 8;
         s.bert = gsv_bert::load(s.pick(cfg.bert_file, "gsv-bert-f16.gguf"), b);
-        if (!s.bert) { fprintf(stderr, "[gsv_engine] BERT 加载失败\n"); delete m; return nullptr; }
+        // v2 变可缺省: 对拍/bench 只需 enc_p 的 text_embedding 输入，bert 由调用方直接给
+        if (!s.bert && !v2) { fprintf(stderr, "[gsv_engine] BERT 加载失败\n"); delete m; return nullptr; }
+        if (!s.bert) fprintf(stderr, "[gsv_engine] 注意: BERT 未加载，v2 路径要求调用方直接提供 bert 向量\n");
     }
     // AR
     {
         gsv_ar_cfg a; a.device = dev; a.n_threads = cfg.n_threads; a.verbose = vb;
         // 锚定档: AR 用 attn+ffn Q8_0 (TV 0.0035 / greedy 3/3); F16 档留作回退
-        s.ar = gsv_ar::load(s.pick(cfg.ar_file, "gsv-ar-q8.gguf"), a);
+        // v2 家族用自己的 GPT (s1bert25hz-5kh-longer-*)，默认文件名不同
+        const char * ar_def = v2 ? "gsv-ar-v2-q8.gguf" : "gsv-ar-q8.gguf";
+        s.ar = gsv_ar::load(s.pick(cfg.ar_file, ar_def), a);
         if (!s.ar) { fprintf(stderr, "[gsv_engine] AR 加载失败\n"); delete m; return nullptr; }
         s.ar_vocab = s.ar->vocab_size();
+    }
+    if (v2) {
+        // ---- v2 家族: S2 (VITS) 解码器，不需要 cond/encp/wns1/DiT/vocoder ----
+        gsv_v2sovits_cfg c;
+        c.device = dev; c.n_threads = cfg.n_threads; c.verbose = vb;
+        const std::string f = s.pick(cfg.s2_file, "gsv-v2sovits.gguf");
+        s.s2 = gsv_v2sovits::load(f, c);
+        if (!s.s2) { fprintf(stderr, "[gsv_engine] v2 SoVITS 加载失败 (%s)\n", f.c_str()); delete m; return nullptr; }
+        if (s.s2->version() != s.ver && vb)
+            printf("[gsv_engine] 注意: --version %s 与 GGUF 里的 %s 不一致 (以导出时的 KV 为准)\n",
+                   s.ver.c_str(), s.s2->version().c_str());
+        s.ver = s.s2->version();
+        s.ready = true;
+        if (vb)
+            printf("[gsv_engine] ready: version=%s sr=%d upsample=%d ggml=%s\n",
+                   s.ver.c_str(), s.s2->sample_rate(), s.s2->upsample(), dev.empty() ? "cpu" : dev.c_str());
+        return m;
     }
     // 条件段
     {
@@ -271,23 +385,31 @@ bool gsv_engine::prep_reference(const std::string & wav_path,
         return false;
     }
 
-    // (a) 16k + 0.3s 零尾 -> HuBERT -> ssl_proj -> RVQ -> codes
+    // (a) 16k + 0.3s 零尾 -> HuBERT -> ssl_proj -> 语义码
+    //     v5: refcode 的 RVQ；v2: s2 自己的 ssl_proj(k2s2) + 单层 1024 码本
     std::vector<float> w16;
     gsv_refcode::resample_librosa(raw.data(), (int64_t) raw.size(), sr, 16000, w16);
     const int zero_tail = (int) (32000 * 0.3);          // repo: int(sampling_rate * 0.3)
     std::vector<float> fed(w16.size() + (size_t) zero_tail, 0.0f);
     if (!w16.empty()) std::memcpy(fed.data(), w16.data(), w16.size() * sizeof(float));
     std::vector<float> hout;
-    if (!s.hub->encode(fed.data(), (int) fed.size(), hout)) {
-        fprintf(stderr, "[gsv_engine] HuBERT 编码失败\n");
+    const bool hok = s.hub ? s.hub->encode(fed.data(), (int) fed.size(), hout)
+                           : s.dhub->encode(fed.data(), (int) fed.size(), hout);
+    if (!hok) {
+        fprintf(stderr, "[gsv_engine] HuBERT(%s) 编码失败\n", s.hub_fe.c_str());
         return false;
     }
     const int Th = (int) (hout.size() / 768);
     std::vector<float> ssl((size_t) 768 * Th);          // ggml [768,T] -> torch [768,T]
     for (int d = 0; d < 768; d++)
         for (int t = 0; t < Th; t++) ssl[(size_t) d * Th + t] = hout[(size_t) d + (size_t) 768 * t];
-    if (!s.rc->codes_from_ssl(ssl.data(), Th, prompt_codes)) {
-        fprintf(stderr, "[gsv_engine] refcode (ssl_proj + RVQ) 失败\n");
+    if (!s.is_v2) {
+        if (!s.rc->codes_from_ssl(ssl.data(), Th, prompt_codes)) {
+            fprintf(stderr, "[gsv_engine] refcode (ssl_proj + RVQ) 失败\n");
+            return false;
+        }
+    } else if (!s.s2->codes_from_ssl(ssl.data(), Th, prompt_codes)) {
+        fprintf(stderr, "[gsv_engine] v2 ssl_proj + VQ 失败\n");
         return false;
     }
 
@@ -307,17 +429,23 @@ bool gsv_engine::prep_reference(const std::string & wav_path,
     }
 
     // (c) 32k -> mel_fn_v4 -> norm_spec (torch 布局, DiT 的 prompt mel 直接用)
-    std::vector<float> w32;
-    gsv_resample(raw.data(), (int64_t) raw.size(), sr, 32000, w32);
-    gsv_mel_cfg mc; mc.n_threads = s.cfg.n_threads > 0 ? s.cfg.n_threads : 8;
-    gsv_mel mel(mc);
-    if (!mel.forward_norm(w32.data(), (int64_t) w32.size(), mel2, mel2_T)) {
-        fprintf(stderr, "[gsv_engine] mel_fn_v4 失败\n");
-        return false;
+    //     v2 不用 DiT，省掉这一步（mel2 留空）
+    if (!s.is_v2) {
+        std::vector<float> w32;
+        gsv_resample(raw.data(), (int64_t) raw.size(), sr, 32000, w32);
+        gsv_mel_cfg mc; mc.n_threads = s.cfg.n_threads > 0 ? s.cfg.n_threads : 8;
+        gsv_mel mel(mc);
+        if (!mel.forward_norm(w32.data(), (int64_t) w32.size(), mel2, mel2_T)) {
+            fprintf(stderr, "[gsv_engine] mel_fn_v4 失败\n");
+            return false;
+        }
+    } else {
+        mel2.clear();
+        mel2_T = 0;
     }
     if (s.cfg.verbose)
-        printf("[gsv_engine] prep_reference: codes=%zu ge[512] mel2[100,%d]\n",
-               prompt_codes.size(), mel2_T);
+        printf("[gsv_engine] prep_reference: codes=%zu ge[%d] mel2[100,%d]\n",
+               prompt_codes.size(), TXT_DIM, mel2_T);
     return true;
 }
 
@@ -673,6 +801,44 @@ bool gsv_engine::synthesize(const std::vector<int32_t> & sem,
                             const std::vector<float> & mel2, int mel2_T,
                             int steps, float cfg, uint64_t seed,
                             std::vector<float> & wav, double speed, int skip_steps) {
+    impl & s = *p;
+    // ---- v2 家族: VITS 一步出波形 (sem → enc_p → flow → dec)，不用 DiT/vocoder ----
+    // 参考侧只提供 ge；prompt_codes/prompt_phones 由 AR 的 prompt 先验吃掉，解码不再需要。
+    // 与 repo 的 SynthesizerTrn.decode(codes, text, refer=…, noise_scale=…) 同义。
+    if (s.is_v2) {
+        wav.clear();
+        if (!s.ready || !s.s2) return false;
+        if (sem.empty()) return false;
+        if (ge.size() != (size_t) TXT_DIM) {
+            fprintf(stderr, "[gsv_engine] ge 尺寸 %zu != %d\n", ge.size(), TXT_DIM);
+            return false;
+        }
+        if (phones.empty()) {
+            fprintf(stderr, "[gsv_engine] phones 为空: v2 的 enc_p 需要目标文本音素\n");
+            return false;
+        }
+        if (!mel2_T) { /* v2 不需要 prompt mel */ }
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!s.s2->synthesize(sem.data(), (int) sem.size(), phones.data(), (int) phones.size(),
+                              ge.data(), wav, speed, seed, s.v2_noise)) {
+            fprintf(stderr, "[gsv_engine] v2 synthesize 失败\n");
+            return false;
+        }
+        double e_ms = 0, f_ms = 0, d_ms = 0;
+        s.s2->last_stage_ms(e_ms, f_ms, d_ms);
+        s.last_cond_ms = e_ms;
+        s.last_dit_ms = f_ms + d_ms;
+        const double tot = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+        const double dur = wav.size() / (double) (s.s2->sample_rate() > 0 ? s.s2->sample_rate() : 32000);
+        if (s.cfg.verbose)
+            printf("[gsv_engine] v2 synthesize: sem=%zu phones=%zu -> wav[%zu] %.2fs "
+                   "(enc_p %.1f + flow %.1f + dec %.1f ms, total %.1f ms, RTF %.3f)\n",
+                   sem.size(), phones.size(), wav.size(), dur, e_ms, f_ms, d_ms, tot,
+                   dur > 0 ? tot / 1000.0 / dur : 0.0);
+        (void) steps; (void) cfg; (void) skip_steps;
+        return true;
+    }
     std::vector<float> mel;
     int mel_T = 0;
     if (!synthesize_mel(sem, phones, prompt_codes, prompt_phones, ge, mel2, mel2_T, steps, cfg, seed,

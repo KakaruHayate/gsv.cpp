@@ -21,8 +21,24 @@ struct gsv_engine_cfg {
     // 可选: 逐模型显式路径 (voice manifest 用)。空 = 取 model_dir 下的默认文件名。
     std::string ar_file, cond_file, dit_file, bert_file, hubert_file, refcode_file, vocoder_file;
     std::string filter_file;   // resampy kaiser_best 表 (空 = model_dir/resampy_kaiser_best.bin)
+    // HuBERT 前端选择（参考音频 -> SSL 特征的那一段）:
+    //   ""             = 从 GGUF 的 general.architecture 自动识别 (gsv-dhubert / gsv-hubert)
+    //   "distilled"    = 蒸馏 HuBERT (student_v0.pt, 2.97M, arch=gsv-dhubert)
+    //   "hubert"/"teacher" = 教师 CN-HuBERT (95M, arch=gsv-hubert)
+    // 环境变量 GSV_HUBERT_FRONTEND 可覆盖。"" + 默认文件名时看 hubert_file 落地的是哪个 GGUF。
+    std::string hubert_frontend;
     int  n_threads = 0;        // CPU 后端线程数 (0 = 默认)
     bool verbose    = false;
+
+    // ---- 版本选择 ----
+    // ""/"v5"        : v5 链路 (cond + DiT/CFM + vocoder), 默认
+    // "v2"/"v2pro"/"v2proplus": v2 家族链路 (VITS: enc_p → flow → dec, 直接出波形)
+    //   空且环境变量 GSV_VERSION 非空时用环境变量; 也接受 export 时的任意别名 (小写比较)
+    std::string version;
+    // v2 家族: S2 (SoVITS) 的 GGUF, 空 = model_dir/gsv-v2sovits.gguf
+    // 该文件同时含 enc_p.* / ref_enc.* / flow.* / dec.* / quantizer.* / ssl_proj.*
+    std::string s2_file;
+    float v2_noise_scale = 0.5f;   // z_p = m_p + ε·exp(logs_p)·noise_scale (repo 默认 0.5)
 };
 
 class gsv_engine {
@@ -119,6 +135,12 @@ public:
     int  mel_dim()  const;      // 100
     int  text_dim() const;      // 512
     int  ar_vocab() const;
+    // "v5" 或 "v2"/"v2pro"/"v2proplus"（决定 synthesize 走 DiT+vocoder 还是 VITS 解码）
+    const std::string & version() const;
+    // 当前生效的参考音频 HuBERT 前端: "hubert" (教师) / "distilled" (蒸馏)
+    const std::string & hubert_frontend() const;
+    // v2 家族: 采样率 / 上采样倍数 / 编解码帧率（v5 返回 32k/1/50 之外的值没有意义）
+    int  sample_rate() const;
 
 private:
     gsv_engine();

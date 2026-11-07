@@ -42,3 +42,6 @@ dist/
 
 # build output / local experiment scratch
 tests/relcpu/
+
+# 临时工作目录 (对拍脚本/参考 dump/基准产物; 参见 AGENTS.md)
+.tmp/

@@ -79,7 +79,8 @@ def main():
         if ("norm" in low) or name.endswith("_b") or ("alpha" in low) or ("bert" in low):
             return gguf.GGMLQuantizationType.F32
         if "text_emb" in low or "audio_emb" in low:
-            return QT.get(SPEC.get("emb", "f32"), gguf.GGMLQuantizationType.F32)
+            # 强制 F32: gsv_ar 直接读这两张表做 host 侧 embedding (emb=f16 会加载失败)
+            return gguf.GGMLQuantizationType.F32
         if "predict" in low:
             return QT.get(SPEC.get("predict", "f32"), gguf.GGMLQuantizationType.F32)
         if "ffn" in low:

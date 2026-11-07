@@ -71,6 +71,7 @@ file(GLOB GSV_ENGINE_SOURCES CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_refcode.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_refenc.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_sampler.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_v2sovits.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_vocoder_ggml.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_wns1.cpp")
 
@@ -133,6 +134,10 @@ if(GSV_BUILD_TESTS)
     # reference chain must be repeatable: test_prep_repeat <models_dir> <ref.wav> [other.wav]
     add_executable(test_prep_repeat "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_prep_repeat.cpp")
     target_link_libraries(test_prep_repeat PRIVATE gsv_engine)
+
+    # v2 / v2Pro / v2ProPlus S2 解码器: 分段对拍 + 端到端 benchmark
+    add_executable(probe_v2sovits "${CMAKE_CURRENT_SOURCE_DIR}/tests/probe_v2sovits.cpp")
+    target_link_libraries(probe_v2sovits PRIVATE gsv_engine)
 
     # add_act kernel (CPU + Vulkan) incl. the mish activation used by the DiT trunk
     add_executable(test_add_act "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_add_act.cpp")
