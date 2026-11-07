@@ -90,6 +90,11 @@ struct gsv_ar::impl {
     ggml_backend_buffer_t cbuf = nullptr;
     std::vector<ggml_tensor *> kc_t, vc_t;   // 各 [HD, Lmax, NH, B]
     int Lmax_alloc = 0;
+    // KV cache 元素类型: F32 (默认, 与历史版本数值完全一致) 或 F16 (GSV_AR_KV_F16=1)。
+    // 解码每步 flash 都要把整个 KV 历史读一遍 —— L≈450 时 44MB/token, 占解码 DRAM
+    // 流量的 1/3; F16 把这份流量减半 (llama.cpp 的 KV cache 默认也是 F16)。
+    // 默认关: 保持既有 v5/v2 路径逐位不变; 需要在 gsv_ar 之外选开。
+    bool kv_f16 = false;
 
     void alloc_cache(int Lmax, int B) {
         if (cctx && Lmax_alloc >= Lmax && cache.B == B) return;
@@ -102,8 +107,8 @@ struct gsv_ar::impl {
         cctx = ggml_init(ip);
         kc_t.resize(NL); vc_t.resize(NL);
         for (int li = 0; li < NL; li++) {
-            kc_t[li] = ggml_new_tensor_4d(cctx, GGML_TYPE_F32, HD, Lmax, NH, B);
-            vc_t[li] = ggml_new_tensor_4d(cctx, GGML_TYPE_F32, HD, Lmax, NH, B);
+            kc_t[li] = ggml_new_tensor_4d(cctx, kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32, HD, Lmax, NH, B);
+            vc_t[li] = ggml_new_tensor_4d(cctx, kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32, HD, Lmax, NH, B);
         }
         cbuf = ggml_backend_alloc_ctx_tensors(cctx, backend);
         if (!cbuf) { fprintf(stderr, "[gsv_ar] cache alloc failed\n"); exit(1); }
@@ -656,6 +661,7 @@ if (!dev) { fprintf(stderr, "[gsv_ar] no usable backend device"); delete m; retu
     }
 
     g_prof = getenv("GSV_AR_PROFILE") != nullptr;
+    s.kv_f16 = getenv("GSV_AR_KV_F16") != nullptr;
     // 融合算子支持探测: 用代表性形状建一次节点问后端 (CPU 恒支持; Vulkan 需 shader 在册)
     {
         ggml_init_params fp = { ggml_tensor_overhead() * 32, NULL, true };
@@ -692,9 +698,9 @@ if (!dev) { fprintf(stderr, "[gsv_ar] no usable backend device"); delete m; retu
     if (cfg.verbose)
         printf("[gsv_ar] loaded %s: D=%d head=%d layers=%d vocab=%d EOS=%d bert=%d alpha=(%.4f, %.4f)\n",
                gguf_path.c_str(), s.D, s.NH, s.NL, s.VOCAB, s.EOS, s.BERT_DIM, s.text_pe_alpha, s.audio_pe_alpha);
-    if (cfg.verbose) printf("[gsv_ar] fused ops: ln=%s act=%s | decode graph cache: %s\n",
+    if (cfg.verbose) printf("[gsv_ar] fused ops: ln=%s act=%s | decode graph cache: %s | kv: %s\n",
                             s.fuse_ln ? "on" : "off", s.fuse_act ? "on" : "off",
-                            s.use_graph_cache ? "on" : "off");
+                            s.use_graph_cache ? "on" : "off", s.kv_f16 ? "f16" : "f32");
     return m;
 }
 
