@@ -1,8 +1,14 @@
 #include "gsv_engine.h"
 
+#include "gsv_path.h"
+
+#include "ggml.h"
+#include "gguf.h"
+
 #include "gsv_ar.h"
 #include "gsv_bert.h"
 #include "gsv_cond.h"
+#include "gsv_dhubert.h"
 #include "gsv_dit.h"
 #include "gsv_encp.h"
 #include "gsv_hubert.h"
@@ -33,6 +39,8 @@ struct gsv_engine::impl {
 
     // 各段模型 (常驻; 与 demo_e2e.cpp 用的是同一批文件)
     gsv_hubert  * hub  = nullptr;
+    gsv_dhubert * dhub = nullptr;      // 蒸馏前端 (arch=gsv-dhubert), 与 hub 二选一
+    std::string hub_fe = "hubert";     // 当前生效的前端名
     gsv_refcode * rc   = nullptr;
     gsv_refenc  * re   = nullptr;
     gsv_bert    * bert = nullptr;
@@ -81,7 +89,7 @@ struct gsv_engine::impl {
 
     ~impl() {
         delete s2; delete vgm; delete dit; delete wns1; delete encp; delete cond;
-        delete ar; delete bert; delete re; delete rc; delete hub;
+        delete ar; delete bert; delete re; delete rc; delete dhub; delete hub;
     }
 
     std::string path(const char * leaf) const {
@@ -181,7 +189,30 @@ void gsv_engine::fea_cache_stats(int & hits, int & misses) const {
 int gsv_engine::text_dim() const { return TXT_DIM; }
 int gsv_engine::ar_vocab() const { return p->ar_vocab; }
 const std::string & gsv_engine::version() const { return p->ver; }
+const std::string & gsv_engine::hubert_frontend() const { return p->hub_fe; }
 int gsv_engine::sample_rate() const { return p->is_v2 ? (p->s2 ? p->s2->sample_rate() : 32000) : 48000; }
+
+// 文件是否存在（走 gsvpath，Windows 上能处理非 ASCII 路径）
+static bool fe_exists(const std::string & p) {
+    FILE * f = gsvpath::open_read(p);
+    if (f) fclose(f);
+    return f != nullptr;
+}
+
+// 只读 GGUF 头，拿 general.architecture（不分配任何张量）
+static std::string peek_gguf_arch(const std::string & path) {
+    ggml_context * ctx = nullptr;
+    gguf_init_params p = { /*no_alloc*/ true, &ctx };
+    gguf_context * g = gguf_init_from_file(path.c_str(), p);
+    std::string arch;
+    if (g) {
+        const int64_t id = gguf_find_key(g, "general.architecture");
+        if (id >= 0) arch = gguf_get_val_str(g, id);
+        gguf_free(g);
+    }
+    if (ctx) ggml_free(ctx);
+    return arch;
+}
 
 // 版本归一化: ""/"v5" -> v5；"v2"/"v2pro"/"v2proplus" -> v2 家族（大小写无关）
 static std::string normalize_version(std::string v) {
@@ -210,15 +241,51 @@ gsv_engine * gsv_engine::load(const gsv_engine_cfg & cfg) {
 
     // 参考音频三链
     {
-        gsv_hubert_cfg c; c.device = dev; c.n_threads = cfg.n_threads; c.verbose = vb;
-        s.hub = gsv_hubert::load(s.pick(cfg.hubert_file, "gsv-hubert-f16.gguf"), c);
+        // ---- HuBERT 前端: 教师 CN-HuBERT 或蒸馏版 (两者 encode() 契约一致) ----
+        //   cfg.hubert_frontend 显式指定 > GSV_HUBERT_FRONTEND > GGUF 的 general.architecture
+        //   (gsv-dhubert → 蒸馏；其余 → 教师)。v2 家族两种前端都能用；教师 GGUF 不是必需的。
+        {
+            std::string fe = cfg.hubert_frontend;
+            if (fe.empty()) { const char * e = getenv("GSV_HUBERT_FRONTEND"); if (e) fe = e; }
+            for (char & ch : fe) ch = (char) std::tolower((unsigned char) ch);
+            const bool is_dh = fe == "distilled" || fe == "dhubert" || fe == "distill";
+            const bool is_h = fe == "hubert" || fe == "teacher" || fe == "cnhubert";
+            std::string path;
+            if (!cfg.hubert_file.empty()) {
+                path = s.pick(cfg.hubert_file, "");
+            } else {
+                // 没显式给文件: 先看两个默认名哪个存在
+                const std::string def_h = s.pick("", "gsv-hubert-f16.gguf");
+                const std::string def_d = s.pick("", "gsv-dhubert.gguf");
+                path = (!is_dh && fe_exists(def_h)) ? def_h
+                     : (fe_exists(def_d) ? def_d : def_h);
+            }
+            const std::string arch = peek_gguf_arch(path);
+            const bool arch_dh = arch == "gsv-dhubert";
+            const bool use_dh = is_dh || (!is_h && arch_dh);
+            if (use_dh) {
+                gsv_dhubert_cfg c; c.device = dev; c.n_threads = cfg.n_threads; c.verbose = vb;
+                s.dhub = gsv_dhubert::load(path, c);
+                s.hub_fe = "distilled";
+            } else {
+                gsv_hubert_cfg c; c.device = dev; c.n_threads = cfg.n_threads; c.verbose = vb;
+                s.hub = gsv_hubert::load(path, c);
+                s.hub_fe = "hubert";
+            }
+            if (vb) printf("[gsv_engine] hubert frontend: %s (arch=%s, %s)\n",
+                           s.hub_fe.c_str(), arch.empty() ? "?" : arch.c_str(), path.c_str());
+            if (!s.hub && !s.dhub) {
+                fprintf(stderr, "[gsv_engine] HuBERT 前端加载失败 (%s)\n", path.c_str());
+                delete m; return nullptr;
+            }
+        }
         gsv_refcode_cfg r; r.device = dev; r.n_threads = cfg.n_threads; r.verbose = vb;
         // v2 家族的语义码走 s2 自己的 ssl_proj+VQ 码本，不需要 v5 的 refcode 模块
         if (!v2) s.rc = gsv_refcode::load(s.pick(cfg.refcode_file, "gsv-refcode.gguf"), r);
         gsv_refenc_cfg g; g.device = dev; g.n_threads = cfg.n_threads; g.verbose = vb;
         s.re = gsv_refenc::load(v2 ? s.pick(cfg.s2_file, "gsv-v2sovits.gguf")
                                    : s.pick(cfg.cond_file, "gsv-cond-f16.gguf"), g);
-        if (!s.hub || !s.re || (!v2 && !s.rc)) {
+        if ((!s.hub && !s.dhub) || !s.re || (!v2 && !s.rc)) {
             fprintf(stderr, "[gsv_engine] 参考音频链加载失败 (hubert/refcode/refenc)\n");
             delete m; return nullptr;
         }
@@ -324,8 +391,10 @@ bool gsv_engine::prep_reference(const std::string & wav_path,
     std::vector<float> fed(w16.size() + (size_t) zero_tail, 0.0f);
     if (!w16.empty()) std::memcpy(fed.data(), w16.data(), w16.size() * sizeof(float));
     std::vector<float> hout;
-    if (!s.hub->encode(fed.data(), (int) fed.size(), hout)) {
-        fprintf(stderr, "[gsv_engine] HuBERT 编码失败\n");
+    const bool hok = s.hub ? s.hub->encode(fed.data(), (int) fed.size(), hout)
+                           : s.dhub->encode(fed.data(), (int) fed.size(), hout);
+    if (!hok) {
+        fprintf(stderr, "[gsv_engine] HuBERT(%s) 编码失败\n", s.hub_fe.c_str());
         return false;
     }
     const int Th = (int) (hout.size() / 768);

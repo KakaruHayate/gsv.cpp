@@ -17,9 +17,9 @@
 #   enc_q.*      posterior encoder: training only, dropped by default (--keep-enc-q)
 #
 # Tensor naming: the checkpoint keys are already unambiguous and stable across v2, v2Pro and
-# v2ProPlus, so they are kept verbatim (dots preserved). Conv1d weights are permuted
-# [OC,IC,K] -> [K,IC,OC] like the other converters, and the arch metadata records the layout
-# so gsv_v2sovits.cpp can stay table-driven.
+# v2ProPlus, so they are kept verbatim (dots preserved). Conv1d weights are written as-is
+# (torch [OC,IC,K]); the GGUF dims reversal makes ggml see them as [K,IC,OC], which is the
+# layout every ggml conv op expects. See convert_cond.py for the same convention.
 import argparse
 import json
 import os
@@ -95,7 +95,12 @@ def main():
         if not torch.is_tensor(t):
             continue
         if is_conv1d(name, t):
-            arr = t.detach().float().permute(2, 1, 0).contiguous().numpy()
+            # 不要 permute。gguf.GGUFWriter 写 dims 时按 shape[::-1] 落盘（见 gguf_writer.py
+            # 的 ti.shape[n_dims-1-j]），所以 torch [OC,IC,K] 原样写出后，ggml 侧 ne 就是
+            # [K,IC,OC] —— 正是 ggml_conv_1d / ggml_conv_direct_1d 要的核布局。
+            # 早期这里多做了一次 permute(2,1,0)，ggml 里就变成 [OC,IC,K]，所有 3D 卷积
+            # （enc_p / ref_enc / dec / flow 的 weight_v）全部错位，v2 家族文件因此不可用。
+            arr = t.detach().float().contiguous().numpy()
             n_conv += 1
         else:
             arr = t.detach().float().contiguous().numpy()

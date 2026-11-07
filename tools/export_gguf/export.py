@@ -56,8 +56,11 @@ def build_cmd(kind, a):
             cmd += ["--spec", "attn=q8_0,ffn=q8_0"]
         elif a.f16:
             cmd += ["--spec", "attn=f16,ffn=f16,predict=f16,emb=f16"]
-    elif kind == "v2sovits" and a.f16:
-        cmd += ["--f16"]
+    elif kind == "v2sovits":
+        if a.f16:
+            cmd += ["--f16"]
+        if a.version:
+            cmd += ["--version", a.version]
     elif kind in ("cond", "dit") and a.spec:
         cmd += ["--spec", a.spec]
     return cmd
@@ -93,6 +96,8 @@ def main():
     ap.add_argument("--spec", default="", help="per-group dtypes, e.g. attn=f16,ffn=f16")
     ap.add_argument("--f16", action="store_true", help="ar: store weights as F16 (norm/bias/emb stay F32)")
     ap.add_argument("--q8", action="store_true", help="ar: store attn/ffn as Q8_0")
+    ap.add_argument("--version", default=None,
+                    help="v2sovits: v2 | v2pro | v2proplus (sample rate / widths; default v2)")
     ap.add_argument("--self-test", action="store_true", help="re-open the artifact and validate it")
     a = ap.parse_args()
 

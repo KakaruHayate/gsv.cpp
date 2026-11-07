@@ -120,11 +120,12 @@ struct v2_graph {
     ggml_tensor * in  = nullptr;
     ggml_tensor * ge  = nullptr;
     ggml_tensor * out = nullptr;
+    ggml_tensor * aux = nullptr;   // 诊断用（vq: ssl_proj 的输出）
     void release() {
         if (ga) ggml_gallocr_free(ga);
         if (ctx) ggml_free(ctx);
         ga = nullptr; ctx = nullptr; g = nullptr;
-        in = ge = out = nullptr; T = 0; nframes = 0;
+        in = ge = out = aux = nullptr; T = 0; nframes = 0;
     }
 };
 
@@ -231,7 +232,14 @@ std::vector<float> gsv_v2sovits::impl::read_f32(const char * name) {
 void gsv_v2sovits::impl::plan_weights() {
     char n1[192], n2[192];
 
-    auto add_plain = [&](const std::string & name) {          // 已是 [K,IC,OC]
+    // GGUF 里张量的 ggml ne（gguf.GGUFWriter 按 shape[::-1] 落盘 ⇒ ne = reversed(numpy shape)）:
+    //   普通 Conv1d        torch [OC,IC,K] → ne = [K, IC, OC]
+    //   Conv1d.weight_v          [OC,IC,K] → ne = [K, IC, OC]
+    //   ConvTranspose1d.weight_v [IC,OC,K] → ne = [K, OC, IC]
+    //   Linear                   [out,in]  → ne = [in, out]
+    //   码本                     [K,D]     → ne = [D, K]
+    //   weight_g / bias          [n,1,1]/[n] → 元素数就是 n
+    auto add_plain = [&](const std::string & name) {          // ne = [K, IC, OC]
         ggml_tensor * t = src(name.c_str());
         if (!t) return;
         v2_item it; it.dst = name; it.kind = 0; it.w = name;
@@ -251,7 +259,7 @@ void gsv_v2sovits::impl::plan_weights() {
         ggml_tensor * tv = src(v.c_str());
         if (!tv) { fprintf(stderr, "[gsv_v2] missing %s\n", v.c_str()); abort(); }
         v2_item it; it.dst = base + ".weight"; it.kind = 1; it.w = v; it.g = g;
-        it.OC = (int) tv->ne[0]; it.IC = (int) tv->ne[1]; it.K = (int) tv->ne[2];
+        it.K = (int) tv->ne[0]; it.IC = (int) tv->ne[1]; it.OC = (int) tv->ne[2];
         items.push_back(it);
         add_bias(base + ".bias");
     };
@@ -261,7 +269,7 @@ void gsv_v2sovits::impl::plan_weights() {
         ggml_tensor * tv = src(v.c_str());
         if (!tv) { fprintf(stderr, "[gsv_v2] missing %s\n", v.c_str()); abort(); }
         v2_item it; it.dst = base + ".weight"; it.kind = 2; it.w = v; it.g = g; it.st = st;
-        it.IC = (int) tv->ne[0]; it.OC = (int) tv->ne[1]; it.K = (int) tv->ne[2];
+        it.K = (int) tv->ne[0]; it.OC = (int) tv->ne[1]; it.IC = (int) tv->ne[2];
         const int pad_tr = (it.K - st) / 2;
         int64_t d_lo = 0, d_hi = 0;
         bool first = true;
@@ -293,6 +301,8 @@ void gsv_v2sovits::impl::plan_weights() {
             }
         }
     }
+    add_plain("dec.cond.weight");          // gin -> 512 的 1x1，把 ge 变成一个常量向量
+    add_bias("dec.cond.bias");
     add_plain("dec.conv_post.weight");
     add_bias("dec.conv_post.bias");      // v2 的 conv_post 无 bias（is_bias=False），不存在则跳过
 
@@ -323,8 +333,8 @@ void gsv_v2sovits::impl::plan_weights() {
         ggml_tensor * t = src(nm.c_str());
         if (!t) { fprintf(stderr, "[gsv_v2] missing %s\n", nm.c_str()); abort(); }
         v2_item it; it.dst = nm; it.kind = 4; it.w = nm;
-        it.OC = (int) t->ne[0];                // K = 码本大小 (ne0)
-        it.IC = (int) t->ne[1];                // D = ssl_dim (ne1)
+        it.IC = (int) t->ne[0];                // D = ssl_dim  (torch [K,D] → ne = [D,K])
+        it.OC = (int) t->ne[1];                // K = 码本大小
         items.push_back(it);
     }
 }
@@ -340,11 +350,16 @@ void gsv_v2sovits::impl::create_folded() {
             case 1: t = ggml_new_tensor_3d(fctx, GGML_TYPE_F32, it.K, it.IC, it.OC); break;
             case 2: t = ggml_new_tensor_3d(fctx, GGML_TYPE_F32, it.M, it.IC, (int64_t) it.OC * it.st); break;
             case 3: t = ggml_new_tensor_1d(fctx, GGML_TYPE_F32, it.K); break;
-            case 4: t = ggml_new_tensor_2d(fctx, GGML_TYPE_F32, it.OC, it.IC); break;
+            case 4: t = ggml_new_tensor_2d(fctx, GGML_TYPE_F32, it.IC, it.OC); break;   // [D,K]
             default: abort();
         }
         ggml_set_name(t, it.dst.c_str());
         w[it.dst] = t;
+    }
+    {   // torch.flip(x,[1]) 用 1x1 置换卷积实现：W[0, ic, oc] = δ(ic+oc, C-1)
+        ggml_tensor * t = ggml_new_tensor_3d(fctx, GGML_TYPE_F32, 1, hidden, hidden);
+        ggml_set_name(t, "flow.flip.weight");
+        w["flow.flip.weight"] = t;
     }
     fbuf = ggml_backend_alloc_ctx_tensors(fctx, backend);
     if (!fbuf) { fprintf(stderr, "[gsv_v2] fold buffer alloc failed\n"); abort(); }
@@ -352,9 +367,20 @@ void gsv_v2sovits::impl::create_folded() {
 
 void gsv_v2sovits::impl::fill_folded() {
     std::vector<float> v, g;
+    {
+        ggml_tensor * t = w["flow.flip.weight"];
+        std::vector<float> pv((size_t) hidden * hidden, 0.0f);
+        for (int ic = 0; ic < hidden; ic++) pv[(size_t) (hidden - 1 - ic) + (size_t) ic * hidden] = 1.0f;
+        ggml_backend_tensor_set(t, pv.data(), 0, pv.size() * 4);
+    }
     for (const v2_item & it : items) {
         ggml_tensor * dst = w[it.dst];
-        if (it.kind == 0 || it.kind == 3) {
+        if (it.kind == 3) {
+            v = read_f32(it.w.c_str());
+            if (v.empty()) abort();
+            ggml_backend_tensor_set(dst, v.data(), 0, v.size() * 4);
+        } else if (it.kind == 0) {
+            // 源和目标都是 [K, IC, OC]，numpy 行主 = flat(k + ic*K + oc*K*IC) → 直接拷
             v = read_f32(it.w.c_str());
             if (v.empty()) abort();
             ggml_backend_tensor_set(dst, v.data(), 0, v.size() * 4);
@@ -363,7 +389,7 @@ void gsv_v2sovits::impl::fill_folded() {
             if (v.empty()) abort();
             ggml_backend_tensor_set(dst, v.data(), 0, v.size() * 4);
             cb = v;                              // host 副本（decode_codes 用）
-            const int K = it.OC, D = it.IC;
+            const int K = it.OC, D = it.IC;   // flat = d + k*D
             cb_sq.assign((size_t) K, 0.0f);
             for (int k = 0; k < K; k++) {
                 double acc = 0.0;
@@ -371,7 +397,8 @@ void gsv_v2sovits::impl::fill_folded() {
                 cb_sq[(size_t) k] = (float) acc;
             }
         } else if (it.kind == 1) {
-            // v:[OC,IC,K] flat o + ic*OC + k*OC*IC ; g:[OC]
+            // v 的 ggml ne 就是 [K, IC, OC] → flat = k + ic*K + oc*K*IC（与 torch [OC,IC,K]
+            // 行主完全相同）; g 的 ne 是 [1,1,OC]
             v = read_f32(it.w.c_str());
             g = read_f32(it.g.c_str());
             if (v.empty() || g.size() != (size_t) it.OC) {
@@ -382,7 +409,8 @@ void gsv_v2sovits::impl::fill_folded() {
                 double acc = 0.0;
                 for (int ic = 0; ic < it.IC; ic++)
                     for (int k = 0; k < it.K; k++) {
-                        const double x = v[(size_t) o + (size_t) ic * it.OC + (size_t) k * it.OC * it.IC];
+                        // flat(k + ic*K + oc*K*IC) == torch [OC,IC,K] 的行主序
+                        const double x = v[(size_t) k + (size_t) ic * it.K + (size_t) o * it.K * it.IC];
                         acc += x * x;
                     }
                 norm[(size_t) o] = (float) std::sqrt(acc);
@@ -392,14 +420,15 @@ void gsv_v2sovits::impl::fill_folded() {
                 const float scale = g[(size_t) o] / (norm[(size_t) o] > 1e-12f ? norm[(size_t) o] : 1e-12f);
                 for (int ic = 0; ic < it.IC; ic++)
                     for (int k = 0; k < it.K; k++) {
-                        const float x = v[(size_t) o + (size_t) ic * it.OC + (size_t) k * it.OC * it.IC];
-                        // dst [K,IC,OC]: flat k + ic*K + o*K*IC
+                        const float x = v[(size_t) k + (size_t) ic * it.K + (size_t) o * it.K * it.IC];
+                        // dst [K,IC,OC]: flat k + ic*K + o*K*IC（与源同一顺序）
                         out[(size_t) k + (size_t) ic * it.K + (size_t) o * it.K * it.IC] = x * scale;
                     }
             }
             ggml_backend_tensor_set(dst, out.data(), 0, out.size() * 4);
         } else if (it.kind == 2) {
-            // v:[IC,OC,K] flat ic + o*IC + k*IC*OC ; g:[IC]（dim0 = in，逐输入通道归一）
+            // v 的 ggml ne 是 [K, OC, IC] → flat = k + oc*K + ic*OC*K（== torch [IC,OC,K] 行主）;
+            // g 的 ne 是 [1,1,IC]（dim0 = in，逐输入通道归一）
             v = read_f32(it.w.c_str());
             g = read_f32(it.g.c_str());
             if (v.empty() || g.size() != (size_t) it.IC) {
@@ -410,7 +439,8 @@ void gsv_v2sovits::impl::fill_folded() {
                 double acc = 0.0;
                 for (int o = 0; o < it.OC; o++)
                     for (int k = 0; k < it.K; k++) {
-                        const double x = v[(size_t) ic + (size_t) o * it.IC + (size_t) k * it.IC * it.OC];
+                        // flat(k + oc*K + ic*OC*K) == torch [IC,OC,K] 的行主序
+                        const double x = v[(size_t) k + (size_t) o * it.K + (size_t) ic * it.OC * it.K];
                         acc += x * x;
                     }
                 norm[(size_t) ic] = (float) std::sqrt(acc);
@@ -426,7 +456,7 @@ void gsv_v2sovits::impl::fill_folded() {
                         const int k = d * st + r + pad_tr;
                         if (k < 0 || k >= K) continue;
                         for (int o = 0; o < OC; o++) {
-                            const float x = v[(size_t) ic + (size_t) o * IC + (size_t) k * IC * OC];
+                            const float x = v[(size_t) k + (size_t) o * K + (size_t) ic * OC * K];
                             // dst [M, IC, OC*st]: flat m + ic*M + (r*OC + o)*M*IC
                             out[(size_t) m + (size_t) ic * M + ((size_t) r * OC + o) * M * IC] = x * scale;
                         }
@@ -439,11 +469,11 @@ void gsv_v2sovits::impl::fill_folded() {
 }
 
 // ------------------------------------------------------------------ flow 图
-static ggml_tensor * v2_flip_halves(ggml_context * c, ggml_tensor * x, int T, int C) {
-    const int h = C / 2;
-    ggml_tensor * lo = ggml_cont(c, ggml_view_2d(c, x, T, h, x->nb[1], 0));
-    ggml_tensor * hi = ggml_cont(c, ggml_view_2d(c, x, T, h, x->nb[1], (size_t) h * 4));
-    return ggml_concat(c, hi, lo, 0);           // torch.flip(x, [1])
+// torch.flip(x, [1])：整条通道轴反序。用 1x1 置换卷积实现（out[t,oc] = x[t, C-1-oc]）
+static ggml_tensor * v2_flip_channels(ggml_context * c, ggml_tensor * x,
+                                      ggml_tensor * perm, int T, int C) {
+    (void) T; (void) C;
+    return ggml_conv_direct_1d_fused(c, perm, x, nullptr, nullptr, 0, 1, 0.0f, 1.0f, 0.0f);
 }
 
 void gsv_v2sovits::impl::build_flow(int T) {
@@ -465,10 +495,10 @@ void gsv_v2sovits::impl::build_flow(int T) {
     char wn[192];
     for (int li = n_flow - 1; li >= 0; li--) {
         const std::string base = "flow.flows." + std::to_string(li * 2) + ".enc";
-        x = v2_flip_halves(c, x, T, C);                       // Flip 层（reverse 序）
+        x = v2_flip_channels(c, x, need("flow.flip.weight"), T, C);   // Flip 层（reverse 序）
         // ---- ResidualCouplingLayer (mean_only) ----
         ggml_tensor * x0 = ggml_cont(c, ggml_view_2d(c, x, T, HC, x->nb[1], 0));
-        ggml_tensor * x1 = ggml_cont(c, ggml_view_2d(c, x, T, HC, x->nb[1], (size_t) HC * 4));
+        ggml_tensor * x1 = ggml_cont(c, ggml_view_2d(c, x, T, HC, x->nb[1], (size_t) HC * x->nb[1]));
         snprintf(wn, sizeof(wn), "flow.flows.%d.pre.weight", li * 2);
         ggml_tensor * h = ggml_conv_direct_1d_fused(c, need(wn), x0, bias_of(wn), nullptr,
                                                     0, 1, 0.0f, 1.0f, 0.0f);         // [T,192]
@@ -490,14 +520,14 @@ void gsv_v2sovits::impl::build_flow(int T) {
                                                                (size_t) i * 2 * flow_hid * 4), 1, 2 * flow_hid);
             xin = ggml_add(c, xin, gl);
             ggml_tensor * a = ggml_cont(c, ggml_view_2d(c, xin, T, flow_hid, xin->nb[1], 0));
-            ggml_tensor * b = ggml_cont(c, ggml_view_2d(c, xin, T, flow_hid, xin->nb[1], (size_t) flow_hid * 4));
+            ggml_tensor * b = ggml_cont(c, ggml_view_2d(c, xin, T, flow_hid, xin->nb[1], (size_t) flow_hid * xin->nb[1]));
             ggml_tensor * acts = ggml_mul(c, ggml_tanh(c, a), ggml_sigmoid(c, b));
             ggml_tensor * rs = ggml_conv_direct_1d_fused(c, need((rsb + ".weight").c_str()), acts,
                                                          need((rsb + ".bias").c_str()), nullptr,
                                                          0, 1, 0.0f, 1.0f, 0.0f);
             if (i < n_wntaps - 1) {
                 ggml_tensor * res = ggml_cont(c, ggml_view_2d(c, rs, T, flow_hid, rs->nb[1], 0));
-                ggml_tensor * skp = ggml_cont(c, ggml_view_2d(c, rs, T, flow_hid, rs->nb[1], (size_t) flow_hid * 4));
+                ggml_tensor * skp = ggml_cont(c, ggml_view_2d(c, rs, T, flow_hid, rs->nb[1], (size_t) flow_hid * rs->nb[1]));
                 hx = ggml_add(c, hx, res);
                 acc = acc ? ggml_add(c, acc, skp) : skp;
             } else {
@@ -509,7 +539,7 @@ void gsv_v2sovits::impl::build_flow(int T) {
         ggml_tensor * m = ggml_conv_direct_1d_fused(c, need(wn), h, bias_of(wn), nullptr,
                                                     0, 1, 0.0f, 1.0f, 0.0f);         // [T,96]
         x1 = ggml_sub(c, x1, m);                                                   // reverse, logs=0
-        x = ggml_concat(c, x0, x1, 0);
+        x = ggml_concat(c, x0, x1, 1);       // 通道轴拼接 → [T, 2*HC]
     }
     ggml_set_output(x);
     gflow.out = x;
@@ -539,8 +569,9 @@ void gsv_v2sovits::impl::build_dec(int T) {
     gdec.ge = ge;
 
     // conv_pre (k=7 pad=3) + LeakyReLU(0.1) 融合在 epilogue
+    // 参考: conv_pre → +cond → leaky_relu → ups[0]，所以 leaky 不能放在 conv_pre 的 epilogue
     ggml_tensor * h = ggml_conv_direct_1d_fused(c, need("dec.conv_pre.weight"), x,
-                                                bias_of("dec.conv_pre.weight"), nullptr, 3, 1, 0.1f, 1.0f, 0.0f);
+                                                bias_of("dec.conv_pre.weight"), nullptr, 3, 1, 0.0f, 1.0f, 0.0f);
     // + cond(ge)（1x1 conv；与时间无关 → 只算一个 [1,512] 向量广播）
     {
         ggml_tensor * gc = ggml_mul_mat(c, ggml_reshape_2d(c, need("dec.cond.weight"), gin, 512),
@@ -561,7 +592,7 @@ void gsv_v2sovits::impl::build_dec(int T) {
         for (const v2_item & it : items)
             if (it.dst == wn) { Puse = it.P; break; }
         const float in_scale = (i > 0) ? mean_scale : 1.0f;
-        const float in_slope = (i > 0) ? 0.1f : 0.0f;
+        const float in_slope = 0.1f;      // 每级 ups 前都有 F.leaky_relu(x, 0.1)
         ggml_tensor * y = ggml_conv_direct_1d_fused(c, uw, h, nullptr, nullptr,
                                                     Puse, 1, 0.0f, in_scale, in_slope);       // [OL, CS]
         const int64_t OL = y->ne[0];
@@ -582,7 +613,7 @@ void gsv_v2sovits::impl::build_dec(int T) {
         auto itb = w.find(bname);
         if (itb != w.end()) up = ggml_add(c, up, ggml_reshape_2d(c, itb->second, 1, cout));
         h = up;
-        // ---- 3 × ResBlock1 求和 ----
+            // ---- 3 × ResBlock1 求和 ----
         ggml_tensor * sum = nullptr;
         for (int j = 0; j < n_res; j++) {
             const int blk = i * n_res + j;
@@ -603,7 +634,7 @@ void gsv_v2sovits::impl::build_dec(int T) {
             sum = sum ? ggml_add(c, sum, hx) : hx;
         }
         h = sum;   // 均值 1/3 与 LeakyReLU 融进下一级 conv 的 in_scale/in_slope
-    }
+        }
     // conv_post (k=7 pad=3, 无 bias) + tanh；leaky_slope < 0 = tanh
     ggml_tensor * out = ggml_conv_direct_1d_fused(c, need("dec.conv_post.weight"), h,
                                                   bias_of("dec.conv_post.weight"), nullptr,
@@ -657,6 +688,7 @@ void gsv_v2sovits::impl::build_vq(int T) {
     ggml_tensor * cbw = need("quantizer.vq.layers.0._codebook.embed");      // [K, D]
     ggml_tensor * dot = ggml_mul_mat(c, cbw, yt);                           // [K, Tc]
     ggml_set_output(dot);
+    gvq.aux = y;   // ssl_proj 输出 [Tc, D, 1]（GSV_V2_DEBUG 时落盘对拍）
     gvq.out = dot;
     gvq.g = ggml_new_graph_custom(c, 2048, false);
     ggml_build_forward_expand(gvq.g, dot);
@@ -767,13 +799,13 @@ gsv_v2sovits * gsv_v2sovits::load(const std::string & gguf_path, const gsv_v2sov
         char nm[64]; snprintf(nm, sizeof(nm), "dec.ups.%d.weight_v", i);
         ggml_tensor * t = s.src(nm);
         if (!t) { fprintf(stderr, "[gsv_v2] missing %s\n", nm); delete m; return nullptr; }
-        const int K = (int) t->ne[2];
+        const int K = (int) t->ne[0];
         if (K != s.ups_k[(size_t) i]) {
             fprintf(stderr, "[gsv_v2] %s: K=%d 与版本 %s 的表 (%d) 不符 —— 导出时用 --version 指定正确家族\n",
                     nm, K, s.ver.c_str(), s.ups_k[(size_t) i]);
             delete m; return nullptr;
         }
-        const int cin = (int) t->ne[0];
+        const int cin = (int) t->ne[2];
         const int want_cin = 512 >> i;
         if (cin != want_cin) {
             fprintf(stderr, "[gsv_v2] %s: 输入通道 %d != %d（upsample_initial_channel 不同的家族）\n",
@@ -788,8 +820,9 @@ gsv_v2sovits * gsv_v2sovits::load(const std::string & gguf_path, const gsv_v2sov
 
     // 码本大小 / ssl 维度从权重读
     if (ggml_tensor * e = s.src("quantizer.vq.layers.0._codebook.embed")) {
-        s.cb_size = (int) e->ne[0];
-        s.ssl_dim = (int) e->ne[1];
+        // torch [K, D] → ggml ne = [D, K]
+        s.ssl_dim = (int) e->ne[0];
+        s.cb_size = (int) e->ne[1];
     }
 
     s.plan_weights();
@@ -837,9 +870,8 @@ bool gsv_v2sovits::codes_from_ssl(const float * ssl, int T, std::vector<int32_t>
         return false;
     }
     if (T != s.gvq.T) s.build_vq(T);
-    std::vector<float> xs((size_t) T * s.ssl_dim);
-    for (int t = 0; t < T; t++)
-        for (int d = 0; d < s.ssl_dim; d++) xs[(size_t) t * s.ssl_dim + d] = ssl[(size_t) d * T + t];
+    // ggml [T, D] 的 flat 索引是 t + T*d，与 torch [D, T] 的 d*T+t 完全相同 → 直接搬
+    std::vector<float> xs(ssl, ssl + (size_t) T * s.ssl_dim);
     ggml_backend_tensor_set(s.gvq.in, xs.data(), 0, xs.size() * 4);
     if (ggml_backend_graph_compute(s.backend, s.gvq.g) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "[gsv_v2] vq graph compute failed\n");
@@ -898,9 +930,8 @@ bool gsv_v2sovits::flow_reverse(const float * zp, int T, const float * ge, std::
     impl & s = *p;
     const auto t0 = std::chrono::steady_clock::now();
     if (T != s.gflow.T) s.build_flow(T);
-    std::vector<float> x((size_t) T * s.hidden);
-    for (int t = 0; t < T; t++)
-        for (int c = 0; c < s.hidden; c++) x[(size_t) t * s.hidden + c] = zp[(size_t) c * T + t];
+    // torch [C,T] ↔ ggml [T,C] 在内存里是同一份数据（flat = c*T + t = t + T*c）
+    std::vector<float> x(zp, zp + (size_t) T * s.hidden);
     ggml_backend_tensor_set(s.gflow.in, x.data(), 0, x.size() * 4);
     ggml_backend_tensor_set(s.gflow.ge, ge, 0, (size_t) s.gin * 4);
     if (ggml_backend_graph_compute(s.backend, s.gflow.g) != GGML_STATUS_SUCCESS) {
@@ -909,9 +940,7 @@ bool gsv_v2sovits::flow_reverse(const float * zp, int T, const float * ge, std::
     }
     std::vector<float> y(x.size());
     ggml_backend_tensor_get(s.gflow.out, y.data(), 0, y.size() * 4);
-    z.assign((size_t) s.hidden * T, 0.0f);
-    for (int t = 0; t < T; t++)
-        for (int c = 0; c < s.hidden; c++) z[(size_t) c * T + t] = y[(size_t) t * s.hidden + c];
+    z.assign(y.begin(), y.end());       // 同一份内存布局，直接拷
     s.ms_flow = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return true;
 }
@@ -921,9 +950,7 @@ bool gsv_v2sovits::decode_wav(const float * z, int T, const float * ge, std::vec
     impl & s = *p;
     const auto t0 = std::chrono::steady_clock::now();
     if (T != s.gdec.T) s.build_dec(T);
-    std::vector<float> x((size_t) T * s.hidden);
-    for (int t = 0; t < T; t++)
-        for (int c = 0; c < s.hidden; c++) x[(size_t) t * s.hidden + c] = z[(size_t) c * T + t];
+    std::vector<float> x(z, z + (size_t) T * s.hidden);
     ggml_backend_tensor_set(s.gdec.in, x.data(), 0, x.size() * 4);
     ggml_backend_tensor_set(s.gdec.ge, ge, 0, (size_t) s.gin * 4);
     if (ggml_backend_graph_compute(s.backend, s.gdec.g) != GGML_STATUS_SUCCESS) {
