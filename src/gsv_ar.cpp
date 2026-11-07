@@ -17,6 +17,7 @@
 
 static bool g_prof = false;
 static double g_ms_build = 0, g_ms_copy = 0, g_ms_compute = 0, g_ms_io = 0;
+static double g_ms_mask = 0, g_ms_samp = 0, g_ms_emb = 0;   // host 侧分桶
 static int    g_steps = 0;
 // prefill 单独计时 (TTFT)
 static double g_pf_build = 0, g_pf_copy = 0, g_pf_compute = 0, g_pf_io = 0;
@@ -24,13 +25,20 @@ static double now_ms() {
     return std::chrono::duration<double, std::milli>(
         std::chrono::high_resolution_clock::now().time_since_epoch()).count();
 }
-static void prof_reset() { g_ms_build = g_ms_copy = g_ms_compute = g_ms_io = 0; g_steps = 0; }
+static void prof_reset() {
+    g_ms_build = g_ms_copy = g_ms_compute = g_ms_io = 0;
+    g_ms_mask = g_ms_samp = g_ms_emb = 0;
+    g_steps = 0;
+}
 static void prof_report(const char * tag) {
     if (!g_prof) return;
     printf("[prof:%s] prefill(build/copy/compute/io) = %.1f/%.1f/%.1f/%.1f ms\n", tag, g_pf_build, g_pf_copy, g_pf_compute, g_pf_io);
     printf("[prof:%s] steps=%d build=%.1fms copy=%.1fms compute=%.1fms other=%.1fms (per-step: %.2f/%.2f/%.2f)\n",
            tag, g_steps, g_ms_build, g_ms_copy, g_ms_compute, g_ms_io,
            g_ms_build / std::max(1, g_steps), g_ms_copy / std::max(1, g_steps), g_ms_compute / std::max(1, g_steps));
+    // host 侧分桶 (每步): 建 mask / 采样 / embedding+PE
+    printf("[prof:%s] host per-step: mask=%.3fms sampling=%.3fms emb+pe=%.3fms\n",
+           tag, g_ms_mask / std::max(1, g_steps), g_ms_samp / std::max(1, g_steps), g_ms_emb / std::max(1, g_steps));
 }
 
 static const int Y_PE_MAX = 4096;
@@ -82,6 +90,11 @@ struct gsv_ar::impl {
     ggml_backend_buffer_t cbuf = nullptr;
     std::vector<ggml_tensor *> kc_t, vc_t;   // 各 [HD, Lmax, NH, B]
     int Lmax_alloc = 0;
+    // KV cache 元素类型: F32 (默认, 与历史版本数值完全一致) 或 F16 (GSV_AR_KV_F16=1)。
+    // 解码每步 flash 都要把整个 KV 历史读一遍 —— L≈450 时 44MB/token, 占解码 DRAM
+    // 流量的 1/3; F16 把这份流量减半 (llama.cpp 的 KV cache 默认也是 F16)。
+    // 默认关: 保持既有 v5/v2 路径逐位不变; 需要在 gsv_ar 之外选开。
+    bool kv_f16 = false;
 
     void alloc_cache(int Lmax, int B) {
         if (cctx && Lmax_alloc >= Lmax && cache.B == B) return;
@@ -94,8 +107,8 @@ struct gsv_ar::impl {
         cctx = ggml_init(ip);
         kc_t.resize(NL); vc_t.resize(NL);
         for (int li = 0; li < NL; li++) {
-            kc_t[li] = ggml_new_tensor_4d(cctx, GGML_TYPE_F32, HD, Lmax, NH, B);
-            vc_t[li] = ggml_new_tensor_4d(cctx, GGML_TYPE_F32, HD, Lmax, NH, B);
+            kc_t[li] = ggml_new_tensor_4d(cctx, kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32, HD, Lmax, NH, B);
+            vc_t[li] = ggml_new_tensor_4d(cctx, kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32, HD, Lmax, NH, B);
         }
         cbuf = ggml_backend_alloc_ctx_tensors(cctx, backend);
         if (!cbuf) { fprintf(stderr, "[gsv_ar] cache alloc failed\n"); exit(1); }
@@ -287,10 +300,12 @@ struct gsv_ar::impl {
         const double t_a = now_ms();
         const int B = cache.B;
         const int L = cache.len + 1;
+        const double t_m0 = now_ms();
         std::vector<ggml_fp16_t> mask_host((size_t)L * B);
         for (int b = 0; b < B; b++)
             for (int k = 0; k < L; k++)
                 mask_host[(size_t)k + (size_t)b * L] = ggml_fp32_to_fp16((k < pad_len[b]) ? -INFINITY : 0.0f);
+        g_ms_mask += now_ms() - t_m0;
 
         ggml_init_params ip = { ggml_tensor_overhead() * 2048, NULL, true };
         ggml_context * ctx = ggml_init(ip);
@@ -299,6 +314,7 @@ struct gsv_ar::impl {
         ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, L, 1, 1, B);
         ggml_set_input(mask);
         ggml_tensor * cur = x;
+        std::vector<ggml_tensor *> writes;   // KV cpy 副作用根 (必须先于 flash 执行)
         for (int li = 0; li < NL; li++) {
             ggml_tensor * qkv = ggml_add(ctx, ggml_mul_mat(ctx, ws[li].qkv_w, cur), ws[li].qkv_b);
             ggml_tensor * qkv4 = ggml_reshape_4d(ctx, qkv, D, 3, 1, B);
@@ -307,11 +323,14 @@ struct gsv_ar::impl {
             ggml_tensor * qh      = ggml_view_4d(ctx, qkv4, HD, 1, NH, B, 4 * HD, 4 * HD, qkv4->nb[3], 0);
             ggml_tensor * ksrc    = ggml_view_4d(ctx, qkv4, HD, 1, NH, B, 4 * HD, 4 * HD, qkv4->nb[3], qkv4->nb[1]);
             ggml_tensor * vsrc    = ggml_view_4d(ctx, qkv4, HD, 1, NH, B, 4 * HD, 4 * HD, qkv4->nb[3], 2 * qkv4->nb[1]);
-            // 新列写入常驻 cache (cpy 副作用); flash 读 concat(旧列视图, cpy输出) 以显式化 "写 -> 读" 依赖
-            ggml_tensor * kcol_w = ggml_cpy(ctx, ksrc, k_col_view(ctx, li, cache.len));
-            ggml_tensor * vcol_w = ggml_cpy(ctx, vsrc, v_col_view(ctx, li, cache.len));
-            ggml_tensor * kfull = ggml_concat(ctx, k_view(ctx, li, cache.len), kcol_w, 1);
-            ggml_tensor * vfull = ggml_concat(ctx, v_view(ctx, li, cache.len), vcol_w, 1);
+            // 新列直接写进常驻 cache 的第 len 列 (cpy 副作用), flash 读 cache 的 [0, len] 视图。
+            // 不再 concat 整段 cache —— 那会每层每步复制 L 列 K/V (L≈200 时 2.0 ms/token,
+            // 实测占解码 29%); 写->读顺序由根的先后顺序保证: cpy 根先 expand, logits 根后 expand,
+            // ggml 的节点序即执行序, 且节点间有 barrier。
+            writes.push_back(ggml_cpy(ctx, ksrc, k_col_view(ctx, li, cache.len)));
+            writes.push_back(ggml_cpy(ctx, vsrc, v_col_view(ctx, li, cache.len)));
+            ggml_tensor * kfull = k_view(ctx, li, cache.len + 1);
+            ggml_tensor * vfull = v_view(ctx, li, cache.len + 1);
             ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, qh, kfull, vfull, mask, 1.0f / std::sqrt((float)HD), 0.0f, 0.0f);
             attn_out = ggml_reshape_3d(ctx, attn_out, D, 1, B);
             ggml_tensor * o = ggml_mul_mat(ctx, ws[li].out_w, attn_out);
@@ -323,7 +342,8 @@ struct gsv_ar::impl {
         ggml_tensor * logits = ggml_mul_mat(ctx, predict, cur);
         ggml_set_output(logits);
         ggml_cgraph * graph = ggml_new_graph_custom(ctx, 4096, false);
-        ggml_build_forward_expand(graph, logits);   // KV cpy 经 concat 连到 flash, 已是 logits 的祖先
+        for (ggml_tensor * w : writes) ggml_build_forward_expand(graph, w);   // 先写 KV (副作用根)
+        ggml_build_forward_expand(graph, logits);
         ggml_gallocr_alloc_graph(galloc, graph);
         const double t_b = now_ms();
         ggml_backend_tensor_set(x, x_host.data(), 0, x_host.size() * 4);
@@ -641,6 +661,7 @@ if (!dev) { fprintf(stderr, "[gsv_ar] no usable backend device"); delete m; retu
     }
 
     g_prof = getenv("GSV_AR_PROFILE") != nullptr;
+    s.kv_f16 = getenv("GSV_AR_KV_F16") != nullptr;
     // 融合算子支持探测: 用代表性形状建一次节点问后端 (CPU 恒支持; Vulkan 需 shader 在册)
     {
         ggml_init_params fp = { ggml_tensor_overhead() * 32, NULL, true };
@@ -677,9 +698,9 @@ if (!dev) { fprintf(stderr, "[gsv_ar] no usable backend device"); delete m; retu
     if (cfg.verbose)
         printf("[gsv_ar] loaded %s: D=%d head=%d layers=%d vocab=%d EOS=%d bert=%d alpha=(%.4f, %.4f)\n",
                gguf_path.c_str(), s.D, s.NH, s.NL, s.VOCAB, s.EOS, s.BERT_DIM, s.text_pe_alpha, s.audio_pe_alpha);
-    if (cfg.verbose) printf("[gsv_ar] fused ops: ln=%s act=%s | decode graph cache: %s\n",
+    if (cfg.verbose) printf("[gsv_ar] fused ops: ln=%s act=%s | decode graph cache: %s | kv: %s\n",
                             s.fuse_ln ? "on" : "off", s.fuse_act ? "on" : "off",
-                            s.use_graph_cache ? "on" : "off");
+                            s.use_graph_cache ? "on" : "off", s.kv_f16 ? "f16" : "f32");
     return m;
 }
 
@@ -749,9 +770,11 @@ gsv_ar_result gsv_ar::generate(const std::vector<gsv_ar_request> & reqs,
             const int np = (int) y[b].size() < 4096 ? (int) y[b].size() : 4096;
             for (int i = 0; i < np; i++) prev[i] = y[b][y[b].size() - np + i];
             float probs[1025];
+            const double t_s0 = now_ms();
             gsv_logits_to_probs(sampler, row, s.VOCAB, prev, np, probs);
             if (b == 0 && getenv("GSV_AR_PROB_DUMP")) prob_dump.insert(prob_dump.end(), probs, probs + s.VOCAB);
             int tok = gsv_sample(probs, s.VOCAB, rng[b], nullptr);
+            g_ms_samp += now_ms() - t_s0;
             if (oracle_tokens != nullptr && idx < (int) oracle_tokens->size()) tok = (*oracle_tokens)[idx];
             y[b].push_back(tok);
             if (tok == s.EOS) {
@@ -773,6 +796,7 @@ gsv_ar_result gsv_ar::generate(const std::vector<gsv_ar_request> & reqs,
         if (!any_unfinished) break;
 
         std::vector<float> x_in((size_t) s.D * B, 0.0f);
+        const double t_e0 = now_ms();
         for (int b = 0; b < B; b++) {
             float e[512];
             s.emb_lookup(y[b].back(), e);
@@ -780,6 +804,7 @@ gsv_ar_result gsv_ar::generate(const std::vector<gsv_ar_request> & reqs,
             for (int d = 0; d < s.D; d++)
                 x_in[(size_t) d + (size_t) b * s.D] = e[d] + s.h_audio_alpha * s.pe_tab[(size_t) pos * s.D + d];
         }
+        g_ms_emb += now_ms() - t_e0;
         if (s.use_graph_cache) s.run_decode_cached(x_in, pad_len, lg);
         else                   s.run_decode(x_in, pad_len, lg);
     }
