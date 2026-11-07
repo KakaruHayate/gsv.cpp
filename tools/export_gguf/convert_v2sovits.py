@@ -54,12 +54,12 @@ def load_state(path):
 def detect_version(sd, override=None):
     if override:
         return override
-    has_wns = any(k.startswith("flow.flows.") for k in sd)
-    dec_convs = sorted(k for k in sd if k.startswith("dec.ups.") and k.endswith(".weight"))
-    if not has_wns:
+    if not any(k.startswith("flow.flows.") for k in sd):
         raise SystemExit("this checkpoint has no flow.flows.*: not a v2-family SoVITS")
-    # v2ProPlus conditions dec on more channels; report what we see instead of guessing
-    return "v2" if len(dec_convs) == 8 else "v2pro"
+    # v2 / v2Pro / v2ProPlus share the same key layout, so the family cannot be inferred from
+    # tensor names -- only the sampling rate and a few conditioning widths differ. Default to
+    # v2 (32 kHz) and require --version for the others instead of guessing.
+    return "v2"
 
 
 def is_conv1d(name, t):
