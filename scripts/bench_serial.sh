@@ -59,8 +59,9 @@ run_bin() {
       | grep -E '^\[RESULT\]|AR\(|synthesize:' | sed "s/^/[$tag#$i] /"
     local pct
     pct=$(tr -d '%\n' < "$tf" 2>/dev/null)
-    if [[ -n "$pct" && "$pct" -lt 370 ]]; then
-      echo "[$tag#$i] DISCARD: job only got ${pct}% CPU (4 threads need ~370%+) - box was busy"
+    # 365-370% is normal steal on a shared cloud vCPU (hypervisor + neighbours), not contention
+    if [[ -n "$pct" && "$pct" -lt 360 ]]; then
+      echo "[$tag#$i] DISCARD: job only got ${pct}% CPU (4 threads need ~365%+) - box was busy"
       rm -f "$OUT/$tag.$i.log"
     else
       echo "[$tag#$i] cpu=${pct:-?}% (clean)"
