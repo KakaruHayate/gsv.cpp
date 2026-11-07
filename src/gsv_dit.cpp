@@ -19,7 +19,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 static const int   DIM   = 1024;
@@ -115,6 +117,21 @@ struct gsv_dit::impl {
     bool debug = false;                      // GSV_DIT_DEBUG=1: 把中间张量标为 output 供读回
     bool mark_on = false;                    // 仅对 pos 图开启标记 (避免 neg 图重名)
     std::vector<float> cos_host, sin_host;   // [32*T]
+
+    // ---- attention map 落盘 (GSV_ATTN_DUMP=<dir>; 仅在 GSV_DIT_ATTN_LEGACY=1 的逐头路径生效) ----
+    // 目的: 观察 DiT 注意力的稀疏结构 (块级规律/对角带/参考段 vs 生成段/跨步稳定性).
+    // 过滤: GSV_ATTN_LAYERS / GSV_ATTN_HEADS / GSV_ATTN_TS (逗号分隔, 空 = 不限).
+    // 文件名: attn_<pos|neg>_t<毫秒>_l<层>_h<头>.f32, 形状 [T_k, T_q], idx = k + T_k*q.
+    std::string attn_dir;                    // 空 = 关闭
+    std::vector<int>   attn_layers, attn_heads;
+    std::vector<float> attn_ts;
+    bool attn_env_done = false;
+    bool cur_neg = false;                    // 正在构建/运行的分支
+    struct attn_probe { std::string name; ggml_tensor * t; };
+    std::vector<attn_probe> attn_pr[2];      // [pos, neg]
+    void attn_parse_env();
+    bool attn_want(const std::vector<int> & v, int x) const { return v.empty() || std::find(v.begin(), v.end(), x) != v.end(); }
+    void attn_flush(int branch, float t);
 
     // ---- 算法级加速开关 (见 gsv_dit.h 的 alg_* 说明) ----
     // Uncond 复用 (alg_uncond_reuse), 运行期闸门.
@@ -299,6 +316,12 @@ struct gsv_dit::impl {
                 ggml_tensor * vT = ggml_cont(c, ggml_permute(c, vh, 1, 0, 2, 3));   // [T_k, 64]
                 ggml_tensor * sc = mm(c, kh, qh, "L234");                         // [T_k, T_q]
                 ggml_tensor * pm = ggml_soft_max_ext(c, sc, amask, ATTN_SCALE, 0.0f);
+                if (!attn_dir.empty() && attn_want(attn_layers, li) && attn_want(attn_heads, h)) {
+                    char an[48];
+                    snprintf(an, sizeof(an), "l%02d_h%02d", li, h);
+                    ggml_set_output(pm);          // 独立缓冲, 计算后可安全回读
+                    attn_pr[cur_neg ? 1 : 0].push_back({ an, pm });
+                }
                 ggml_tensor * oh = mm(c, vT, pm, "L236");                         // [64, T_q]
                 cat = cat ? ggml_concat(c, cat, oh, 0) : oh;
             }
@@ -550,6 +573,9 @@ ggml_tensor * gsv_dit::impl::build_head(ggml_context * c, ggml_tensor * x, ggml_
 
 void gsv_dit::impl::build_step(step_graph & sg, bool negative) {
     if (getenv("GSV_DIT_BUILD_TRACE")) { printf("[bt] build_step neg=%d\n", (int) negative); fflush(stdout); }
+    attn_parse_env();
+    cur_neg = negative;
+    attn_pr[negative ? 1 : 0].clear();
     ggml_context * c = gctx;
     ggml_tensor * x_in = ggml_new_tensor_2d(c, GGML_TYPE_F32, T, MEL);
     ggml_set_input(x_in); ggml_set_name(x_in, negative ? "in_x_neg" : "in_x");
@@ -823,8 +849,85 @@ bool gsv_dit::impl::run_step(step_graph & sg, const float * x_mel, float t, floa
         fprintf(stderr, "[gsv_dit] step graph compute failed\n");
         return false;
     }
+    attn_flush(&sg == &sn ? 1 : 0, t);
     ggml_backend_tensor_get(sg.out, vel, 0, (size_t) MEL * T * 4);
     return true;
+}
+
+// ---------------- attention map 落盘 ----------------
+
+static std::vector<int> attn_parse_ints(const char * s) {
+    std::vector<int> v;
+    if (!s) return v;
+    const char * p = s;
+    while (*p) {
+        char * e = nullptr;
+        const long x = strtol(p, &e, 10);
+        if (e == p) break;
+        v.push_back((int) x);
+        p = e;
+        while (*p == ',' || *p == ' ') p++;
+    }
+    return v;
+}
+
+static std::vector<float> attn_parse_floats(const char * s) {
+    std::vector<float> v;
+    if (!s) return v;
+    const char * p = s;
+    while (*p) {
+        char * e = nullptr;
+        const float x = strtof(p, &e);
+        if (e == p) break;
+        v.push_back(x);
+        p = e;
+        while (*p == ',' || *p == ' ') p++;
+    }
+    return v;
+}
+
+void gsv_dit::impl::attn_parse_env() {
+    if (attn_env_done) return;
+    attn_env_done = true;
+    const char * d = getenv("GSV_ATTN_DUMP");
+    if (!d || !*d) return;
+    attn_dir    = d;
+    attn_layers = attn_parse_ints(getenv("GSV_ATTN_LAYERS"));
+    attn_heads  = attn_parse_ints(getenv("GSV_ATTN_HEADS"));
+    attn_ts     = attn_parse_floats(getenv("GSV_ATTN_TS"));
+    if (attn_ts.empty()) attn_ts.push_back(0.0f);
+    if (getenv("GSV_DIT_ATTN_LEGACY") == nullptr)
+        fprintf(stderr, "[attn-dump] 注意: 只支持逐头路径, 需要同时设 GSV_DIT_ATTN_LEGACY=1\n");
+    fprintf(stderr, "[attn-dump] dir=%s layers=%zu heads=%zu ts=%zu T_check_pending\n",
+            attn_dir.c_str(), attn_layers.size(), attn_heads.size(), attn_ts.size());
+}
+
+void gsv_dit::impl::attn_flush(int branch, float t) {
+    if (attn_dir.empty() || attn_pr[branch].empty()) return;
+    const char * tag_t = nullptr;
+    char tagbuf[32];
+    for (float tv : attn_ts) {
+        if (fabsf(tv - t) <= 1e-4f) { snprintf(tagbuf, sizeof(tagbuf), "t%04d", (int) lroundf(tv * 1000.0f)); tag_t = tagbuf; break; }
+    }
+    if (!tag_t) return;
+    const char * bn = branch ? "neg" : "pos";
+    // 一次写入 meta (T / x_lens / P): 分析脚本靠它解释矩阵布局
+    {
+        char mp[512];
+        snprintf(mp, sizeof(mp), "%s/attn_meta.txt", attn_dir.c_str());
+        FILE * m = fopen(mp, branch ? "ab" : "wb");
+        if (m) { fprintf(m, "T=%d x_lens=%d prompt_T=%d branch=%s t=%.4f\n", T, x_lens, prompt_T, bn, t); fclose(m); }
+    }
+    for (const attn_probe & a : attn_pr[branch]) {
+        const size_t n = (size_t) a.t->ne[0] * (size_t) a.t->ne[1];
+        std::vector<float> buf(n);
+        ggml_backend_tensor_get(a.t, buf.data(), 0, n * 4);
+        char fn[512];
+        snprintf(fn, sizeof(fn), "%s/attn_%s_%s_%s.f32", attn_dir.c_str(), bn, tag_t, a.name.c_str());
+        FILE * f = fopen(fn, "wb");
+        if (f) { fwrite(buf.data(), 4, n, f); fclose(f); }
+    }
+    fprintf(stderr, "[attn-dump] %s t=%.4f -> %zu matrices (T=%d P=%d)\n", bn, t, attn_pr[branch].size(), T, prompt_T);
 }
 
 // ============================ cache-dit (DBCache) ============================
