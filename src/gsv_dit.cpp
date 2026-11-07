@@ -126,12 +126,16 @@ struct gsv_dit::impl {
     std::vector<int>   attn_layers, attn_heads;
     std::vector<float> attn_ts;
     bool attn_env_done = false;
+    bool attn_summary = false;               // GSV_ATTN_MODE=summary: 只落盘块级统计 (全层全头可跑)
+    bool attn_sum_hdr = false, attn_prof_hdr = false;
     bool cur_neg = false;                    // 正在构建/运行的分支
     struct attn_probe { std::string name; ggml_tensor * t; };
     std::vector<attn_probe> attn_pr[2];      // [pos, neg]
     void attn_parse_env();
     bool attn_want(const std::vector<int> & v, int x) const { return v.empty() || std::find(v.begin(), v.end(), x) != v.end(); }
     void attn_flush(int branch, float t);
+    void attn_write_summary(int branch, float t, const std::string & name,
+                            const std::vector<float> & a, int Tk, int Tq);
 
     // ---- 算法级加速开关 (见 gsv_dit.h 的 alg_* 说明) ----
     // Uncond 复用 (alg_uncond_reuse), 运行期闸门.
@@ -896,10 +900,153 @@ void gsv_dit::impl::attn_parse_env() {
     attn_heads  = attn_parse_ints(getenv("GSV_ATTN_HEADS"));
     attn_ts     = attn_parse_floats(getenv("GSV_ATTN_TS"));
     if (attn_ts.empty()) attn_ts.push_back(0.0f);
+    const char * md = getenv("GSV_ATTN_MODE");
+    attn_summary = md && std::string(md) == "summary";
     if (getenv("GSV_DIT_ATTN_LEGACY") == nullptr)
         fprintf(stderr, "[attn-dump] 注意: 只支持逐头路径, 需要同时设 GSV_DIT_ATTN_LEGACY=1\n");
-    fprintf(stderr, "[attn-dump] dir=%s layers=%zu heads=%zu ts=%zu T_check_pending\n",
-            attn_dir.c_str(), attn_layers.size(), attn_heads.size(), attn_ts.size());
+    fprintf(stderr, "[attn-dump] dir=%s layers=%zu heads=%zu ts=%zu mode=%s\n",
+            attn_dir.c_str(), attn_layers.size(), attn_heads.size(), attn_ts.size(),
+            attn_summary ? "summary" : "raw");
+}
+
+// 一块注意力矩阵的结构统计 (全部在 host 侧做; 只在 summary 模式调用)
+void gsv_dit::impl::attn_write_summary(int branch, float t, const std::string & name,
+                                       const std::vector<float> & a, int Tk, int Tq) {
+    const int P = prompt_T > 0 ? prompt_T : Tq / 2;
+    const int G = Tq - P;
+    const int B = 32;
+    const int nb = (Tk + B - 1) / B;
+    const char * bn = branch ? "neg" : "pos";
+
+    // ---- 象限质量 (行均值) ----
+    double gen_ref = 0, gen_gen = 0, ref_ref = 0, ref_gen = 0;
+    int ngen = 0, nref = 0;
+    for (int q = 0; q < Tq; q++) {
+        const float * col = a.data() + (size_t) Tk * q;
+        double ar = 0, ag = 0;
+        for (int k = 0; k < P; k++)        ar += col[k];
+        for (int k = P; k < Tk; k++)       ag += col[k];
+        if (q >= P) { gen_ref += ar; gen_gen += ag; ngen++; }
+        else        { ref_ref += ar; ref_gen += ag; nref++; }
+    }
+    if (ngen) { gen_ref /= ngen; gen_gen /= ngen; }
+    if (nref) { ref_ref /= nref; ref_gen /= nref; }
+
+    // ---- 生成段带宽 ----
+    static const int W[5] = { 16, 32, 64, 128, 256 };
+    double band[5] = { 0, 0, 0, 0, 0 }, tot_gg = 0;
+    for (int q = P; q < Tq; q++) {
+        const float * col = a.data() + (size_t) Tk * q;
+        for (int k = P; k < Tk; k++) {
+            const double v = col[k];
+            const int d = k > q ? k - q : q - k;
+            for (int i = 0; i < 5; i++) if (d <= W[i]) band[i] += v;
+            tot_gg += v;
+        }
+    }
+    for (int i = 0; i < 5; i++) band[i] = tot_gg > 0 ? band[i] / tot_gg : 0.0;
+
+    // ---- 块级集中度 (每行 31 块) ----
+    std::vector<double> blk((size_t) nb);
+    double max_blk = 0, need90 = 0, need95 = 0, need99 = 0;
+    int rowcnt = 0;
+    for (int q = 0; q < Tq; q++) {
+        const float * col = a.data() + (size_t) Tk * q;
+        std::fill(blk.begin(), blk.end(), 0.0);
+        double tot = 0;
+        for (int k = 0; k < Tk; k++) { blk[k / B] += col[k]; tot += col[k]; }
+        if (tot <= 0) continue;
+        double mx = 0;
+        std::vector<double> s(blk);
+        for (double v : s) mx = std::max(mx, v);
+        max_blk += mx / tot;
+        std::sort(s.begin(), s.end(), std::greater<double>());
+        double c = 0;
+        int n90 = nb, n95 = nb, n99 = nb;
+        for (int i = 0; i < nb; i++) {
+            c += s[i];
+            const double f = c / tot;
+            if (n90 == nb && f >= 0.90) n90 = i + 1;
+            if (n95 == nb && f >= 0.95) n95 = i + 1;
+            if (n99 == nb && f >= 0.99) n99 = i + 1;
+        }
+        need90 += n90; need95 += n95; need99 += n99;
+        rowcnt++;
+    }
+    if (rowcnt) { max_blk /= rowcnt; need90 /= rowcnt; need95 /= rowcnt; need99 /= rowcnt; }
+
+    // ---- 熵 (gen 行; 全键 / 仅参考键) ----
+    double ent_all = 0, ent_ref = 0;
+    int ne = 0;
+    for (int q = P; q < Tq; q++) {
+        const float * col = a.data() + (size_t) Tk * q;
+        double H = 0, rmass = 0, Hr = 0;
+        for (int k = 0; k < Tk; k++) if (col[k] > 0) H -= col[k] * log((double) col[k]);
+        for (int k = 0; k < P; k++) rmass += col[k];
+        if (rmass > 1e-30)
+            for (int k = 0; k < P; k++) if (col[k] > 0) { const double p = col[k] / rmass; Hr -= p * log(p); }
+        ent_all += H / log((double) Tk);
+        ent_ref += (rmass > 1e-30) ? Hr / log((double) std::max(P, 2)) : 0.0;
+        ne++;
+    }
+    if (ne) { ent_all /= ne; ent_ref /= ne; }
+
+    // ---- 列质量 (汇检测) ----
+    std::vector<double> cm((size_t) Tk, 0.0);
+    for (int q = 0; q < Tq; q++) {
+        const float * col = a.data() + (size_t) Tk * q;
+        for (int k = 0; k < Tk; k++) cm[k] += col[k];
+    }
+    double ctot = 0, cmax = 0;
+    int carg = 0;
+    for (int k = 0; k < Tk; k++) { ctot += cm[k]; if (cm[k] > cmax) { cmax = cm[k]; carg = k; } }
+
+    char fn[512];
+    snprintf(fn, sizeof(fn), "%s/attn_summary.csv", attn_dir.c_str());
+    const bool newf = !attn_sum_hdr;
+    FILE * f = fopen(fn, "ab");
+    if (f) attn_sum_hdr = true;
+    if (f) {
+        if (newf)
+            fprintf(f, "branch,t,layer,head,T,P,gen_ref,gen_gen,ref_ref,ref_gen,"
+                       "band16,band32,band64,band128,band256,maxblk32,b90,b95,b99,"
+                       "ent_all,ent_ref,colmax_k,colmax_share\n");
+        int li = -1, h = -1;
+        if (sscanf(name.c_str(), "l%d_h%d", &li, &h) != 2) { li = h = -1; }
+        fprintf(f, "%s,%.3f,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
+                   "%.4f,%.2f,%.2f,%.2f,%.4f,%.4f,%d,%.5f\n",
+                bn, t, li, h, Tk, P, gen_ref, gen_gen, ref_ref, ref_gen,
+                band[0], band[1], band[2], band[3], band[4], max_blk,
+                need90, need95, need99, ent_all, ent_ref, carg, ctot > 0 ? cmax / ctot : 0.0);
+        fclose(f);
+    }
+
+    // ---- 参考块剖面 (gen 查询在参考块上的质量; 16 桶) ----
+    snprintf(fn, sizeof(fn), "%s/attn_refprof.csv", attn_dir.c_str());
+    const bool newf2 = !attn_prof_hdr;
+    f = fopen(fn, "ab");
+    if (f) attn_prof_hdr = true;
+    if (f) {
+        if (newf2) {
+            fprintf(f, "branch,t,layer,head");
+            for (int i = 0; i < 16; i++) fprintf(f, ",r%d", i);
+            fprintf(f, "\n");
+        }
+        std::vector<double> prof(16, 0.0);
+        double sum = 0;
+        for (int k = 0; k < P; k++) {
+            double s = 0;
+            for (int q = P; q < Tq; q++) s += a[(size_t) Tk * q + k];
+            const int bi = std::min(15, k * 16 / std::max(P, 1));
+            prof[bi] += s; sum += s;
+        }
+        int li = -1, h = -1;
+        if (sscanf(name.c_str(), "l%d_h%d", &li, &h) != 2) { li = h = -1; }
+        fprintf(f, "%s,%.3f,%d,%d", bn, t, li, h);
+        for (int i = 0; i < 16; i++) fprintf(f, ",%.4f", sum > 0 ? prof[i] / sum : 0.0);
+        fprintf(f, "\n");
+        fclose(f);
+    }
 }
 
 void gsv_dit::impl::attn_flush(int branch, float t) {
@@ -922,6 +1069,10 @@ void gsv_dit::impl::attn_flush(int branch, float t) {
         const size_t n = (size_t) a.t->ne[0] * (size_t) a.t->ne[1];
         std::vector<float> buf(n);
         ggml_backend_tensor_get(a.t, buf.data(), 0, n * 4);
+        if (attn_summary) {
+            attn_write_summary(branch, t, a.name, buf, (int) a.t->ne[0], (int) a.t->ne[1]);
+            continue;
+        }
         char fn[512];
         snprintf(fn, sizeof(fn), "%s/attn_%s_%s_%s.f32", attn_dir.c_str(), bn, tag_t, a.name.c_str());
         FILE * f = fopen(fn, "wb");
