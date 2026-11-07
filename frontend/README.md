@@ -28,6 +28,25 @@ The frontend does **not** need torch, and after the tokenizer replacement it doe
 Verified: with `transformers` removed from the venv, the sidecar produces the same
 `phones` / `bert_ids` and the **same WAV SHA-256** as the old build (`395b0ab4…`, 3.40 s).
 
+## Polyphone backend: g2ps (default) vs g2pw
+
+| `GSV_G2P_BACKEND` | engine | needs | cost (4 vCPU, zh) |
+|---|---|---|---|
+| `g2ps` (default) | numpy nano transformer, 2.1 MB model shipped in the wheel | `g2ps`, `pypinyin-g2pS` | ~2.9 ms / sentence, 0.28 ms / char |
+| `g2pw` | ONNX G2PW (`g2pW.onnx` + dicts) | `onnxruntime` + 608 MB of data | ~40-60 ms of the 101 ms frontend column in `docs/benchmark.md` |
+
+Both are char-aligned (`row[i]` belongs to `sentences[i]`), tone3 pinyin, `None` = "fall back to
+pypinyin". `g2ps` also merges phrase-level overrides into the pypinyin dictionary row instead of
+using the sparse override list as the row, which previously crashed `chinese2._g2p` on inputs like
+`第一，` (`TypeError: 'NoneType' object is not subscriptable`).
+
+Verify a backend and time it:
+
+```
+python frontend/check_g2ps.py --backend g2ps --repeat 10    # prints per-case phones + ms/char
+python frontend/check_g2ps.py --backend g2pw --repeat 10    # diff the two JSON dumps for parity
+```
+
 ## Data files (not in git)
 
 | what | size | where |

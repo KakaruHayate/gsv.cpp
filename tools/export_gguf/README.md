@@ -77,6 +77,11 @@ torch numpy gguf          # gguf = pip install gguf  (llama.cpp ecosystem)
 transformers              # bert / hubert only
 ```
 
+| kind | source | notes |
+|---|---|---|
+| `dhubert` | `distilled_hubert/student_v0.pt` | 102 tensors / 2.97M params. 7-layer conv frontend + 6-block dilated TCN + 2-layer pre-norm transformer + 1x1 head to 768. Arch metadata (kernels, strides, dilations, GroupNorm groups, eps) goes into GGUF KV. **C++ consumer (`src/gsv_dhubert.cpp`) not written yet.** |
+| `v2sovits` | `s2G2333k.pth` / `s2Gv2Pro.pth` / `s2Gv2ProPlus.pth` | v2-family SoVITS (VITS decoder: enc_p + MRTE, flow, HiFi-GAN dec, ref_enc, VQ). Keys kept verbatim, `enc_q` dropped (training-only). **C++ consumer (`src/gsv_v2sovits.cpp`) not written yet.** |
+
 ## Version matrix
 
 - V5 (`s1v3.ckpt` + `s2Gv5turbo.pth` / `s2Gv5dev.pth`): complete.
