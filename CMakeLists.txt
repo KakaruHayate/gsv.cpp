@@ -139,6 +139,10 @@ if(GSV_BUILD_TESTS)
     add_executable(probe_v2sovits "${CMAKE_CURRENT_SOURCE_DIR}/tests/probe_v2sovits.cpp")
     target_link_libraries(probe_v2sovits PRIVATE gsv_engine)
 
+    # AR (T2S) decode latency bench: bench_ar <ar.gguf> [--threads N] [--steps N] [--fixture DIR]
+    add_executable(bench_ar "${CMAKE_CURRENT_SOURCE_DIR}/tests/bench_ar.cpp")
+    target_link_libraries(bench_ar PRIVATE gsv_engine)
+
     # add_act kernel (CPU + Vulkan) incl. the mish activation used by the DiT trunk
     add_executable(test_add_act "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_add_act.cpp")
     target_include_directories(test_add_act PRIVATE ${GSV_GGML_INCLUDES})
