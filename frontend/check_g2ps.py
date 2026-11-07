@@ -74,7 +74,7 @@ def main():
             case["error"] = f"{type(exc).__name__}: {exc}"
         out["cases"].append(case)
 
-    texts = [c["text"] for c in CASES if "error" not in c]
+    texts = [c["text"] for c in out["cases"] if "error" not in c]
     for text in texts:  # warm the per-sentence caches once
         clean_text(text, args.lang, "v2")
     t0 = time.perf_counter()
