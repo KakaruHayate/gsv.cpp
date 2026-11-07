@@ -35,7 +35,10 @@ quiet_check() {
   load=$(awk '{print $1}' /proc/loadavg)
   local busy
   busy=$(ps -eo pcpu,comm --no-headers | awk '$1 > 20 {print $2}' | grep -vcE '^(ps|awk|grep)$' || true)
-  if awk -v l="$load" -v m="$MAXLOAD" 'BEGIN{exit !(l > m)}' || [[ "${busy:-0}" -gt 0 ]]; then
+  # loadavg decays slowly (~1 min) after a heavy job is killed, so it lags reality. Trust the
+  # per-process check first: if nothing is above 20% CPU the box is idle right now and the load
+  # number is just decay. Only refuse on load when there is also something actually running.
+  if [[ "${busy:-0}" -gt 0 ]] || awk -v l="$load" -v m="$MAXLOAD" 'BEGIN{exit !(l > m * 6)}'; then
     echo "REFUSING: load=$load (max $MAXLOAD), busy procs: ${busy:-0}" >&2
     ps -eo pcpu,comm --sort=-pcpu --no-headers | head -5 >&2
     return 1
