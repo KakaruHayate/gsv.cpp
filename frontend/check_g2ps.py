@@ -67,7 +67,7 @@ def main():
                     "norm_text": norm_text,
                     "phones_len": len(phones),
                     "word2ph": list(word2ph),
-                    "phones": [int(p) for p in phones],
+                    "phones": [str(p) for p in phones],
                 }
             )
         except Exception as exc:  # keep going, report per case
