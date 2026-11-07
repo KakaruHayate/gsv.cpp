@@ -2,9 +2,11 @@
 #   python -m venv .venv-sidecar
 #   .venv-sidecar/bin/pip install -r frontend/requirements-zh.txt
 numpy>=1.26
-onnxruntime>=1.20
+# onnxruntime>=1.20   # only for GSV_G2P_BACKEND=g2pw (the 608 MB g2pW.onnx path)
 pypinyin
 jieba_fast
 cn2an
 OpenCC
 nltk
+g2ps                # default polyphone backend: numpy-only nano model (2.1 MB), no onnx
+pypinyin-g2pS

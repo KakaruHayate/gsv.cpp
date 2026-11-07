@@ -9,7 +9,10 @@ from pypinyin.core import Pinyin, Style
 from pypinyin.seg.simpleseg import simple_seg
 from pypinyin.converter import UltimateConverter
 from pypinyin.contrib.tone_convert import to_tone
-from .onnx_api import G2PWOnnxConverter
+
+# Backend switch: g2ps (default, numpy-only 2.1 MB model) or g2pw (original ONNX, 608 MB).
+# GSV_G2P_BACKEND=g2pw restores the upstream behaviour.
+_G2P_BACKEND = os.environ.get("GSV_G2P_BACKEND", "g2ps").strip().lower()
 
 current_file_path = os.path.dirname(__file__)
 CACHE_PATH = os.path.join(current_file_path, "polyphonic.pickle")
@@ -38,12 +41,22 @@ class G2PWPinyin(Pinyin):
         tone_sandhi=False,
         **kwargs,
     ):
-        self._g2pw = G2PWOnnxConverter(
-            model_dir=model_dir,
-            style="pinyin",
-            model_source=model_source,
-            enable_non_tradional_chinese=enable_non_tradional_chinese,
-        )
+        if _G2P_BACKEND == "g2pw":
+            # imported lazily so that onnxruntime is only required for the ONNX backend
+            from .onnx_api import G2PWOnnxConverter
+
+            self._g2pw = G2PWOnnxConverter(
+                model_dir=model_dir,
+                style="pinyin",
+                model_source=model_source,
+                enable_non_tradional_chinese=enable_non_tradional_chinese,
+            )
+        else:
+            from .g2ps_adapter import G2pSConverter
+
+            # No model_dir / model_source needed: g2ps ships its model in the wheel and
+            # does not use the BERT tokenizer.
+            self._g2pw = G2pSConverter(style="pinyin")
         self._converter = Converter(
             self._g2pw,
             v_to_u=v_to_u,
