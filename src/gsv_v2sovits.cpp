@@ -38,22 +38,29 @@
 //   （该算子 CPU 实现要求 F32 核，见 patches/0001-ggml-audio-patch-*）。
 //
 // ============================================================================
-// 4) ConvTranspose1d → 子像素卷积（相位主序核）
+// 4) ConvTranspose1d → 子像素卷积（相位分组核）
 // ============================================================================
 //   torch: y[t·s + r, o] = Σ_{i,k} x[i, c]·W[c, o, k]，其中 n = t·s + r = i·s - pad + k
 //   ⇒ k = (t-i)·s + (r + pad)，记 d = t-i、p = r + pad ⇒ k = d·s + p。
-//   所以每个相位 r 是 x 的一个**普通相关**（k 轴被 s 抽样），tap 集合
-//       d ∈ [ceil(-p/s), floor((K-1-p)/s)]
-//   对 s=10/K=16/pad=3 这种 K > s 的层，d 会跨负值（d=-1 = 用下一帧），
-//   因此统一取 d ∈ [d_lo, d_hi]（并集），M = d_hi-d_lo+1，就能用一次 conv 覆盖全部相位。
+//   所以每个相位 r 是 x 的一个**普通相关**（k 轴被 s 抽样），有效 tap 集合是
+//       d ∈ [lo_r, hi_r] = [ceil(-p/s), floor((K-1-p)/s)]
+//   对 s=10/K=16/pad=3 这种 K > s 的层，d 会跨负值（d=-1 = 用下一帧）。
+//
+//   **相位分组**：dhi-dlo+1 = M 就是这组真正要算的 tap 数。相邻相位的 [lo,hi] 往往
+//   完全相同，于是把区间相同的相邻相位并成一组，每组一次 conv、M 个 tap 全部命中。
+//   早期的实现取所有相位的**并集**区间，会白算 (并集 M) / (K/s) 倍：stage0 1.875x、
+//   stage1 1.5x、stage2 1.25x、stage3/4 2x（实测 ups 3.98 → 2.69 GMAC）。
+//   副作用同样重要：单组 Wt 只有 ~1/5 大（stage0 15.7 MB → 每组 2-3 MB），不再在每次调用
+//   里把整块权重从 DRAM 刷一遍（那正是 stage0 只跑到 17% 峰值的原因）。
 //
 //   ggml_conv_direct_1d_fused: out[j, oc] = Σ_m w[m, ic, oc]·x[j + m - P]，OL = T + 2P - M + 1
-//   令 j = t（a=0）⇒ x[t + m - P] = x[t - d] ⇒ d = P - m，故
-//       P = d_hi,  w[m] = Weff[d_hi - m],  OL = T + 2·d_hi - M + 1 = T + d_lo + d_hi
-//   对本模型的五个层 d_lo + d_hi 恒为 0 ⇒ OL == T，前 T 行即答案。
-//   （v5 vocoder 的 upsub 是 M=3/P=1 的特例，d_lo=-1,d_hi=1；这里按权重形状自动求 M/P。）
-//   逐相位的权重块放在 OC 维的 [r·OC, (r+1)·OC) → 输出 [T, OC·s]，
-//   再 reshape/permute/interleave 成 [T·s, OC]（与 gsv_vocoder_ggml 完全相同的重排）。
+//   令 j = t、P = hi_r ⇒ x[t + m - hi_r] = x[t - d] ⇒ d = hi_r - m，OL = T + lo_r + hi_r。
+//   OL ≥ T 时取前 T 行即答案；OL = T 时无需裁剪。
+//   dlo < 0（相位用到下一帧）时，用 ggml_pad 在输入末尾补 dmax = max(-dlo) 行零，
+//   这样不必再为“让 pad 抵消 dlo”而多算零 tap（torch 的 conv_transpose 在末尾同样视为 0）。
+//   组内输出通道 = (r - ph0)·OC + o，按相位升序 concat 就得到 [T, OC·s]，
+//   再 reshape/permute/cont 成 [T·s, OC]（与 gsv_vocoder_ggml 相同的一次转置）。
+//   bias 按相位展开后直接融进 conv 的 epilogue（省掉 5 个 add 节点）。
 //
 // ============================================================================
 // 5) 图切分
@@ -65,6 +72,17 @@
 //   (d) dec  : z[T,192] + ge[512] → wav[T·640]
 //   中间张量布局一律 "t 主序" [T, C]（ggml_conv_direct_1d 的要求），与 gsv_encp 的
 //   torch [C,T] 布局在边界处转置（只在小张量上做，成本可忽略）。
+//
+// ============================================================================
+// 6) 性能剖析（GSV_V2_PROFILE=1）
+// ============================================================================
+//   把 flow/dec 的每个节点单独 compute 一遍（ggml_graph_view 不对外，改用
+//   ggml_graph_clear + ggml_graph_add_node 复用一张单节点 cgraph），按实际张量形状算
+//   MAC、按 exec 算 GFLOPS，并用 ggml_set_name 在构图时给 conv 节点起名。
+//   实测：逐节点时间合计与整图时间差 < 1%（节点唤醒开销 ~20 µs/节点）。
+//   GSV_V2_PEAK 可覆盖 roofline 峰值（默认 319 GFLOPS = tests/bwpeak.c 的 4 线程实测）。
+//   结论见 docs/ 或任务报告：dec 是 645k MAC/输出采样（20.6 GMAC/s 音频），
+//   fp32 在 4 核 Zen2 上的地板就是 0.162 RTF，别再往 0.10 上追；剩下的差距只能靠 int8。
 #include "gsv_v2sovits.h"
 
 #include "gsv_device.h"
@@ -102,13 +120,31 @@ static int64_t v2_ceil_div(int64_t a, int64_t b) {    // b > 0
     return a >= 0 ? (a + b - 1) / b : -((-a) / b);
 }
 
+// 具名 conv（名字供 GSV_V2_PROFILE 的逐节点表使用，同时改善 GGML debug print）
+static ggml_tensor * v2_conv(ggml_context * c, ggml_tensor * w, ggml_tensor * x,
+                             ggml_tensor * bias, ggml_tensor * res,
+                             int pad, int dil, float slope, float in_scale, float in_slope,
+                             const char * name) {
+    if (w->ne[1] != x->ne[1]) {
+        fprintf(stderr, "[gsv_v2] conv %s: w ne=[%ld,%ld,%ld] x ne=[%ld,%ld]\n",
+                name, (long) w->ne[0], (long) w->ne[1], (long) w->ne[2],
+                (long) x->ne[0], (long) x->ne[1]);
+        abort();
+    }
+    ggml_tensor * t = ggml_conv_direct_1d_fused(c, w, x, bias, res, pad, dil, slope, in_scale, in_slope);
+    ggml_set_name(t, name);
+    return t;
+}
+
 // 一个待折叠/拷贝的张量
 struct v2_item {
     std::string dst;    // 折叠后的逻辑名（weight 用 .weight，bias 用 .bias）
-    int kind = 0;       // 0 = 已是 [K,IC,OC] 的普通核; 1 = weight_norm conv; 2 = weight_norm TransposeConv
-                        // 3 = 直接拷贝 (bias); 4 = 码本 [K, D]
+    int kind = 0;       // 0 = 已是 [K,IC,OC] 的普通核; 1 = weight_norm conv; 2 = weight_norm TransposeConv 的相位组
+                        // 3 = 直接拷贝 (bias); 4 = 码本 [K, D]; 5 = 相位展开后的 bias
     std::string w, g;   // 源张量名
     int K = 0, IC = 0, OC = 0, st = 0, M = 0, P = 0;
+    int ph0 = 0, ph1 = 0;   // kind 2/5：本 item 负责的相位区间 [ph0, ph1)
+    int dlo = 0, dhi = 0;   // kind 2：本组每个相位都命中的 tap 区间（d = 帧偏移）
 };
 
 struct v2_graph {
@@ -128,6 +164,124 @@ struct v2_graph {
         in = ge = out = aux = nullptr; T = 0; nframes = 0;
     }
 };
+
+// ---------------------------------------------------------------- 逐节点剖析
+// GSV_V2_PROFILE=1 时把 flow/dec 图按节点逐个 compute（ggml_graph_view）并计时。
+// 单独 compute 一个节点多花一次线程池唤醒（~20 µs），所以看合计与整图时间的差
+// 就能判断开销占比；MAC 数一律从实际张量形状算（不猜）。
+struct v2_prof_row {
+    std::string   name;
+    enum ggml_op  op = GGML_OP_NONE;
+    int64_t K = 0, IC = 0, OC = 0, OL = 0;
+    double macs = 0, macs_raw = 0, bytes = 0, ms = 0;
+};
+
+static const char * v2_op_str(enum ggml_op op) {
+    switch (op) {
+        case GGML_OP_CONV_DIRECT_1D: return "conv1d";
+        case GGML_OP_MUL_MAT:        return "mul_mat";
+        case GGML_OP_ADD:            return "add";
+        case GGML_OP_SUB:            return "sub";
+        case GGML_OP_MUL:            return "mul";
+        case GGML_OP_SCALE:          return "scale";
+        case GGML_OP_LEAKY_RELU:     return "leaky";
+        case GGML_OP_CONT:           return "cont";
+        case GGML_OP_RESHAPE:        return "reshape";
+        case GGML_OP_PERMUTE:        return "permute";
+        case GGML_OP_VIEW:           return "view";
+        case GGML_OP_CONCAT:         return "concat";
+        default:                     return ggml_op_name(op);
+    }
+}
+
+// MAC 与最小搬运字节；macs_raw = 含 16 通道补齐的实际执行量
+static void v2_node_cost(ggml_tensor * n, int64_t & K, int64_t & IC, int64_t & OC, int64_t & OL,
+                         double & macs, double & macs_raw, double & bytes) {
+    K = IC = OC = OL = 0;
+    macs = macs_raw = 0.0;
+    bytes = (double) ggml_nbytes(n);
+    for (int i = 0; i < GGML_MAX_SRC; i++)
+        if (n->src[i]) bytes += (double) ggml_nbytes(n->src[i]);
+
+    switch (n->op) {
+        case GGML_OP_CONV_DIRECT_1D: {
+            const ggml_tensor * w = n->src[0];
+            const ggml_tensor * x = n->src[1];
+            K  = w->ne[0]; IC = w->ne[1]; OC = w->ne[2];
+            OL = x->ne[0];
+            const int64_t OCe = (OC + 15) / 16 * 16;
+            macs     = (double) OL * OC  * IC * K;
+            macs_raw = (double) OL * OCe * IC * K;
+            break;
+        }
+        case GGML_OP_MUL_MAT: {
+            const ggml_tensor * a = n->src[0];
+            K  = a->ne[0]; IC = a->ne[1];
+            OL = n->ne[0]; OC = n->ne[1] * n->ne[2] * n->ne[3];
+            macs = macs_raw = (double) ggml_nelements(n) * (double) a->ne[0];
+            break;
+        }
+        default:
+            macs = macs_raw = (double) ggml_nelements(n);
+            break;
+    }
+}
+
+static void v2_profile_graph(ggml_backend_t backend, v2_graph & gr, const char * tag) {
+    if (!gr.g || ggml_graph_n_nodes(gr.g) <= 0) return;
+    const int nn = ggml_graph_n_nodes(gr.g);
+
+    // 单节点图（复用同一个 cgraph 对象，只换 nodes[0]）——不走
+    // ggml_build_forward_expand，否则会递归把所有祖先重算一遍。
+    ggml_init_params pip = { ggml_tensor_overhead() * 16, nullptr, true };
+    ggml_context * pctx = ggml_init(pip);
+    ggml_cgraph * one = ggml_new_graph_custom(pctx, 16, false);
+
+    std::vector<v2_prof_row> rows;
+    rows.reserve((size_t) nn);
+    for (int i = 0; i < nn; i++) {
+        ggml_tensor * n = ggml_graph_node(gr.g, i);
+        v2_prof_row r;
+        r.name = n->name[0] ? n->name : ggml_op_name(n->op);
+        r.op = n->op;
+        v2_node_cost(n, r.K, r.IC, r.OC, r.OL, r.macs, r.macs_raw, r.bytes);
+        ggml_graph_clear(one);
+        ggml_graph_add_node(one, n);
+        const auto t0 = std::chrono::steady_clock::now();
+        ggml_backend_graph_compute(backend, one);
+        r.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        rows.push_back(std::move(r));
+    }
+    ggml_free(pctx);
+
+    double tot_ms = 0, tot_macs = 0, tot_raw = 0, tot_bytes = 0;
+    for (const auto & r : rows) { tot_ms += r.ms; tot_macs += r.macs; tot_raw += r.macs_raw; tot_bytes += r.bytes; }
+    const char * pk = getenv("GSV_V2_PEAK");
+    const double peak = pk ? atof(pk) : 319.0;   // 4 线程 AVX2-FMA roofline (tests/bwpeak.c)
+
+    std::vector<size_t> ord(rows.size());
+    for (size_t i = 0; i < ord.size(); i++) ord[i] = i;
+    std::sort(ord.begin(), ord.end(), [&](size_t a, size_t b) { return rows[a].ms > rows[b].ms; });
+
+    printf("\n==== [%s] per-node profile: %zu nodes, sum=%.1f ms, MAC=%.1f M (raw %.1f M, pad %.1f%%), "
+           "min-traffic=%.1f MB -> %.1f GFLOPS = %.0f%% of %.0f GFLOPS peak\n",
+           tag, rows.size(), tot_ms, tot_macs / 1e6, tot_raw / 1e6,
+           100.0 * (tot_raw - tot_macs) / (tot_raw > 0 ? tot_raw : 1),
+           tot_bytes / 1048576.0, 2.0 * tot_macs / (tot_ms * 1e6),
+           100.0 * (2.0 * tot_macs / (tot_ms * 1e6)) / peak, peak);
+    printf("  %-18s %-8s %6s %6s %6s %7s %12s %8s %8s %5s %8s %6s\n",
+           "node", "op", "K", "IC", "OC", "OL", "MAC", "ms", "GFLOPS", "%pk", "MB", "GB/s");
+    for (size_t oi = 0; oi < ord.size(); oi++) {
+        const v2_prof_row & r = rows[ord[oi]];
+        if (r.ms < 0.02 && r.macs < 1e5) continue;      // 噪声行不打印
+        const double gf = r.ms > 0 ? 2.0 * r.macs / (r.ms * 1e6) : 0.0;
+        printf("  %-18s %-8s %6ld %6ld %6ld %7ld %12.2f %8.2f %8.1f %5.1f %8.3f %6.1f\n",
+               r.name.c_str(), v2_op_str(r.op), (long) r.K, (long) r.IC, (long) r.OC, (long) r.OL,
+               r.macs / 1e6, r.ms, gf, 100.0 * gf / peak, r.bytes / 1048576.0,
+               r.ms > 0 ? r.bytes / 1048576.0 / (r.ms / 1e3) : 0.0);
+    }
+    fflush(stdout);
+}
 
 struct gsv_v2sovits::impl {
     ggml_backend_t backend = nullptr;
@@ -168,6 +322,10 @@ struct gsv_v2sovits::impl {
     int n_threads = 0;
     bool verbose = false;
     double ms_encp = 0, ms_flow = 0, ms_dec = 0;
+
+    // 子像素上采样的相位分组（每个 stage 一组，组内按相位升序）
+    struct v2_upg { std::string wname, bname; int ph0 = 0, ph1 = 0, dlo = 0, dhi = 0; };
+    std::vector<std::vector<v2_upg>> up_groups;
 
     v2_graph gvq, gflow, gdec;
 
@@ -264,26 +422,53 @@ void gsv_v2sovits::impl::plan_weights() {
         add_bias(base + ".bias");
     };
     // weight_norm ConvTranspose1d: 源 v:[IC,OC,K] g:[IC,1,1]
+    // → 子像素卷积按「相位分组」折叠：相位 r 的 tap 集合是 d ∈ [lo_r, hi_r]
+    //   （k = d*st + r + pad_tr 必须落在 [0,K)），相邻相位往往共享同一个区间；
+    //   把区间相同的相邻相位并成一组，每组一次 conv，K=M=dhi-dlo+1 个 tap **全部命中**。
+    //   旧的「所有相位取并集区间」白算了 K/st / M 的倍数：stage0 1.875x、stage1 1.5x、
+    //   stage2 1.25x、stage3/4 2x。组内输出通道 = (r-ph0)*OC + o，所以按相位顺序
+    //   concat 就得到 [T, st*OC]。bias 也用 phase 展开（kind 5）直接融进 conv 的 epilogue。
     auto add_wnt = [&](const std::string & base, int st) {
         const std::string v = base + ".weight_v", g = base + ".weight_g";
         ggml_tensor * tv = src(v.c_str());
         if (!tv) { fprintf(stderr, "[gsv_v2] missing %s\n", v.c_str()); abort(); }
-        v2_item it; it.dst = base + ".weight"; it.kind = 2; it.w = v; it.g = g; it.st = st;
-        it.K = (int) tv->ne[0]; it.OC = (int) tv->ne[1]; it.IC = (int) tv->ne[2];
-        const int pad_tr = (it.K - st) / 2;
-        int64_t d_lo = 0, d_hi = 0;
-        bool first = true;
+        const int K = (int) tv->ne[0], OC = (int) tv->ne[1], IC = (int) tv->ne[2];
+        const int pad_tr = (K - st) / 2;
+        std::vector<int> lo((size_t) st), hi((size_t) st);
         for (int r = 0; r < st; r++) {
             const int64_t p = r + pad_tr;
-            const int64_t lo = v2_ceil_div(-p, st);
-            const int64_t hi = v2_floor_div(it.K - 1 - p, st);
-            if (first) { d_lo = lo; d_hi = hi; first = false; }
-            else { d_lo = std::min(d_lo, lo); d_hi = std::max(d_hi, hi); }
+            lo[(size_t) r] = (int) v2_ceil_div(-p, st);
+            hi[(size_t) r] = (int) v2_floor_div(K - 1 - p, st);
+            if (lo[(size_t) r] > hi[(size_t) r]) {
+                fprintf(stderr, "[gsv_v2] %s 相位 %d 无有效 tap\n", base.c_str(), r); abort();
+            }
         }
-        it.M = (int) (d_hi - d_lo + 1);
-        it.P = (int) d_hi;
-        items.push_back(it);
-        add_bias(base + ".bias");
+        std::vector<v2_upg> gs;
+        int gi = 0;
+        for (int r = 0; r < st; ) {
+            int r2 = r + 1;
+            while (r2 < st && lo[(size_t) r2] == lo[(size_t) r] && hi[(size_t) r2] == hi[(size_t) r]) r2++;
+            char nm[224];
+            v2_item it;
+            snprintf(nm, sizeof(nm), "%s.weight.g%d", base.c_str(), gi);
+            it.dst = nm; it.kind = 2; it.w = v; it.g = g; it.st = st;
+            it.K = K; it.IC = IC; it.OC = OC;
+            it.dlo = lo[(size_t) r]; it.dhi = hi[(size_t) r];
+            it.M = it.dhi - it.dlo + 1; it.P = it.dhi;
+            it.ph0 = r; it.ph1 = r2;
+            items.push_back(it);
+            v2_item ib;
+            snprintf(nm, sizeof(nm), "%s.bias.g%d", base.c_str(), gi);
+            ib.dst = nm; ib.kind = 5; ib.w = base + ".bias";
+            ib.OC = OC; ib.ph0 = r; ib.ph1 = r2;
+            items.push_back(ib);
+            v2_upg u;
+            u.wname = it.dst; u.bname = ib.dst;
+            u.ph0 = r; u.ph1 = r2; u.dlo = it.dlo; u.dhi = it.dhi;
+            gs.push_back(u);
+            r = r2; gi++;
+        }
+        up_groups.push_back(gs);
     };
 
     // ---- dec (HiFi-GAN) ----
@@ -348,9 +533,11 @@ void gsv_v2sovits::impl::create_folded() {
         switch (it.kind) {
             case 0: t = ggml_new_tensor_3d(fctx, GGML_TYPE_F32, it.K, it.IC, it.OC); break;
             case 1: t = ggml_new_tensor_3d(fctx, GGML_TYPE_F32, it.K, it.IC, it.OC); break;
-            case 2: t = ggml_new_tensor_3d(fctx, GGML_TYPE_F32, it.M, it.IC, (int64_t) it.OC * it.st); break;
+            case 2: t = ggml_new_tensor_3d(fctx, GGML_TYPE_F32, it.M, it.IC,
+                                           (int64_t) it.OC * (it.ph1 - it.ph0)); break;
             case 3: t = ggml_new_tensor_1d(fctx, GGML_TYPE_F32, it.K); break;
             case 4: t = ggml_new_tensor_2d(fctx, GGML_TYPE_F32, it.IC, it.OC); break;   // [D,K]
+            case 5: t = ggml_new_tensor_1d(fctx, GGML_TYPE_F32, (int64_t) it.OC * (it.ph1 - it.ph0)); break;
             default: abort();
         }
         ggml_set_name(t, it.dst.c_str());
@@ -446,24 +633,39 @@ void gsv_v2sovits::impl::fill_folded() {
                 norm[(size_t) ic] = (float) std::sqrt(acc);
             }
             const int st = it.st, M = it.M, IC = it.IC, OC = it.OC, K = it.K;
-            const int pad_tr = (K - st) / 2;
-            std::vector<float> out((size_t) M * IC * OC * st, 0.0f);
+            const int pad_tr = (K - st) / 2, np = it.ph1 - it.ph0;
+            std::vector<float> out((size_t) M * IC * OC * np, 0.0f);
             for (int ic = 0; ic < IC; ic++) {
                 const float scale = g[(size_t) ic] / (norm[(size_t) ic] > 1e-12f ? norm[(size_t) ic] : 1e-12f);
-                for (int r = 0; r < st; r++) {
+                for (int r = it.ph0; r < it.ph1; r++) {
                     for (int m = 0; m < M; m++) {
                         const int d = it.P - m;
                         const int k = d * st + r + pad_tr;
                         if (k < 0 || k >= K) continue;
                         for (int o = 0; o < OC; o++) {
                             const float x = v[(size_t) k + (size_t) o * K + (size_t) ic * OC * K];
-                            // dst [M, IC, OC*st]: flat m + ic*M + (r*OC + o)*M*IC
-                            out[(size_t) m + (size_t) ic * M + ((size_t) r * OC + o) * M * IC] = x * scale;
+                            // dst [M, IC, np*OC]: flat m + ic*M + ((r-ph0)*OC + o)*M*IC
+                            out[(size_t) m + (size_t) ic * M + ((size_t) (r - it.ph0) * OC + o) * M * IC] = x * scale;
                         }
                     }
                 }
             }
             ggml_backend_tensor_set(dst, out.data(), 0, out.size() * 4);
+        } else if (it.kind == 5) {
+            // 相位展开后的 bias：同一 OC 组每个相位一份（torch 的 conv_transpose bias 对每个
+            // 输出采样都加一次，所以每个相位相同）
+            const int np = it.ph1 - it.ph0, OC = it.OC;
+            std::vector<float> b((size_t) np * OC, 0.0f);
+            if (src(it.w.c_str())) {
+                v = read_f32(it.w.c_str());
+                if ((int) v.size() < OC) {
+                    fprintf(stderr, "[gsv_v2] bias %s 长度 %zu < %d\n", it.w.c_str(), v.size(), OC);
+                    abort();
+                }
+                for (int r = 0; r < np; r++)
+                    for (int o = 0; o < OC; o++) b[(size_t) r * OC + o] = v[(size_t) o];
+            }
+            ggml_backend_tensor_set(dst, b.data(), 0, b.size() * 4);
         }
     }
 }
@@ -473,7 +675,7 @@ void gsv_v2sovits::impl::fill_folded() {
 static ggml_tensor * v2_flip_channels(ggml_context * c, ggml_tensor * x,
                                       ggml_tensor * perm, int T, int C) {
     (void) T; (void) C;
-    return ggml_conv_direct_1d_fused(c, perm, x, nullptr, nullptr, 0, 1, 0.0f, 1.0f, 0.0f);
+    return v2_conv(c, perm, x, nullptr, nullptr, 0, 1, 0.0f, 1.0f, 0.0f, "flip");
 }
 
 void gsv_v2sovits::impl::build_flow(int T) {
@@ -500,8 +702,10 @@ void gsv_v2sovits::impl::build_flow(int T) {
         ggml_tensor * x0 = ggml_cont(c, ggml_view_2d(c, x, T, HC, x->nb[1], 0));
         ggml_tensor * x1 = ggml_cont(c, ggml_view_2d(c, x, T, HC, x->nb[1], (size_t) HC * x->nb[1]));
         snprintf(wn, sizeof(wn), "flow.flows.%d.pre.weight", li * 2);
-        ggml_tensor * h = ggml_conv_direct_1d_fused(c, need(wn), x0, bias_of(wn), nullptr,
-                                                    0, 1, 0.0f, 1.0f, 0.0f);         // [T,192]
+        char fn[64];
+        snprintf(fn, sizeof(fn), "flow%d.pre", li);
+        ggml_tensor * h = v2_conv(c, need(wn), x0, bias_of(wn), nullptr,
+                                  0, 1, 0.0f, 1.0f, 0.0f, fn);                        // [T,192]
         // ---- WN ----
         ggml_tensor * gc = ggml_mul_mat(c,
                 ggml_reshape_2d(c, need((base + ".cond_layer.weight").c_str()), gin, 2 * flow_hid * n_wntaps),
@@ -513,18 +717,20 @@ void gsv_v2sovits::impl::build_flow(int T) {
         for (int i = 0; i < n_wntaps; i++) {
             const std::string inb = base + ".in_layers." + std::to_string(i);
             const std::string rsb = base + ".res_skip_layers." + std::to_string(i);
-            ggml_tensor * xin = ggml_conv_direct_1d_fused(c, need((inb + ".weight").c_str()), hx,
-                                                          need((inb + ".bias").c_str()), nullptr,
-                                                          flow_k / 2, 1, 0.0f, 1.0f, 0.0f);   // [T,384]
+            snprintf(fn, sizeof(fn), "flow%d.in%d", li, i);
+            ggml_tensor * xin = v2_conv(c, need((inb + ".weight").c_str()), hx,
+                                        need((inb + ".bias").c_str()), nullptr,
+                                        flow_k / 2, 1, 0.0f, 1.0f, 0.0f, fn);            // [T,384]
             ggml_tensor * gl = ggml_reshape_2d(c, ggml_view_1d(c, gc, 2 * flow_hid,
                                                                (size_t) i * 2 * flow_hid * 4), 1, 2 * flow_hid);
             xin = ggml_add(c, xin, gl);
             ggml_tensor * a = ggml_cont(c, ggml_view_2d(c, xin, T, flow_hid, xin->nb[1], 0));
             ggml_tensor * b = ggml_cont(c, ggml_view_2d(c, xin, T, flow_hid, xin->nb[1], (size_t) flow_hid * xin->nb[1]));
             ggml_tensor * acts = ggml_mul(c, ggml_tanh(c, a), ggml_sigmoid(c, b));
-            ggml_tensor * rs = ggml_conv_direct_1d_fused(c, need((rsb + ".weight").c_str()), acts,
-                                                         need((rsb + ".bias").c_str()), nullptr,
-                                                         0, 1, 0.0f, 1.0f, 0.0f);
+            snprintf(fn, sizeof(fn), "flow%d.rs%d", li, i);
+            ggml_tensor * rs = v2_conv(c, need((rsb + ".weight").c_str()), acts,
+                                       need((rsb + ".bias").c_str()), nullptr,
+                                       0, 1, 0.0f, 1.0f, 0.0f, fn);
             if (i < n_wntaps - 1) {
                 ggml_tensor * res = ggml_cont(c, ggml_view_2d(c, rs, T, flow_hid, rs->nb[1], 0));
                 ggml_tensor * skp = ggml_cont(c, ggml_view_2d(c, rs, T, flow_hid, rs->nb[1], (size_t) flow_hid * rs->nb[1]));
@@ -536,8 +742,9 @@ void gsv_v2sovits::impl::build_flow(int T) {
         }
         h = acc;
         snprintf(wn, sizeof(wn), "flow.flows.%d.post.weight", li * 2);
-        ggml_tensor * m = ggml_conv_direct_1d_fused(c, need(wn), h, bias_of(wn), nullptr,
-                                                    0, 1, 0.0f, 1.0f, 0.0f);         // [T,96]
+        snprintf(fn, sizeof(fn), "flow%d.post", li);
+        ggml_tensor * m = v2_conv(c, need(wn), h, bias_of(wn), nullptr,
+                                  0, 1, 0.0f, 1.0f, 0.0f, fn);                        // [T,96]
         x1 = ggml_sub(c, x1, m);                                                   // reverse, logs=0
         x = ggml_concat(c, x0, x1, 1);       // 通道轴拼接 → [T, 2*HC]
     }
@@ -570,8 +777,9 @@ void gsv_v2sovits::impl::build_dec(int T) {
 
     // conv_pre (k=7 pad=3) + LeakyReLU(0.1) 融合在 epilogue
     // 参考: conv_pre → +cond → leaky_relu → ups[0]，所以 leaky 不能放在 conv_pre 的 epilogue
-    ggml_tensor * h = ggml_conv_direct_1d_fused(c, need("dec.conv_pre.weight"), x,
-                                                bias_of("dec.conv_pre.weight"), nullptr, 3, 1, 0.0f, 1.0f, 0.0f);
+    ggml_tensor * h = v2_conv(c, need("dec.conv_pre.weight"), x,
+                              bias_of("dec.conv_pre.weight"), nullptr, 3, 1, 0.0f, 1.0f, 0.0f,
+                              "conv_pre");
     // + cond(ge)（1x1 conv；与时间无关 → 只算一个 [1,512] 向量广播）
     {
         ggml_tensor * gc = ggml_mul_mat(c, ggml_reshape_2d(c, need("dec.cond.weight"), gin, 512),
@@ -583,37 +791,41 @@ void gsv_v2sovits::impl::build_dec(int T) {
     char wn[192];
     for (int i = 0; i < n_stage; i++) {
         const int st = ups[(size_t) i];
-        // ---- 子像素上采样：ConvTranspose1d(K, stride) == conv(P) + 相位交织 ----
-        snprintf(wn, sizeof(wn), "dec.ups.%d.weight", i);
-        ggml_tensor * uw = need(wn);
-        const int CS = (int) uw->ne[2];
-        const int cout = CS / st;
-        int Puse = 0;
-        for (const v2_item & it : items)
-            if (it.dst == wn) { Puse = it.P; break; }
+        // ---- 子像素上采样：ConvTranspose1d(K, stride) == 相位分组 conv + 相位交织 ----
+        // 每个相位组的 K=M=dhi-dlo+1 个 tap 全部命中（旧实现取并集区间，白算 1.25~2x）。
+        // 组内输出通道 = (r-ph0)*cout + o，按相位顺序 concat → [Tin, st*cout]。
+        const std::vector<v2_upg> & gs = up_groups[(size_t) i];
+        const int cout = (int) (need(gs[0].wname.c_str())->ne[2] / (gs[0].ph1 - gs[0].ph0));
+        int dmax = 0;
+        for (const v2_upg & g : gs) dmax = std::max(dmax, -g.dlo);   // dlo<0 时需要往右补零帧
         const float in_scale = (i > 0) ? mean_scale : 1.0f;
         const float in_slope = 0.1f;      // 每级 ups 前都有 F.leaky_relu(x, 0.1)
-        ggml_tensor * y = ggml_conv_direct_1d_fused(c, uw, h, nullptr, nullptr,
-                                                    Puse, 1, 0.0f, in_scale, in_slope);       // [OL, CS]
-        const int64_t OL = y->ne[0];
         const int64_t Tin = h->ne[0];
-        if (OL != Tin) {
+        ggml_tensor * xin = h;
+        if (dmax > 0)
+            xin = ggml_pad(c, h, dmax, 0, 0, 0);        // 尾部补 dmax 行零（dim0）
+        char nm[64];
+        ggml_tensor * ycat = nullptr;
+        for (size_t gi = 0; gi < gs.size(); gi++) {
+            snprintf(nm, sizeof(nm), "ups.%d.g%zu", i, gi);
+            ggml_tensor * y = v2_conv(c, need(gs[gi].wname.c_str()), xin,
+                                      need(gs[gi].bname.c_str()), nullptr,
+                                      gs[gi].dhi, 1, 0.0f, in_scale, in_slope, nm);
+            const int64_t OL = y->ne[0];
             if (OL < Tin) {
-                fprintf(stderr, "[gsv_v2] up%d: OL %ld < T %ld\n", i, (long) OL, (long) Tin);
+                fprintf(stderr, "[gsv_v2] up%d g%zu: OL %ld < T %ld (dmax=%d)\n",
+                        i, gi, (long) OL, (long) Tin, dmax);
                 abort();
             }
-            y = ggml_cont(c, ggml_view_2d(c, y, Tin, CS, y->nb[1], 0));
+            if (OL != Tin) y = ggml_cont(c, ggml_view_2d(c, y, Tin, y->ne[1], y->nb[1], 0));
+            ycat = ycat ? ggml_concat(c, ycat, y, 1) : y;
         }
-        ggml_tensor * y3 = ggml_reshape_3d(c, y, Tin, cout, st);
+        ggml_tensor * y3 = ggml_reshape_3d(c, ycat, Tin, cout, st);
         ggml_tensor * yp = ggml_permute(c, y3, 1, 2, 0, 3);
         ggml_tensor * yc = ggml_cont(c, yp);
         ggml_tensor * up = ggml_reshape_2d(c, yc, (int64_t) Tin * st, cout);              // [T·st, cout]
-        std::string bname(wn);
-        bname = bname.substr(0, bname.size() - 7) + ".bias";
-        auto itb = w.find(bname);
-        if (itb != w.end()) up = ggml_add(c, up, ggml_reshape_2d(c, itb->second, 1, cout));
         h = up;
-            // ---- 3 × ResBlock1 求和 ----
+            // ---- 3 × ResBlock1 求和（第 j>0 块的求和融进第 3 对 conv 的 epilogue）----
         ggml_tensor * sum = nullptr;
         for (int j = 0; j < n_res; j++) {
             const int blk = i * n_res + j;
@@ -623,22 +835,26 @@ void gsv_v2sovits::impl::build_dec(int T) {
                 snprintf(wn, sizeof(wn), "dec.resblocks.%d.convs1.%d.weight", blk, k);
                 ggml_tensor * w1 = need(wn);
                 const int pad1 = ((int) w1->ne[0] / 2) * dil;
-                ggml_tensor * yy = ggml_conv_direct_1d_fused(c, w1, hx, bias_of(wn), nullptr,
-                                                             pad1, dil, 0.1f, 1.0f, 0.1f);
+                snprintf(nm, sizeof(nm), "rb%d.c1.%d", blk, k);
+                ggml_tensor * yy = v2_conv(c, w1, hx, bias_of(wn), nullptr,
+                                           pad1, dil, 0.1f, 1.0f, 0.1f, nm);
                 snprintf(wn, sizeof(wn), "dec.resblocks.%d.convs2.%d.weight", blk, k);
                 ggml_tensor * w2 = need(wn);
                 const int pad2 = (int) w2->ne[0] / 2;
-                hx = ggml_conv_direct_1d_fused(c, w2, yy, bias_of(wn), hx,
-                                               pad2, 1, 0.0f, 1.0f, 0.0f);
+                snprintf(nm, sizeof(nm), "rb%d.c2.%d", blk, k);
+                // k==2 是块内最后一对 conv：把「前面块的部分和」当 res 交给 epilogue
+                // ((bias+acc)+res) 与 res+hx 位级相同（两数相加可交换）
+                hx = v2_conv(c, w2, yy, bias_of(wn), hx,
+                             pad2, 1, 0.0f, 1.0f, 0.0f, nm);
             }
             sum = sum ? ggml_add(c, sum, hx) : hx;
         }
         h = sum;   // 均值 1/3 与 LeakyReLU 融进下一级 conv 的 in_scale/in_slope
         }
     // conv_post (k=7 pad=3, 无 bias) + tanh；leaky_slope < 0 = tanh
-    ggml_tensor * out = ggml_conv_direct_1d_fused(c, need("dec.conv_post.weight"), h,
-                                                  bias_of("dec.conv_post.weight"), nullptr,
-                                                  3, 1, -1.0f, mean_scale, 0.1f);
+    ggml_tensor * out = v2_conv(c, need("dec.conv_post.weight"), h,
+                                bias_of("dec.conv_post.weight"), nullptr,
+                                3, 1, -1.0f, mean_scale, 0.1f, "conv_post");
     ggml_set_output(out);
     gdec.out = out;
     gdec.g = ggml_new_graph_custom(c, 65536, false);
@@ -942,6 +1158,8 @@ bool gsv_v2sovits::flow_reverse(const float * zp, int T, const float * ge, std::
     ggml_backend_tensor_get(s.gflow.out, y.data(), 0, y.size() * 4);
     z.assign(y.begin(), y.end());       // 同一份内存布局，直接拷
     s.ms_flow = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    // 剖析放在取完输出之后：逐节点重算会撞上 gallocr 的 buffer 复用
+    if (getenv("GSV_V2_PROFILE")) v2_profile_graph(s.backend, s.gflow, "flow");
     return true;
 }
 
@@ -960,6 +1178,9 @@ bool gsv_v2sovits::decode_wav(const float * z, int T, const float * ge, std::vec
     const size_t n = (size_t) ggml_nelements(s.gdec.out);
     wav.resize(n);
     ggml_backend_tensor_get(s.gdec.out, wav.data(), 0, n * 4);
+    // 剖析放在取回输出之后：逐节点重算会撞上 gallocr 的 buffer 复用，
+    // 会把最终输出覆盖掉（数值本身不受影响，但必须先把 wav 取走）
+    if (getenv("GSV_V2_PROFILE")) v2_profile_graph(s.backend, s.gdec, "dec");
     s.ms_dec = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return true;
 }
