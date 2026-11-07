@@ -38,6 +38,7 @@ KINDS = {
     "vocoder": ("export_vocoder_gguf.py",  None, False),
     "bert":    ("convert_bert.py",         None, False),
     "hubert":  ("convert_hubert.py",       None, False),
+    "dhubert": ("convert_distilled_hubert.py", 102, False),
 }
 
 
