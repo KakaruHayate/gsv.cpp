@@ -62,6 +62,7 @@ file(GLOB GSV_ENGINE_SOURCES CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_ar.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_bert.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_cond.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_dhubert.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_dit.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_encp.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/src/gsv_engine.cpp"
@@ -115,6 +116,10 @@ endif()
 
 # ---------------------------------------------------------------- tests
 if(GSV_BUILD_TESTS)
+    # distilled HuBERT numerical probe: dhubert_probe <gguf> <wav> [out.f32] [--ref ...]
+    add_executable(dhubert_probe "${CMAKE_CURRENT_SOURCE_DIR}/tools/dhubert_probe.cpp")
+    target_link_libraries(dhubert_probe PRIVATE gsv_engine)
+
     add_executable(test_svc "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_svc.cpp")
     target_include_directories(test_svc PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
