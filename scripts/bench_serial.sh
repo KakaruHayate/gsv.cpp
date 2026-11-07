@@ -49,9 +49,22 @@ quiet_check() {
 run_bin() {
   local bin="$1" tag="$2" i
   for i in $(seq 1 "$REPS"); do
+    # /usr/bin/time reports the CPU percentage this job actually got. On a 4-vCPU box a clean
+    # 4-thread run is ~380-400%; anything lower means another process stole cycles and the
+    # wall-clock number must be thrown away. This catches contention that the loadavg gate
+    # misses (short bursts between samples).
+    local tf="$OUT/$tag.$i.time"
     # shellcheck disable=SC2086
-    "$bin" $ARGS 2>&1 | tee "$OUT/$tag.$i.log" | grep -E '^\[RESULT\]|AR\(|synthesize:' \
-      | sed "s/^/[$tag#$i] /"
+    /usr/bin/time -f "%P" -o "$tf" "$bin" $ARGS 2>&1 | tee "$OUT/$tag.$i.log" \
+      | grep -E '^\[RESULT\]|AR\(|synthesize:' | sed "s/^/[$tag#$i] /"
+    local pct
+    pct=$(tr -d '%\n' < "$tf" 2>/dev/null)
+    if [[ -n "$pct" && "$pct" -lt 370 ]]; then
+      echo "[$tag#$i] DISCARD: job only got ${pct}% CPU (4 threads need ~370%+) - box was busy"
+      rm -f "$OUT/$tag.$i.log"
+    else
+      echo "[$tag#$i] cpu=${pct:-?}% (clean)"
+    fi
   done
 }
 
