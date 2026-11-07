@@ -301,7 +301,9 @@ gsv_engine * gsv_engine::load(const gsv_engine_cfg & cfg) {
         gsv_bert_cfg b; b.device = dev; b.n_threads = cfg.n_threads; b.verbose = vb;
         b.feat_cache = 8;
         s.bert = gsv_bert::load(s.pick(cfg.bert_file, "gsv-bert-f16.gguf"), b);
-        if (!s.bert) { fprintf(stderr, "[gsv_engine] BERT 加载失败\n"); delete m; return nullptr; }
+        // v2 变可缺省: 对拍/bench 只需 enc_p 的 text_embedding 输入，bert 由调用方直接给
+        if (!s.bert && !v2) { fprintf(stderr, "[gsv_engine] BERT 加载失败\n"); delete m; return nullptr; }
+        if (!s.bert) fprintf(stderr, "[gsv_engine] 注意: BERT 未加载，v2 路径要求调用方直接提供 bert 向量\n");
     }
     // AR
     {

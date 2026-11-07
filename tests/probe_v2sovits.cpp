@@ -8,6 +8,8 @@
 //     --bench N        v2 SoVITS 段重复次数（默认 1）
 //     --ar-bench N     AR 段重复次数（默认 1）
 //     --speed S        enc_p 的时间缩放（默认 1.0）
+//     --ar-max N       AR 最多生成多少 semantic token（默认 2000，~8s 音频约 220）
+//     --ar-file PATH   覆盖 AR 的 GGUF（对比 q8 / f16）
 //     --seed N         z_p 噪声种子（默认 12345）
 //     --noise N        noise_scale（默认 0.5）
 //     --dump           把本侧中间量写到 fixture_dir/ours_*.f32（供 python 侧复算/出报告）
@@ -92,14 +94,16 @@ static void cmp(const char * name, const std::vector<float> & a, const std::vect
 int main(int argc, char ** argv) {
     if (argc < 3) {
         printf("usage: probe_v2sovits <s2.gguf> <fixture_dir> [--models DIR] [--ref-wav PATH]\n"
-               "                      [--threads N] [--bench N] [--ar-bench N] [--speed S] [--seed N]\n"
+               "                      [--threads N] [--bench N] [--ar-bench N] [--ar-max N] [--ar-file PATH]\n"
+               "                      [--speed S] [--seed N]\n"
                "                      [--noise N] [--dump]\n");
         return 2;
     }
+    std::string ec_ar_file;
     const std::string s2_path = argv[1];
     const std::string fix = argv[2];
     std::string models, ref_wav;
-    int threads = 0, bench = 1, ar_bench = 1;
+    int threads = 0, bench = 1, ar_bench = 1, ar_max = 2000;
     double speed = 1.0, noise = 0.5;
     uint64_t seed = 12345;
     bool dump = false;
@@ -111,6 +115,8 @@ int main(int argc, char ** argv) {
         else if (a == "--threads") threads = std::atoi(next().c_str());
         else if (a == "--bench") bench = std::max(1, std::atoi(next().c_str()));
         else if (a == "--ar-bench") ar_bench = std::max(1, std::atoi(next().c_str()));
+        else if (a == "--ar-max") ar_max = std::max(1, std::atoi(next().c_str()));
+        else if (a == "--ar-file") ec_ar_file = next();
         else if (a == "--speed") speed = std::atof(next().c_str());
         else if (a == "--seed") seed = (uint64_t) std::strtoull(next().c_str(), nullptr, 10);
         else if (a == "--noise") noise = std::atof(next().c_str());
@@ -247,6 +253,7 @@ int main(int argc, char ** argv) {
         ec.verbose = true;
         ec.version = "v2";
         ec.s2_file = s2_path;
+        ec.ar_file = ec_ar_file;
         ec.v2_noise_scale = (float) noise;
         gsv_engine * eng = gsv_engine::load(ec);
         if (!eng) { printf("engine load failed\n"); delete s2; return 1; }
@@ -293,9 +300,12 @@ int main(int argc, char ** argv) {
                 const auto t0 = std::chrono::steady_clock::now();
                 ar_ok = eng->ar_generate(phones, use_bert ? bert : std::vector<float>(),
                                          prompt_phones, prompt_bert, prompt_codes,
-                                         2000, 4, seed, sem, nullptr);
-                ar_ms += std::chrono::duration<double, std::milli>(
+                                         ar_max, ar_max, seed, sem, nullptr);   // (max_steps, early_stop 硬上限)
+                const double one = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t0).count();
+                ar_ms += one;
+                printf("  AR iter %d: %.1f ms (sem=%zu, %.1f ms/token)\n", it + 1, one,
+                       sem.size(), sem.empty() ? 0.0 : one / (double) sem.size());
             }
             if (!ar_ok) { printf("  ar_generate FAIL\n"); delete eng; delete s2; return 1; }
             ar_ms /= (double) ar_bench;

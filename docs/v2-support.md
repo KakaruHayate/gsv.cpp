@@ -139,7 +139,31 @@ enc_p 96.3 ms、flow 45.6 ms、dec 862.1 ms。
 
 ## Benchmark
 
-<!-- BENCH_TABLE -->
+环境：4 vCPU EPYC 7K62 / 3.7 GB RAM，`--threads 4`，CPU 后端，无 GPU。
+参考音频 8.00 s（`ref8s.wav`，16 kHz，由 3.84 s 参考音频拼接 + 0.2 s 间隔凑成 8 s），
+输出 **7.96 s**（179 个语义 token，`--speed 0.9` 让 179 token 落在 8 s 附近），
+`--bench 3 --ar-bench 3` 取平均（三次离散度 < 5%，第 1 次已不含冷启动开销）。
+
+| 段 | q8 AR | f16 AR | 备注 |
+| --- | --- | --- | --- |
+| AR (T2S) | **2454 ms**（13.5–14.0 ms/token） | **2812 ms**（15.5–15.9 ms/token） | 同一 GPT，只差 AR 的量化档；q8 文件 89 MB，f16 151 MB |
+| v2 SoVITS 合计 | 1778 ms | 1801–1861 ms | 与 AR 无关（解码侧同一份权重） |
+| ├ enc_p | 155 ms | 155 ms | codes→m_p/logs_p（+speed 缩放） |
+| ├ flow | 59 ms | 59 ms | 4×ResidualCouplingLayer(reverse) |
+| └ dec | 1575 ms | 1575 ms | HiFi-GAN 5 级上采样，占 SoVITS 的 89% |
+| **全链** | **4254 ms → RTF 0.534** | **4673 ms → RTF 0.587** | AR + SoVITS + 波形 |
+| 仅合成侧 RTF | 0.223 | 0.226 | 不含 AR |
+
+参考音频侧（`prep_reference`，8 s 输入）：教师 HuBERT 1589 ms，蒸馏 HuBERT 283 ms；两者都产出
+214 个 prompt codes，v2 的 `ssl_proj → VQ` 链路都跑通。
+
+结论：
+
+- **SoVITS+解码器在 4 vCPU 上 RTF ≈ 0.22**（8 s 音频 1.78 s），瓶颈是 dec（1575 ms / 7.96 s 波形），
+  enc_p+flow 只占 12%。dec 的耗时随帧数线性（4.12 s fixture 时 859 ms）。
+- **AR 是整条链的主要成本**：q8 13.7 ms/token，比 f16 快约 15%（2454 vs 2812 ms）；
+  但 f16 的译码更接近 torch（无 Q8_0 误差），需要的显存/内存也多 1.7 倍。
+- 整链 RTF 0.53（q8 AR）。若要实时（RTF < 1）单路已经满足；多路并发时 dec 是扩展瓶颈。
 
 ## 已知差异
 

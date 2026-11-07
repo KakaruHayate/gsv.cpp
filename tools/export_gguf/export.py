@@ -55,7 +55,9 @@ def build_cmd(kind, a):
         elif a.q8:
             cmd += ["--spec", "attn=q8_0,ffn=q8_0"]
         elif a.f16:
-            cmd += ["--spec", "attn=f16,ffn=f16,predict=f16,emb=f16"]
+            # emb 不能压: gsv_ar 在 host 侧直读 text_emb / audio_emb (logits 与 embed 表),
+            # 非 F32 会直接加载失败。所以 F16 档只压 attn/ffn/predict。
+            cmd += ["--spec", "attn=f16,ffn=f16,predict=f16"]
     elif kind == "v2sovits":
         if a.f16:
             cmd += ["--f16"]
