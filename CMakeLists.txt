@@ -153,4 +153,9 @@ if(GSV_BUILD_TESTS)
     target_include_directories(test_conv_direct_act PRIVATE ${GSV_GGML_INCLUDES})
     target_link_libraries(test_conv_direct_act PRIVATE ${GSV_GGML_LIBS})
     add_test(NAME test_conv_direct_act COMMAND test_conv_direct_act --cpu)
+
+    # 直接卷积 vs im2col+ggml_mul_mat 的 A/B（dec 主算子选型依据）
+    add_executable(bench_conv1d "${CMAKE_CURRENT_SOURCE_DIR}/tests/bench_conv1d.cpp")
+    target_include_directories(bench_conv1d PRIVATE ${GSV_GGML_INCLUDES})
+    target_link_libraries(bench_conv1d PRIVATE ${GSV_GGML_LIBS})
 endif()
