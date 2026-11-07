@@ -128,6 +128,7 @@ struct gsv_dit::impl {
     bool attn_env_done = false;
     bool attn_summary = false;               // GSV_ATTN_MODE=summary: 只落盘块级统计 (全层全头可跑)
     bool attn_sum_hdr = false, attn_prof_hdr = false;
+    int  attn_block = 32;                    // 块粒度 (GSV_ATTN_BLOCK; 对应 shader 的 Bc)
     bool cur_neg = false;                    // 正在构建/运行的分支
     struct attn_probe { std::string name; ggml_tensor * t; };
     std::vector<attn_probe> attn_pr[2];      // [pos, neg]
@@ -902,6 +903,7 @@ void gsv_dit::impl::attn_parse_env() {
     if (attn_ts.empty()) attn_ts.push_back(0.0f);
     const char * md = getenv("GSV_ATTN_MODE");
     attn_summary = md && std::string(md) == "summary";
+    if (const char * bb = getenv("GSV_ATTN_BLOCK")) { const int v = atoi(bb); if (v >= 8 && v <= 512) attn_block = v; }
     if (getenv("GSV_DIT_ATTN_LEGACY") == nullptr)
         fprintf(stderr, "[attn-dump] 注意: 只支持逐头路径, 需要同时设 GSV_DIT_ATTN_LEGACY=1\n");
     fprintf(stderr, "[attn-dump] dir=%s layers=%zu heads=%zu ts=%zu mode=%s\n",
@@ -914,7 +916,7 @@ void gsv_dit::impl::attn_write_summary(int branch, float t, const std::string & 
                                        const std::vector<float> & a, int Tk, int Tq) {
     const int P = prompt_T > 0 ? prompt_T : Tq / 2;
     const int G = Tq - P;
-    const int B = 32;
+    const int B = attn_block;
     const int nb = (Tk + B - 1) / B;
     const char * bn = branch ? "neg" : "pos";
 
