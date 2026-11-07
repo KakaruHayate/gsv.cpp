@@ -39,6 +39,9 @@ KINDS = {
     "bert":    ("convert_bert.py",         None, False),
     "hubert":  ("convert_hubert.py",       None, False),
     "dhubert": ("convert_distilled_hubert.py", 102, False),
+    # v2-family SoVITS (VITS decoder). Not wired into the engine yet: the converter fixes the
+    # GGUF contract for src/gsv_v2sovits.cpp, which is still to be written.
+    "v2sovits": ("convert_v2sovits.py",    None, False),
 }
 
 
@@ -53,6 +56,8 @@ def build_cmd(kind, a):
             cmd += ["--spec", "attn=q8_0,ffn=q8_0"]
         elif a.f16:
             cmd += ["--spec", "attn=f16,ffn=f16,predict=f16,emb=f16"]
+    elif kind == "v2sovits" and a.f16:
+        cmd += ["--f16"]
     elif kind in ("cond", "dit") and a.spec:
         cmd += ["--spec", a.spec]
     return cmd
