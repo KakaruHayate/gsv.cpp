@@ -72,6 +72,7 @@ def main():
             )
         except Exception as exc:  # keep going, report per case
             case["error"] = f"{type(exc).__name__}: {exc}"
+            print(f"[check_g2ps] {text[:20]!r}: {case['error']}", file=sys.stderr)
         out["cases"].append(case)
 
     texts = [c["text"] for c in out["cases"] if "error" not in c]
@@ -84,6 +85,10 @@ def main():
             clean_text(text, args.lang, "v2")
             chars += len(text)
     dt = time.perf_counter() - t0
+    if not texts:
+        print("[check_g2ps] no case succeeded", file=sys.stderr)
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+        return 1
     out["timing"] = {
         "repeat": args.repeat,
         "chars": chars,
