@@ -100,6 +100,41 @@ Windows, Xeon E5-2675 v3 (16 cores / 32 threads, 1.8 GHz), turbo-q8, 4 steps, 3.
 DiT is memory-bound in this configuration and does not improve past 8 threads; the win is in the
 AR/cond/vocoder stages. --threads N overrides the default.
 
+## AR decode: KV cache concat removal (2026-11-08)
+
+The decode graph used to copy the whole KV history twice per layer per token
+(`ggml_concat(cache[0..L), new_column)`, K and V) only to make the "write → read" dependency
+explicit; the copy is mathematically redundant. The new column is now written straight into the
+resident cache column `len` (a `cpy`/`set_rows` side-effect root expanded **before** the logits
+root, so node order still guarantees write-then-read) and flash attention reads the cache view
+directly. Both decode paths are covered: `run_decode()` (CPU) and `run_decode_cached()` (the
+fixed-shape graph reused on the GPU).
+
+AR-only measurement, teacher forcing with a fixed context so every build sees identical inputs,
+`gsv-ar-q8.gguf`, 179 steps, interleaved A/B (ABBA) with a fresh process per run:
+
+| path | before | after | delta |
+|---|---|---|---|
+| CPU, 4 threads, prompt 200 | 24.84 ms/token | **12.55 ms/token** | −49% |
+| CPU, 8 threads, prompt 400 | 23.9 ms/token | **12.9 ms/token** | −45% |
+| Vulkan (RTX 2070), prompt 200 | 2.88 / 2.91 / 3.06 ms/token | **2.52 / 2.54 / 2.73** | −12% |
+| Vulkan, prompt 400 | 3.33 / 3.42 / 3.54 ms/token | **3.13 / 3.20 / 3.29** | −7.5% |
+| Vulkan, batch 2, prompt 200 | 787.6 / 683.2 ms | **629.8 / 623.7 ms** | −10…−20% |
+
+Correctness: on CPU the per-token probability dump is **bit-identical** before/after
+(md5 unchanged over 61 steps × 1025 vocab), and the generated token sequence matches on both
+backends (`be29fd0385f0553f` for the 179-step fixture, `7b7e35445ea1c39d` for batch 2). On Vulkan
+the graph-cached path now feeds flash attention a **non-contiguous** cache view, so it takes a
+different kernel path: the probabilities differ from the concat build by `mean|d| 9.6e-7 /
+max|d| 2.2e-2`, i.e. **smaller** than the normal CPU-vs-Vulkan backend spread on the same fixture
+(`mean 4.7e-5 / max 5.9e-2`), with identical argmax on all steps. The largest deviation sits on a
+`top_k=15` pivot tie (rank 15 vs 16), not on a mask error.
+
+Note for reviewers: on the GPU path the `set_rows` → `flash` dependency is not a graph edge, it
+relies on node order being execution order (CPU is sequential; Vulkan was deterministic across
+repeated runs). `GSV_AR_NO_GRAPHCACHE=1` still forces the CPU-style path if this ever needs to be
+bisected.
+
 ## What is not parallelised
 
 - **Pipeline overlap** (AR of segment i+1 while DiT/vocoder runs segment i) is not implemented:
