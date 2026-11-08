@@ -56,7 +56,7 @@
 #include "ggml-backend.h"
 #include "gsv_progress.h"
 
-#define GSV_VERSION "0.1.2"
+#define GSV_VERSION "0.1.3"
 
 #include "svc_core.h"
 
