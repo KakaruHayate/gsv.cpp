@@ -107,8 +107,10 @@ struct gsv_ar::impl {
         cctx = ggml_init(ip);
         kc_t.resize(NL); vc_t.resize(NL);
         for (int li = 0; li < NL; li++) {
-            kc_t[li] = ggml_new_tensor_4d(cctx, kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32, HD, Lmax, NH, B);
-            vc_t[li] = ggml_new_tensor_4d(cctx, kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32, HD, Lmax, NH, B);
+            // +1 列: 解码图缓存路径让 flash 直接读常驻 cache 的 [0, Lmax] 视图 (不再 concat 新列),
+            // 新列由 set_rows 落到 idx = cache.len 处, 因此视图长度 Lmax+1 必须落在分配范围内。
+            kc_t[li] = ggml_new_tensor_4d(cctx, kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32, HD, Lmax + 1, NH, B);
+            vc_t[li] = ggml_new_tensor_4d(cctx, kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32, HD, Lmax + 1, NH, B);
         }
         cbuf = ggml_backend_alloc_ctx_tensors(cctx, backend);
         if (!cbuf) { fprintf(stderr, "[gsv_ar] cache alloc failed\n"); exit(1); }
@@ -400,8 +402,10 @@ struct gsv_ar::impl {
             // KV 追加: 按 idx 写入 cache 的第 len 行 (同一行索引对 K/V 与所有 head/batch 生效)
             writes.push_back(ggml_set_rows(ctx, kc_t[li], ksrc, dgs.idx));
             writes.push_back(ggml_set_rows(ctx, vc_t[li], vsrc, dgs.idx));
-            ggml_tensor * kfull = ggml_concat(ctx, k_view(ctx, li, Lmax), ksrc, 1);
-            ggml_tensor * vfull = ggml_concat(ctx, v_view(ctx, li, Lmax), vsrc, 1);
+            // 不再 concat: 新列已由上面的 set_rows 落到 idx = cache.len, flash 直接读
+            // 常驻 cache 的 [0, Lmax] 视图 (常量长度 -> 图照旧可复用)。尾部无效槽靠 mask 屏蔽。
+            ggml_tensor * kfull = k_view(ctx, li, Lmax + 1);
+            ggml_tensor * vfull = v_view(ctx, li, Lmax + 1);
             ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, qh, kfull, vfull, dgs.mask,
                                                         1.0f / std::sqrt((float)HD), 0.0f, 0.0f);
             attn_out = ggml_reshape_3d(ctx, attn_out, D, 1, B);
@@ -414,8 +418,8 @@ struct gsv_ar::impl {
         dgs.logits = ggml_mul_mat(ctx, predict, cur);
         ggml_set_output(dgs.logits);
         dgs.graph = ggml_new_graph_custom(ctx, 4096, false);
+        for (ggml_tensor * w : writes) ggml_build_forward_expand(dgs.graph, w);   // 先写 KV (副作用根)
         ggml_build_forward_expand(dgs.graph, dgs.logits);
-        for (ggml_tensor * w : writes) ggml_build_forward_expand(dgs.graph, w);   // set_rows 是副作用根
         ggml_gallocr_alloc_graph(galloc, dgs.graph);
         dgs.Lmax = Lmax; dgs.B = B; dgs.ctx = ctx;
     }
@@ -446,7 +450,9 @@ struct gsv_ar::impl {
         std::vector<ggml_fp16_t> mask_host((size_t)(Lmax + 1) * B);
         for (int b = 0; b < B; b++)
             for (int k = 0; k <= Lmax; k++) {
-                const bool bad = (k < pad_len[b]) || (k >= Lh && k < Lmax);
+                // 有效 key = 左 padding 之后的历史 [pad, Lh] —— 本步的新列落在 idx=Lh (视图内部),
+                // 不再是原来的尾部槽 Lmax; (Lh, Lmax] 是未写入的旧数据, 必须屏蔽。
+                const bool bad = (k < pad_len[b]) || (k > Lh);
                 mask_host[(size_t) k + (size_t) b * (Lmax + 1)] = ggml_fp32_to_fp16(bad ? -INFINITY : 0.0f);
             }
         const double t_b = now_ms();
