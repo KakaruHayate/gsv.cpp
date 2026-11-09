@@ -1,4 +1,4 @@
-# 从零构建 gsv.cpp
+﻿# 从零构建 gsv.cpp
 
 本文把一台干净机器带到可用的 `/tts` 服务：引擎、GGUF 模型、Python 文本前端。
 
@@ -84,6 +84,28 @@ cmake -S llama.cpp -B llama.cpp/build-cpu-rel \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build llama.cpp/build-cpu-rel --config Release --target ggml ggml-base ggml-cpu -j
 ```
+
+### 不要用 `-DGGML_NATIVE=ON`
+
+上面那套参数就是最快的。在 Zen4 虚拟机（EPYC 9754）上、同一份源码、单线程，用裸 ggml
+微基准实测（一个 512x2048 的 GEMV + dec stage1 的卷积形状，不含引擎与模型）：
+
+| ggml 构建 | `mul_mat` f32 GEMV | `conv_1d` |
+|---|---|---|
+| 上面那套（AVX2） | ~15 GMAC/s | ~14 GMAC/s |
+| `-DGGML_NATIVE=ON`（AVX-512） | ~1.7 GMAC/s | ~1.3 GMAC/s |
+
+也就是**慢 8–10 倍**；端到端把一次 1.7 s 的解码变成 43.6 s。原因是**代码生成**，不是频率、也不是
+AVX-512 内核本身（`GGML_NATIVE=OFF -DGGML_AVX512=ON` 是快的）：`-march=native` 下 gcc 13 把
+`ggml_vec_dot_f16` 的累加器溢出到栈上、每轮从栈重载 mask、结果还过一次内存，同样的工作量
+AVX2 构建 10.6 G 条指令、它要 115.9 G 条，核心频率一样。
+
+第二个坑：`-DGGML_AVX_VNNI=ON` 会让 gcc 生成 VEX 编码的 `vpdpbusd`，而只报 `avx512_vnni`、
+不报 `avx_vnni` 的 CPU 会直接 SIGILL。真要用 VNNI 请用 `-DGGML_AVX512_VNNI=ON` 搭配
+`-DGGML_AVX_VNNI=OFF` —— 不过这里 VNNI 只带来约 5%（q8_0），却让它路上 conv 慢约 26%，
+所以 AVX2 构建整体仍然最快。
+
+MSVC 构建（Windows 出货包）不受影响：走的是 `/arch:AVX2`，没有 `-march=native` 这条路。
 
 ## 4. 编译服务端
 
@@ -202,3 +224,4 @@ curl -X POST http://127.0.0.1:9880/tts -H 'Content-Type: application/json' -d '{
 | `reference audio too long` | 把参考音频裁到 3–10 秒 |
 | Windows 缺 `ggml-*.dll` | 拷到 `gsv_server.exe` 旁边，或加入 `PATH` |
 | Linux 二进制报 `GLIBC_2.38 not found` | 在你要支持的最老发行版上构建（CI 用 Ubuntu 22.04） |
+

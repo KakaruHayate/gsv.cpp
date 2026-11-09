@@ -1,4 +1,4 @@
-# Building gsv.cpp from scratch
+﻿# Building gsv.cpp from scratch
 
 This guide takes a clean machine to a working `/tts` server: engine, GGUF models, and the Python
 text frontend.
@@ -85,6 +85,31 @@ cmake -S llama.cpp -B llama.cpp/build-cpu-rel \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build llama.cpp/build-cpu-rel --config Release --target ggml ggml-base ggml-cpu -j
 ```
+
+### Do not use `-DGGML_NATIVE=ON`
+
+The flags above are the fast ones. Measured on a Zen4 VM (EPYC 9754), same source, one thread,
+with a bare-ggml microbenchmark (a 512x2048 GEMV and the dec stage-1 conv shape, no engine,
+no model):
+
+| ggml build | `mul_mat` f32 GEMV | `conv_1d` |
+|---|---|---|
+| the flags above (AVX2) | ~15 GMAC/s | ~14 GMAC/s |
+| `-DGGML_NATIVE=ON` (AVX-512) | ~1.7 GMAC/s | ~1.3 GMAC/s |
+
+That is **8–10× slower**, and end to end it turned a 1.7 s decode into 43.6 s. It is code
+generation, not clock and not the AVX-512 kernels themselves (`GGML_NATIVE=OFF -DGGML_AVX512=ON`
+is fast): under `-march=native` gcc 13 spills `ggml_vec_dot_f16`'s accumulator, reloads the mask
+from the stack every iteration and bounces each result through memory — 115.9 G instructions for
+the work the AVX2 build does in 10.6 G, at the same core clock.
+
+Second trap: `-DGGML_AVX_VNNI=ON` makes gcc emit VEX `vpdpbusd`, and a CPU that advertises
+`avx512_vnni` but not `avx_vnni` dies with SIGILL. If you want VNNI, use `-DGGML_AVX512_VNNI=ON`
+with `-DGGML_AVX_VNNI=OFF` — although here it only buys ~5% on q8_0 while costing ~26% on the
+conv, so the AVX2 build stays the fastest overall configuration.
+
+MSVC builds (the Windows release) are unaffected: they use `/arch:AVX2` and have no
+`-march=native` path.
 
 ## 4. Build the server
 
@@ -207,3 +232,5 @@ Reference audio must be 3–10 s (max 30 s) and readable by the process.
 | `reference audio too long` | trim the clip to 3–10 s |
 | Windows: missing `ggml-*.dll` | copy them next to `gsv_server.exe` (or add to `PATH`) |
 | Linux binary: `GLIBC_2.38 not found` | build on the oldest distro you need (CI uses Ubuntu 22.04) |
+
+
