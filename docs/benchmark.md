@@ -135,6 +135,85 @@ relies on node order being execution order (CPU is sequential; Vulkan was determ
 repeated runs). `GSV_AR_NO_GRAPHCACHE=1` still forces the CPU-style path if this ever needs to be
 bisected.
 
+## AR decode: where the time goes, and why n-gram speculation does not pay off (2026-11-10)
+
+### What the AR decode already does
+
+`src/gsv_ar.cpp`, in the order the per-token cost is saved:
+
+| optimisation | effect (measured) |
+|---|---|
+| KV cache resident on the backend, new column written in place (`set_rows`/`cpy` side effect, no `concat`) | 0.1.3: −7…−12% on Vulkan, −49% on CPU (section above) |
+| fixed-shape decode graph reused across steps (bucket = `L + 25%`), rebuilt only when `L` outgrows the bucket | build 0.01 ms/step (vs ~0.8 ms rebuilding) |
+| constant mask + tail slots masked by index, so the mask buffer is not resized per step | mask rebuild 0.000 ms/step |
+| flash attention (`ggml_flash_attn_ext`) with an F16 mask | part of `compute` |
+| fused LayerNorm+affine (`ln_affine`), fused bias+act (`add_act`) | `GSV_NO_FUSE=1` reverts |
+| BERT projection in-graph via the augmented `[W|b]` weight (no 30 M-MAC host loop) | prefill only |
+| positional table precomputed once (`pe_tab`), host-side embedding add | emb+pe 0.002 ms/step |
+| batched AR: several sequences share one decode pass, per-sequence seeds, KV released after | B=2: −10…−20% |
+| vectorised sampler (`argmax(probs/q)`, bit-identical to torch) | sampling 0.066 ms/step |
+| F16 weights everywhere, Q8_0 for the AR option | 83 MB vs 296 MB read per token |
+
+Per-step breakdown, `gsv-ar-q8.gguf`, RTX 2070 / Vulkan, 156 steps, warm (`GSV_AR_PROFILE=1`,
+`tests/probe_ar_profile.py`):
+
+| stage | per step | share |
+|---|---|---|
+| graph compute | **3.53 ms** | 79% |
+| host→device uploads (x / mask / idx, 3 `tensor_set`) | 0.62 ms | 14% |
+| logits read-back + loop | 0.22 ms | 5% |
+| sampling | 0.07 ms | 2% |
+| graph (re)build, mask rebuild, emb+PE | 0.01 / 0.000 / 0.002 ms | ~0% |
+
+So the remaining cost is the graph itself, not framework overhead: the prefill pass costs
+**0.3 ms/position** for 159 positions against **3.53 ms/position** one-at-a-time, i.e. the same
+weights read once per pass instead of once per token. Anything that puts several tokens into one
+pass (speculation, larger batches) is therefore the only big lever left — though that 12x is an
+upper bound, not what small batches deliver (B=2 is only ~1.5x, see below).
+
+### Prompt-lookup (n-gram) speculation: measured, and rejected
+
+The idea is that speech tokens repeat locally (held vowels, silence, repeated prosody), so the
+last 2–3 tokens can be matched against the prompt/generated history and the following tokens used
+as a draft. We tested it on real streams before writing any decoder code
+(`tests/probe_lookup_accept.py`, `tests/probe_token_stream.py`, engine dump `sem.i32` +
+`prompt_codes.i32` via `GSV_ENGINE_DUMP`):
+
+| text | AR tokens | distinct 2-grams / total | longest run of equal tokens |
+|---|---|---|---|
+| 50 chars | 73 | 265 / 276 | 2 |
+| 15 chars (all 「啊」) | 27 | 219 / 230 | 2 |
+| 23 chars (「哈哈…慢慢慢…」) | 11 | 203 / 214 | 2 |
+
+Every repeated n-gram in that table comes from the **reference audio** part of the history
+(`[486,486,…]` ×12, the silence/long-vowel run in `prompt_codes`), never from the generated
+stream. Simulated acceptance over all four texts: **0 drafts proposed** for n = 2 and 3, K = 3/5/8.
+The counts are what you would expect from near-i.i.d. draws over the 1024-entry codebook
+(276 bigram positions predict ~37 chance collisions; we see 11, all from the prompt).
+
+The premise holds for *acoustic* codec tokens (EnCodec/SoundStream-style RVQ, or mel frames),
+where a held note is literally `[a,a,a,a,…]`. In GPT-SoVITS V5 the AR emits **semantic** tokens
+(one-stage VQ over HuBERT features, 1024 bins at ~25 Hz) that are information-dense and
+uncorrelated: the model reaches EOS in 11–156 tokens for these texts, and consecutive codes carry
+no local redundancy. Silence in the *output* is represented by the DiT/CFM stage, not by repeated
+semantic tokens.
+
+Consequence: implementing lookup decoding would add a draft-search and a multi-token verify path
+for a 0% hit rate, i.e. it can only slow the decoder down. Not implemented.
+
+### What would actually use the headroom
+
+The 12x prefill-vs-decode gap needs a draft source that is *correlated with the AR's own output*,
+which n-grams are not. Two realistic options, neither of them free:
+
+- a small draft model distilled from s1v3 (a 1–2 layer transformer over the same 1024-token
+  vocabulary), verified with rejection sampling as usual — this is a training task, and the
+  acceptance rate has to clear ~70% before the verify overhead pays off at these step costs;
+- larger AR batches across requests (`/batch`, the AR batcher) — already implemented; the measured
+  ceiling is modest: at B=2 the decode costs 3.5 ms per step for two sequences (1.76 ms/token)
+  against 2.6 ms/token at B=1, i.e. **~1.5x throughput, not 2x**, because the decode matvecs are
+  bandwidth-bound on this GPU.
+
 ## What is not parallelised
 
 - **Pipeline overlap** (AR of segment i+1 while DiT/vocoder runs segment i) is not implemented:
