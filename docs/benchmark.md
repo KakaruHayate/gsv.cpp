@@ -204,15 +204,88 @@ for a 0% hit rate, i.e. it can only slow the decoder down. Not implemented.
 ### What would actually use the headroom
 
 The 12x prefill-vs-decode gap needs a draft source that is *correlated with the AR's own output*,
-which n-grams are not. Two realistic options, neither of them free:
+which n-grams are not. The next section measures how much a wider pass is actually worth, and why
+the draft-based families (lookahead, self-speculative) still fail for a second, independent
+reason.
 
-- a small draft model distilled from s1v3 (a 1–2 layer transformer over the same 1024-token
-  vocabulary), verified with rejection sampling as usual — this is a training task, and the
-  acceptance rate has to clear ~70% before the verify overhead pays off at these step costs;
-- larger AR batches across requests (`/batch`, the AR batcher) — already implemented; the measured
-  ceiling is modest: at B=2 the decode costs 3.5 ms per step for two sequences (1.76 ms/token)
-  against 2.6 ms/token at B=1, i.e. **~1.5x throughput, not 2x**, because the decode matvecs are
-  bandwidth-bound on this GPU.
+## AR decode: width is cheap, the distribution is flat (lookahead / self-speculative) (2026-11-10)
+
+Follow-up to the section above, after Lookahead Decoding and self-speculative (layer-skipping)
+decoding were proposed. Both rest on the same assumption: putting W tokens into one pass must cost
+less than W separate passes. That part is true, and it is measured below. What kills them here is
+the second half of the trade — the acceptance rate.
+
+### 1. Width scaling (`tests/bench_ar_width.cpp`)
+
+Teacher-forced decode (`oracle_tokens`, so every run does exactly 160 steps and no sequence exits
+early), `gsv-ar-q8.gguf`, RTX 2070 / Vulkan, second call (KV allocated, graph and pipelines warm):
+
+| B | total | ms/step | ms/token | vs B=1 | tok/s |
+|---|---|---|---|---|---|
+| 1 | 388.3 ms | 2.43 | 2.43 | 1.00x | 412 |
+| 2 | 407.1 ms | 2.55 | 1.27 | 1.91x | 786 |
+| 4 | 539.4 ms | 3.37 | 0.84 | 2.88x | 1187 |
+| 8 | 815.9 ms | 5.10 | 0.64 | 3.81x | 1569 |
+
+So the compute really is amortised: eight sequences cost 2.1x the per-step time of one. The gain
+is sub-linear (not 8x) because the decode matvecs are bandwidth-bound, but 3.8x on throughput is
+still the largest lever in the decoder.
+
+### 2. Acceptance ceiling (`tests/probe_ar_peakiness.py`)
+
+`GSV_AR_PROB_DUMP` gives the post-sampler distribution per step (74 steps, same text/seed):
+
+| sampler | mean p(top1) | min p(top1) | top-5 mass |
+|---|---|---|---|
+| top_k=15, temp=1.0 (default) | **0.211** | 0.088 | 0.591 |
+| top_k=15, temp=0.7 | 0.269 | 0.099 | 0.680 |
+| top_k=5, temp=1.0 | 0.339 | 0.224 | 1.000 |
+
+Every hard-draft scheme (n-gram, lookahead) verifies by *matching a token*, so its acceptance is
+exactly `p(draft token)` — at best `p(top1)` = 0.21 at the default sampler. (This is the caveat
+the Lookahead write-ups already flag: it is designed for greedy search.)
+
+### 3. Return on one verify pass
+
+One pass of width W returns `1 + a + a² + a³` tokens (1 sampled base token + 3 drafts, each
+verified at rate `a`), and costs `C(W)` from the table above:
+
+| acceptance a | tokens/pass (W=4) | ms/token | vs 2.43 baseline |
+|---|---|---|---|
+| 0.21 (measured) | 1.26 | 2.68 | **0.91x — slower** |
+| 0.35 | 1.53 | 2.20 | 1.10x |
+| 0.50 | 1.88 | 1.80 | 1.35x |
+| 0.70 | 2.53 | 1.33 | 1.83x |
+| 1.00 (greedy) | 4.00 | 0.84 | 2.88x |
+
+### 4. Per-method verdict
+
+- **Prompt lookup / n-gram** — measured 0 drafts (previous section). Dead.
+- **Lookahead Decoding** (Fu et al., NeurIPS 2023) — the Jacobi lookahead branch would produce
+  drafts in a wide pass, so `C(4)` applies, but acceptance is the same hard-token match, i.e.
+  `a ≈ 0.21`: row 1 of the table, a *slowdown*. It also needs the n-gram pool (0 hits here), a
+  W-wide fixed-shape graph and a 2D window mask, i.e. the most work of the three for a negative
+  return.
+- **Self-speculative (layer skipping)** — worse, because drafting W−1 tokens is *sequential*:
+  `(W−1) × (k/24) × 2.43 ms` on top of the verify pass. For W=4 and half the layers that is
+  +3.65 ms, so even at `a = 0.7` (generous for a 12-layer draft) the result is
+  7.0 ms / 2.53 tokens = 2.8 ms/token, i.e. **slower than plain decode**. It only breaks even at
+  `k ≈ 6` layers *and* high agreement, and a quarter-depth model will not agree with a flat
+  distribution like this one.
+
+Root cause for all three: at top_k=15/temp=1.0 the semantic-token distribution is spread over the
+candidates (top-5 = 0.59), so the model itself is only 21% confident. Speculation converts
+confidence into speed; there is no confidence to convert. Greedy decoding (`top_k=1`) would make
+the whole family viable at ~2.9x — but it also removes the prosody variation users select with the
+sampler, so it is a product decision, not an optimisation.
+
+### 5. Consequence
+
+Width is exploitable across *requests*, not within one: `kMaxBatch = 8` with a 20 ms grace window
+already fills it under concurrent load, giving the 3.8x AR throughput on the table (the honest
+real-world number is lower than the bench, ~1.5x at B=2 in the earlier section, because sequences
+finish at different steps and the batch thins out). For single-request latency the only remaining
+lever is a cheaper AR (distillation or lower precision), not speculation.
 
 ## What is not parallelised
 

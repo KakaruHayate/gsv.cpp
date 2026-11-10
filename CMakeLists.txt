@@ -139,4 +139,8 @@ if(GSV_BUILD_TESTS)
     target_include_directories(test_conv_direct_act PRIVATE ${GSV_GGML_INCLUDES})
     target_link_libraries(test_conv_direct_act PRIVATE ${GSV_GGML_LIBS})
     add_test(NAME test_conv_direct_act COMMAND test_conv_direct_act --cpu)
+
+    # width scaling of the AR decode step (teacher forced, no sampling): bench_ar_width <ar.gguf>
+    add_executable(bench_ar_width "${CMAKE_CURRENT_SOURCE_DIR}/tests/bench_ar_width.cpp")
+    target_link_libraries(bench_ar_width PRIVATE gsv_engine)
 endif()
